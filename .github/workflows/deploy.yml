@@ -1,0 +1,30 @@
+name: Deploy pixie-workers
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy-microsoft:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy Microsoft worker
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 143.198.126.147
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            cd /opt/pixie/microsoft-worker && git pull && cd pixie-microsoft-rm-creation-process && docker compose up -d --build
+
+  deploy-google:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy Google worker
+        uses: appleboy/ssh-action@v1
+        with:
+          host: 157.245.129.244
+          username: root
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          script: |
+            cd /opt/pixie-google && git pull && cd pixie_google_smartlead && docker compose up -d --build
