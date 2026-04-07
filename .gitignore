@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+node_modules/
+__pycache__/
+.DS_Store
+debug_screens/
+debug_screens_nonheadless/
+debug_screenshots/
+*.pyc

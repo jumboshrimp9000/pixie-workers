@@ -1,0 +1,17 @@
+services:
+  pixie-google:
+    build: .
+    container_name: pixie-google-worker
+    restart: unless-stopped
+    env_file: .env.worker
+    volumes:
+      - google-logs:/app/app/logs
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/pixie_google_smartlead_heartbeat && find /tmp/pixie_google_smartlead_heartbeat -newermt '-120 seconds' | grep -q ."]
+      interval: 60s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
+volumes:
+  google-logs:

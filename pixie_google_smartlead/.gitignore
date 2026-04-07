@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env.worker
+
+app/logs/
+app/logs/playwright_debug/
+
+scripts/__pycache__/
