@@ -16,6 +16,28 @@ services:
       start_period: 30s
       retries: 3
 
+  pixie-google-nonprofit-worker:
+    build: ./pixie_google_smartlead
+    container_name: pixie-google-nonprofit-worker
+    command: ["python3", "main_nonprofit.py"]
+    restart: unless-stopped
+    env_file: ./pixie_google_smartlead/.env.worker
+    environment:
+      NONPROFIT_GOOGLE_ACTION_TYPES: ${NONPROFIT_GOOGLE_ACTION_TYPES:-free_google_provision,free_google_cancel_domain}
+      NONPROFIT_GOOGLE_POLL_SECONDS: ${NONPROFIT_GOOGLE_POLL_SECONDS:-10}
+      NONPROFIT_GOOGLE_PLAYWRIGHT_HEADLESS: ${NONPROFIT_GOOGLE_PLAYWRIGHT_HEADLESS:-true}
+      NONPROFIT_GOOGLE_REQUIRE_MFA_ENROLLMENT: ${NONPROFIT_GOOGLE_REQUIRE_MFA_ENROLLMENT:-true}
+      NONPROFIT_GOOGLE_USER_OP_VAULT: ${NONPROFIT_GOOGLE_USER_OP_VAULT:-icje7jpscrdm6xtlcr252zxinq}
+      NONPROFIT_GOOGLE_ADMIN_OP_VAULT: ${NONPROFIT_GOOGLE_ADMIN_OP_VAULT}
+    volumes:
+      - google-logs:/app/app/logs
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/pixie_google_smartlead_heartbeat && find /tmp/pixie_google_smartlead_heartbeat -newermt '-120 seconds' | grep -q ."]
+      interval: 60s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+
   pixie-microsoft:
     build: ./pixie-microsoft-rm-creation-process
     container_name: pixie-microsoft-worker

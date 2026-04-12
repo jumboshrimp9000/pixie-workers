@@ -28,6 +28,7 @@ WORKDIR /app
 # Copy worker code
 COPY app/ ./app/
 COPY main.py .
+COPY main_nonprofit.py .
 COPY run_google_supabase.py .
 COPY scripts/ ./scripts/
 
