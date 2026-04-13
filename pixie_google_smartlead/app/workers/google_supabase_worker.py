@@ -220,7 +220,13 @@ class GoogleSupabaseWorker:
                         fields["interim_status"] = interim_status
                     if domain_status:
                         fields["status"] = domain_status
-                    self.client.update_domain(domain_id, fields)
+                    # Conditional update when changing status: never overwrite a
+                    # domain that has been moved into a cancellation/terminal
+                    # state. Protects the cancel/provision race window.
+                    if domain_status:
+                        self.client.update_domain_if_active(domain_id, fields)
+                    else:
+                        self.client.update_domain(domain_id, fields)
             except Exception:
                 # Progress is best-effort; fulfillment should continue.
                 pass
@@ -290,6 +296,21 @@ class GoogleSupabaseWorker:
                 self.client.insert_action_log(action, "action_completed", "info", "Skipped non-google domain", result)
                 return
 
+            # Race guard: if a cancellation has already landed, do not start
+            # provisioning. Free the cancel worker to handle teardown.
+            entry_status = str(domain.get("status") or "").strip().lower()
+            if entry_status in ("queued_for_cancellation", "cancelled", "suspended"):
+                result = {"skipped": True, "reason": f"Domain is {entry_status}"}
+                self.client.complete_action(action_id, result)
+                self.client.insert_action_log(
+                    action,
+                    "action_skipped",
+                    "warn",
+                    f"Domain {domain_id} entry status is {entry_status}; aborting provisioning",
+                    result,
+                )
+                return
+
             inboxes = self.client.get_domain_inboxes(domain_id)
             if not inboxes:
                 result = {"skipped": True, "reason": "No inboxes found"}
@@ -298,7 +319,10 @@ class GoogleSupabaseWorker:
                 return
 
             # Domain enters in-progress while fulfillment runs.
-            self.client.update_domain(domain_id, {"status": "in_progress"})
+            # Conditional update: only set in_progress if status is still in an
+            # active/preparing state. This prevents a race where a cancellation
+            # arrives between get_domain above and this update.
+            self.client.update_domain_if_active(domain_id, {"status": "in_progress"})
 
             for inbox in inboxes:
                 if inbox.get("status") in ("pending", "provisioning"):
@@ -1320,7 +1344,31 @@ class GoogleSupabaseWorker:
 
             step = start_step("finalize")
 
-            self.client.update_domain(
+            # Re-check domain status before finalize. A cancellation may have
+            # landed mid-flight; if so we must not flip the domain back to
+            # 'active'. Skip finalize and let the cancel worker take over.
+            fresh_domain = self.client.get_domain(domain_id) or {}
+            fresh_status = str(fresh_domain.get("status") or "").strip().lower()
+            if fresh_status in ("queued_for_cancellation", "cancelled", "suspended"):
+                log_event(
+                    "action_skipped",
+                    "warn",
+                    f"Domain {domain_name} became {fresh_status} during provisioning; aborting finalize",
+                    {"domain_status": fresh_status},
+                )
+                complete_step(step, {"skipped": True, "reason": f"Domain is {fresh_status}"})
+                self.client.complete_action(
+                    action_id,
+                    {
+                        "skipped": True,
+                        "reason": f"Domain is {fresh_status}",
+                        "domain": domain_name,
+                    },
+                )
+                return
+
+            # Conditional update: never flip to active if status changed under us.
+            self.client.update_domain_if_active(
                 domain_id,
                 {
                     "status": "active",

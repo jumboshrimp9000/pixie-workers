@@ -152,7 +152,14 @@ class NonprofitGoogleProvisionWorker:
                         fields["interim_status"] = interim_status
                     if domain_status:
                         fields["status"] = domain_status
-                    self.client.update_domain(domain_id, fields)
+                    # Conditional update: never overwrite a domain that has been
+                    # moved into a cancellation/terminal state. Protects the
+                    # cancel/provision race window so a customer-initiated cancel
+                    # is not clobbered by a subsequent progress write.
+                    if domain_status:
+                        self.client.update_domain_if_active(domain_id, fields)
+                    else:
+                        self.client.update_domain(domain_id, fields)
             except Exception:
                 pass
 
@@ -179,7 +186,9 @@ class NonprofitGoogleProvisionWorker:
                 self.client.complete_action(action_id, {"skipped": True, "reason": "No inboxes found"})
                 return
 
-            self.client.update_domain(domain_id, {"status": "in_progress"})
+            # Conditional: only flip to in_progress if the domain is still in an
+            # active/preparing state (race guard for mid-flight cancellation).
+            self.client.update_domain_if_active(domain_id, {"status": "in_progress"})
             for inbox in inboxes:
                 if str(inbox.get("status") or "") in {"pending", "provisioning"}:
                     self.client.update_inbox(str(inbox.get("id")), {"status": "provisioning"})

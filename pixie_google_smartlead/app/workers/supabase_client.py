@@ -35,6 +35,7 @@ class SupabaseRestClient:
         self.timeout_seconds = timeout_seconds
         self.max_request_attempts = max(1, int(os.getenv("SUPABASE_HTTP_RETRIES", "3")))
         self.retry_backoff_seconds = max(0.25, float(os.getenv("SUPABASE_HTTP_BACKOFF_SECONDS", "1")))
+        self.action_lease_seconds = max(30.0, float(os.getenv("WORKER_ACTION_LEASE_SECONDS", "600")))
         self.base_headers = {
             "apikey": service_role_key,
             "Authorization": f"Bearer {service_role_key}",
@@ -110,13 +111,26 @@ class SupabaseRestClient:
         if not action_types:
             return []
         encoded_types = ",".join(action_types)
-        rows = self._request(
+        pending_rows = self._request(
             "GET",
             "actions",
             params={
                 "select": "*",
-                "status": "in.(pending,in_progress)",
+                "status": "eq.pending",
                 "type": f"in.({encoded_types})",
+                "order": "created_at.asc",
+                "limit": str(limit),
+            },
+        )
+        reclaim_before = _to_iso(_utc_now() - timedelta(seconds=self.action_lease_seconds))
+        stale_rows = self._request(
+            "GET",
+            "actions",
+            params={
+                "select": "*",
+                "status": "eq.in_progress",
+                "type": f"in.({encoded_types})",
+                "or": f"(started_at.is.null,started_at.lte.{reclaim_before})",
                 "order": "created_at.asc",
                 "limit": str(limit),
             },
@@ -124,32 +138,43 @@ class SupabaseRestClient:
 
         now = _utc_now()
         eligible: List[Dict[str, Any]] = []
-        for row in rows:
+        for row in [*pending_rows, *stale_rows]:
             attempts = int(row.get("attempts") or 0)
             max_attempts = int(row.get("max_attempts") or 3)
             if attempts >= max_attempts:
                 continue
-            next_retry_at = _parse_ts(row.get("next_retry_at"))
-            if next_retry_at and next_retry_at > now:
-                continue
+            if str(row.get("status") or "") == "pending":
+                next_retry_at = _parse_ts(row.get("next_retry_at"))
+                if next_retry_at and next_retry_at > now:
+                    continue
             eligible.append(row)
-        return eligible
+        eligible.sort(key=lambda row: str(row.get("created_at") or ""))
+        return eligible[:limit]
 
     def claim_action(self, action: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         action_id = action["id"]
         attempts = int(action.get("attempts") or 0)
+        params = {
+            "id": f"eq.{action_id}",
+            "attempts": f"eq.{attempts}",
+            "status": f"eq.{action.get('status')}",
+        }
+        if str(action.get("status") or "") == "in_progress":
+            reclaim_before = _to_iso(_utc_now() - timedelta(seconds=self.action_lease_seconds))
+            if action.get("started_at"):
+                params["started_at"] = f"lte.{reclaim_before}"
+            else:
+                params["started_at"] = "is.null"
         claimed_rows = self._request(
             "PATCH",
             "actions",
-            params={
-                "id": f"eq.{action_id}",
-                "attempts": f"eq.{attempts}",
-            },
+            params=params,
             payload={
                 "status": "in_progress",
                 "attempts": attempts + 1,
                 "started_at": _to_iso(_utc_now()),
                 "error": None,
+                "next_retry_at": None,
             },
         )
         if not claimed_rows:
@@ -258,6 +283,21 @@ class SupabaseRestClient:
             "PATCH",
             "domains",
             params={"id": f"eq.{domain_id}"},
+            payload=fields,
+        )
+
+    def update_domain_if_active(self, domain_id: str, fields: Dict[str, Any]) -> None:
+        """Update a domain only if its current status is NOT in a cancellation
+        or terminal state. Used by progress writes to prevent the cancel/provision
+        race where a worker overwrites queued_for_cancellation back to in_progress.
+        """
+        self._request(
+            "PATCH",
+            "domains",
+            params={
+                "id": f"eq.{domain_id}",
+                "status": "not.in.(queued_for_cancellation,suspended,cancelled,expired)",
+            },
             payload=fields,
         )
 
