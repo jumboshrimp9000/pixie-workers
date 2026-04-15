@@ -62,6 +62,30 @@ function Process-SingleAction {
     $domainId = $Action.domain_id
     $actionType = [string]$Action.type
 
+    if ($actionType -in @("microsoft_recovery_move", "microsoft_recovery_reactivate", "microsoft_recovery_purge")) {
+        Write-Host ""
+        Write-Host "────────────────────────────────────────────────────────────" -ForegroundColor White
+        Write-Host "  ACTION: $actionId" -ForegroundColor White
+        Write-Host "  TYPE:   $actionType" -ForegroundColor White
+        Write-Host "────────────────────────────────────────────────────────────" -ForegroundColor White
+
+        $scriptPath = switch ($actionType) {
+            "microsoft_recovery_move" { Join-Path $PSScriptRoot "Part4-MicrosoftDomainRecoveryMove.ps1" }
+            "microsoft_recovery_reactivate" { Join-Path $PSScriptRoot "Part5-MicrosoftDomainRecoveryReactivate.ps1" }
+            "microsoft_recovery_purge" { Join-Path $PSScriptRoot "Part6-MicrosoftDomainRecoveryPurge.ps1" }
+        }
+
+        try {
+            $params = @{ Action = $Action }
+            if ($DryRun) { $params.DryRun = $true }
+            & $scriptPath @params
+        } catch {
+            Write-Log "$actionType error: $($_.Exception.Message)" -Level Error
+            Fail-Action -Action $Action -ErrorMessage "$actionType error: $($_.Exception.Message)"
+        }
+        return
+    }
+
     if (-not $domainId) {
         Write-Log "Action $actionId has no domain_id, skipping" -Level Warning
         return
@@ -201,7 +225,7 @@ function Process-SingleAction {
 # MAIN LOOP
 # ============================================================================
 do {
-    $actions = Get-PendingActions -ActionTypes @("provision_inbox", "microsoft_update_inboxes", "microsoft_cancel_domain")
+    $actions = Get-PendingActions -ActionTypes @("provision_inbox", "microsoft_update_inboxes", "microsoft_cancel_domain", "microsoft_recovery_move", "microsoft_recovery_reactivate", "microsoft_recovery_purge")
 
     if ($actions -and $actions.Count -gt 0) {
         $toProcess = $actions
