@@ -215,6 +215,38 @@ class NonprofitGoogleCancelWorker:
                         }
                     )
 
+            # Recovery chain: if the backend's enqueueRecoveryMove flagged this
+            # cancellation as a source teardown for a recovery_pool row, enqueue
+            # the microsoft_recovery_move follow-up action so the MS worker
+            # picks the domain up (with source_teardown_done=true) on its next
+            # poll. The MS worker will skip its own teardown step and continue
+            # with the recovery tenant add + room mailbox + Instantly flow.
+            chain_recovery_pool_id = str(payload.get("chain_to_recovery_pool_id") or "").strip()
+            if chain_recovery_pool_id and not checkpoint("chain_to_microsoft_recovery"):
+                step = start_step("chain_to_microsoft_recovery")
+                try:
+                    self.client._request(  # type: ignore[attr-defined]
+                        "POST",
+                        "actions",
+                        payload={
+                            "customer_id": str(domain.get("customer_id") or ""),
+                            "domain_id": domain_id,
+                            "order_batch_id": str(domain.get("order_batch_id") or None) or None,
+                            "type": "microsoft_recovery_move",
+                            "status": "pending",
+                            "payload": {
+                                "recovery_pool_id": chain_recovery_pool_id,
+                                "source_teardown_done": True,
+                            },
+                            "attempts": 0,
+                            "max_attempts": 5,
+                        },
+                    )
+                    complete_step(step, {"recovery_pool_id": chain_recovery_pool_id})
+                except Exception as exc:
+                    complete_step(step, {"recovery_pool_id": chain_recovery_pool_id, "error": str(exc)})
+                persist()
+
             result = {"steps": steps, "domain": domain_name, "cancelled": True}
             self.client.complete_action(action_id, result)
             log_event("action_completed", "info", f"Cancelled nonprofit Google domain {domain_name}", result)
