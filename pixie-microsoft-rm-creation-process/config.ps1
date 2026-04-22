@@ -155,27 +155,38 @@ function Get-PendingActions {
     if ($validTypes.Count -eq 0) { return @() }
 
     $encodedTypes = ($validTypes -join ",")
-    $query = "type=in.($encodedTypes)&status=in.(pending,in_progress)&order=created_at.asc&limit=$Limit"
-    $result = Invoke-SupabaseApi -Method GET -Table "actions" -Query $query
-    if (-not $result.Success) { return @() }
+    $pendingQuery = "type=in.($encodedTypes)&status=eq.pending&order=created_at.asc&limit=$Limit"
+    $pendingResult = Invoke-SupabaseApi -Method GET -Table "actions" -Query $pendingQuery
+    if (-not $pendingResult.Success) { return @() }
+
+    $leaseSeconds = 600
+    if ($env:WORKER_ACTION_LEASE_SECONDS) {
+        try { $leaseSeconds = [Math]::Max(30, [int][double]$env:WORKER_ACTION_LEASE_SECONDS) } catch { $leaseSeconds = 600 }
+    }
+    $reclaimBefore = (Get-Date).ToUniversalTime().AddSeconds(-$leaseSeconds).ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $staleQuery = "type=in.($encodedTypes)&status=eq.in_progress&or=(started_at.is.null,started_at.lte.$reclaimBefore)&order=created_at.asc&limit=$Limit"
+    $staleResult = Invoke-SupabaseApi -Method GET -Table "actions" -Query $staleQuery
+    if (-not $staleResult.Success) { return @() }
 
     $now = Get-Date
-    return @($result.Data | Where-Object {
+    return @(@($pendingResult.Data) + @($staleResult.Data) | Sort-Object created_at | Where-Object {
         $attempts = if ($_.attempts -ne $null) { [int]$_.attempts } else { 0 }
         $maxAttempts = if ($_.max_attempts -ne $null) { [int]$_.max_attempts } else { 3 }
         if ($attempts -ge $maxAttempts) { return $false }
 
-        $nextRetryAt = $null
-        if ($_.next_retry_at) {
-            try { $nextRetryAt = [DateTime]::Parse($_.next_retry_at).ToUniversalTime() } catch { $nextRetryAt = $null }
-        }
+        if ($_.status -eq "pending") {
+            $nextRetryAt = $null
+            if ($_.next_retry_at) {
+                try { $nextRetryAt = [DateTime]::Parse($_.next_retry_at).ToUniversalTime() } catch { $nextRetryAt = $null }
+            }
 
-        if ($nextRetryAt -and $nextRetryAt -gt $now.ToUniversalTime()) {
-            return $false
+            if ($nextRetryAt -and $nextRetryAt -gt $now.ToUniversalTime()) {
+                return $false
+            }
         }
 
         return $true
-    })
+    } | Select-Object -First $Limit)
 }
 
 function Claim-Action {
@@ -183,14 +194,30 @@ function Claim-Action {
 
     if (-not $Action -or -not $Action.id) { return $null }
     $attempts = if ($Action.attempts -ne $null) { [int]$Action.attempts } else { 0 }
+    $status = if ($Action.status) { [string]$Action.status } else { "pending" }
     $body = @{
         status = "in_progress"
         attempts = $attempts + 1
         started_at = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
         error = $null
+        next_retry_at = $null
     }
 
-    $result = Invoke-SupabaseApi -Method PATCH -Table "actions" -Query "id=eq.$($Action.id)&attempts=eq.$attempts" -Body $body
+    $query = "id=eq.$($Action.id)&attempts=eq.$attempts&status=eq.$status"
+    if ($status -eq "in_progress") {
+        $leaseSeconds = 600
+        if ($env:WORKER_ACTION_LEASE_SECONDS) {
+            try { $leaseSeconds = [Math]::Max(30, [int][double]$env:WORKER_ACTION_LEASE_SECONDS) } catch { $leaseSeconds = 600 }
+        }
+        $reclaimBefore = (Get-Date).ToUniversalTime().AddSeconds(-$leaseSeconds).ToString("yyyy-MM-ddTHH:mm:ssZ")
+        if ($Action.started_at) {
+            $query += "&started_at=lte.$reclaimBefore"
+        } else {
+            $query += "&started_at=is.null"
+        }
+    }
+
+    $result = Invoke-SupabaseApi -Method PATCH -Table "actions" -Query $query -Body $body
     if ($result.Success -and $result.Data -and $result.Data.Count -gt 0) { return $result.Data[0] }
     return $null
 }
