@@ -40,7 +40,8 @@ COPY Part2-MicrosoftInboxMutations.ps1 ./
 COPY Part3-MicrosoftDomainCancellation.ps1 ./
 COPY RecoveryCommon.ps1 ./
 COPY Part4-MicrosoftDomainRecoveryMove.ps1 ./
-COPY Part4-MicrosoftDomainRecoveryValidate.ps1 ./
+COPY Part5-MicrosoftDomainRecoveryReactivate.ps1 ./
+COPY Part6-MicrosoftDomainRecoveryPurge.ps1 ./
 
 # Copy the health-check wrapper
 COPY healthcheck-wrapper.ps1 ./
