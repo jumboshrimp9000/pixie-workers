@@ -1788,9 +1788,10 @@ Ensure-DomainAdminAssignment -DomainId $DomainId -AdminCredId $adminRecord.id
 Write-Log "Using admin: $($adminRecord.email)" -Level Info
 
 try {
-    # Claim the action
-    Update-ActionStatus -ActionId $ActionId -Status "in_progress"
-    Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $domainRecord.customer_id -EventType "part2_started" -Severity "info" -Message "Microsoft provisioning started with admin $($adminRecord.email)"
+	# Claim the action
+	Update-ActionStatus -ActionId $ActionId -Status "in_progress"
+	Refresh-MicrosoftAdminLock -ActionId $ActionId | Out-Null
+	Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $domainRecord.customer_id -EventType "part2_started" -Severity "info" -Message "Microsoft provisioning started with admin $($adminRecord.email)"
 
     # Process
     Process-MicrosoftDomain -DomainRecord $domainRecord -AdminRecord $adminRecord -Inboxes $inboxes -ActionId $ActionId

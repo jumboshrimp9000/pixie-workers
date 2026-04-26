@@ -318,6 +318,19 @@ class NonprofitGoogleProvisionWorker:
             if not upload_checkpoint:
                 step = start_step("upload_sending_tool")
                 upload_result = self._upload_to_sending_tool(domain_id, domain_name, inboxes)
+                if upload_result.get("skipped"):
+                    fail_message = f"Sending-tool upload skipped: {upload_result.get('skipped')}"
+                    fail_step(step, fail_message)
+                    persist_progress(INTERIM_STATUSES["FAILED"], "in_progress")
+                    raise RuntimeError(fail_message)
+                if upload_result.get("failed_uploads"):
+                    fail_message = (
+                        f"{upload_result.get('tool') or 'sending tool'} upload validation failed for "
+                        f"{len(upload_result.get('failed_uploads') or [])}/{upload_result.get('total_candidates') or 0} inbox(es)"
+                    )
+                    fail_step(step, fail_message)
+                    persist_progress(INTERIM_STATUSES["FAILED"], "in_progress")
+                    raise RuntimeError(fail_message)
                 complete_step(step, upload_result)
                 persist_progress(INTERIM_STATUSES["SENDING_TOOL_UPLOAD"], "in_progress")
 

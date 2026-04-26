@@ -527,7 +527,7 @@ function Acquire-MicrosoftAdminLock {
         [string]$ActionId,
         [string]$DomainId,
         [string]$PreferredAdminId = $null,
-        [int]$LeaseSeconds = 7200
+        [int]$LeaseSeconds = 21600
     )
 
     $body = @{
@@ -548,7 +548,7 @@ function Acquire-MicrosoftAdminLock {
 function Refresh-MicrosoftAdminLock {
     param(
         [string]$ActionId,
-        [int]$LeaseSeconds = 7200
+        [int]$LeaseSeconds = 21600
     )
 
     $body = @{

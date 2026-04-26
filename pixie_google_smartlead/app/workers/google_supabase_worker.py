@@ -280,6 +280,34 @@ class GoogleSupabaseWorker:
                 return False, f"confirmation.verified={confirmation.get('verified')!r}"
             return False, "confirmation details missing"
 
+        def upload_checkpoint_strictly_valid(step_details: Optional[Dict[str, Any]]) -> Tuple[bool, str]:
+            if self.dry_run:
+                return True, "dry_run"
+            if not isinstance(step_details, dict) or not step_details:
+                return False, "upload details missing"
+            if bool(step_details.get("skipped")):
+                return False, "upload checkpoint was skipped"
+            if not bool(step_details.get("strict_validation")):
+                return False, "upload checkpoint was not strictly validated"
+
+            failed_uploads = step_details.get("failed_uploads") or []
+            if isinstance(failed_uploads, list) and len(failed_uploads) > 0:
+                return False, f"upload checkpoint has {len(failed_uploads)} failed upload(s)"
+
+            total_candidates_raw = step_details.get("total_candidates")
+            try:
+                total_candidates = int(total_candidates_raw or 0)
+            except (TypeError, ValueError):
+                total_candidates = 0
+            uploaded_emails = step_details.get("uploaded_emails") or []
+            uploaded_count = len(uploaded_emails) if isinstance(uploaded_emails, list) else 0
+
+            if total_candidates <= 0:
+                return False, "upload checkpoint has no upload candidates"
+            if uploaded_count < total_candidates:
+                return False, f"upload checkpoint only has {uploaded_count}/{total_candidates} uploaded inbox(es)"
+            return True, "strict upload checkpoint valid"
+
         try:
             log_event("action_started", "info", f"Processing action {action.get('type')}")
 
@@ -1305,6 +1333,32 @@ class GoogleSupabaseWorker:
 
             sending_tool_checkpoint = checkpoint("upload_sending_tool")
             if sending_tool_checkpoint:
+                upload_checkpoint_ok, upload_checkpoint_reason = upload_checkpoint_strictly_valid(sending_tool_checkpoint)
+                if not upload_checkpoint_ok:
+                    step = start_step("upload_sending_tool")
+                    fail_message = (
+                        f"Previous sending-tool upload checkpoint for {domain_name} is not safe to reuse: "
+                        f"{upload_checkpoint_reason}. Retry the upload step after confirming sending-tool credentials."
+                    )
+                    fail_step(step, fail_message)
+                    step["details"] = {
+                        "domain": domain_name,
+                        "reason": upload_checkpoint_reason,
+                        "previous_upload_details": sending_tool_checkpoint,
+                        "ops_next_steps": [
+                            "Confirm a supported sending-tool credential is assigned to this domain.",
+                            "Clear the stale upload_sending_tool checkpoint or create a retry action.",
+                            "Retry fulfillment and verify the inboxes exist in the sending tool before activation.",
+                        ],
+                    }
+                    persist_progress(INTERIM_STATUSES["FAILED"], "in_progress")
+                    log_event(
+                        "step_failed",
+                        "error",
+                        f"[upload_sending_tool] {fail_message}",
+                        step["details"],
+                    )
+                    raise RuntimeError(fail_message)
                 persist_progress(INTERIM_STATUSES["SENDING_TOOL_UPLOAD"], "in_progress")
             else:
                 step = start_step("upload_sending_tool")
@@ -1908,6 +1962,22 @@ class GoogleSupabaseWorker:
                 "skipped_already_uploaded": 0,
             }
         if not payloads:
+            if inboxes:
+                failed_uploads.append(
+                    {
+                        "email": str(domain_name or "unknown").strip().lower(),
+                        "error": "No valid inbox payloads were available for sending-tool upload",
+                    }
+                )
+                return {
+                    "tool": None,
+                    "tools": [],
+                    "strict_validation": True,
+                    "total_candidates": len(inboxes),
+                    "uploaded_emails": [],
+                    "failed_uploads": failed_uploads,
+                    "skipped_already_uploaded": 0,
+                }
             return {
                 "tool": None,
                 "tools": [],

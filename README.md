@@ -4,6 +4,8 @@ This folder contains external/background workers that consume Supabase actions.
 
 ## Canonical folders
 
+- Root-level legacy scripts such as `MS-ResourceMailbox.ps1` are archived references only. Do not run them for production launch; use the canonical folders below.
+
 - `pixie_google_smartlead/`
   - canonical Google worker folder
   - `pixie-google-paid-worker` owns paid Google provisioning and Google inbox lifecycle updates
