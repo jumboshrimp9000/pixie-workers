@@ -41,7 +41,8 @@ class NonprofitGoogleCancelWorker:
             if not claimed:
                 continue
             processed += 1
-            self._process_action(claimed)
+            with self.client.action_lease_heartbeat(claimed):
+                self._process_action(claimed)
         return processed
 
     def _process_action(self, action: Dict[str, Any]) -> None:
@@ -78,7 +79,7 @@ class NonprofitGoogleCancelWorker:
 
         def persist() -> None:
             try:
-                self.client.update_action(action_id, {"result": {"steps": steps, "lastUpdated": self._iso_now()}})
+                self.client.update_action(action, {"result": {"steps": steps, "lastUpdated": self._iso_now()}})
             except Exception:
                 pass
 
@@ -248,7 +249,7 @@ class NonprofitGoogleCancelWorker:
                 persist()
 
             result = {"steps": steps, "domain": domain_name, "cancelled": True}
-            self.client.complete_action(action_id, result)
+            self.client.complete_action(action, result)
             log_event("action_completed", "info", f"Cancelled nonprofit Google domain {domain_name}", result)
         except Exception as exc:
             persist()

@@ -4,11 +4,16 @@ Canonical Google fulfillment worker for Supabase actions.
 
 ## What this worker owns
 
+Paid Google service (`pixie-google-paid-worker`, `main.py`):
 - `google_provision`
 - `google_add_inboxes`
 - `google_remove_inboxes`
 - `google_update_inboxes`
 - `google_update_profile_photos`
+
+Free/nonprofit Google service (`pixie-google-free-nonprofit-worker`, `main_nonprofit.py`):
+- `free_google_provision`
+- `free_google_cancel_domain`
 
 ## Fulfillment capabilities
 
@@ -59,13 +64,17 @@ Existing-domain lifecycle:
 ## Main files
 
 - `main.py`
+- `main_nonprofit.py`
 - `run_google_supabase.py`
 - `app/workers/google_supabase_worker.py`
 - `app/workers/google_inbox_lifecycle_worker.py`
+- `app/workers/nonprofit_google_provision_worker.py`
+- `app/workers/nonprofit_google_cancel_worker.py`
 - `app/workers/google_admin_playwright.py`
 - `app/workers/onepassword_client.py`
 - `app/workers/supabase_client.py`
 - `SUPABASE_WORKER.md`
+- `NONPROFIT_WORKER.md`
 
 ## 1Password behavior
 
@@ -112,4 +121,11 @@ or
 ```bash
 cd job-workers/pixie_google_smartlead
 python3 run_google_supabase.py
+```
+
+Production compose runs both Google services:
+
+```bash
+cd job-workers/pixie_google_smartlead
+docker compose up -d --build --remove-orphans pixie-google-paid-worker pixie-google-free-nonprofit-worker
 ```

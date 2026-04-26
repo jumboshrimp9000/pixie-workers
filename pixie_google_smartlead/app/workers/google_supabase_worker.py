@@ -5,7 +5,7 @@ import string
 import time
 import json
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app import get_order_logger
 from app.workers.google_fulfillment_clients import (
@@ -146,7 +146,8 @@ class GoogleSupabaseWorker:
             if not claimed:
                 continue
             processed += 1
-            self._process_action(claimed)
+            with self.client.action_lease_heartbeat(claimed):
+                self._process_action(claimed)
         return processed
 
     def _process_action(self, action: Dict[str, Any]) -> None:
@@ -206,7 +207,7 @@ class GoogleSupabaseWorker:
         def persist_progress(interim_status: Optional[str] = None, domain_status: Optional[str] = None) -> None:
             try:
                 self.client.update_action(
-                    action_id,
+                    action,
                     {
                         "result": {
                             "steps": steps,
@@ -292,7 +293,7 @@ class GoogleSupabaseWorker:
             provider = str(domain.get("provider") or "").lower()
             if provider != "google":
                 result = {"skipped": True, "reason": "Domain provider is not google"}
-                self.client.complete_action(action_id, result)
+                self.client.complete_action(action, result)
                 self.client.insert_action_log(action, "action_completed", "info", "Skipped non-google domain", result)
                 return
 
@@ -301,7 +302,7 @@ class GoogleSupabaseWorker:
             entry_status = str(domain.get("status") or "").strip().lower()
             if entry_status in ("queued_for_cancellation", "cancelled", "suspended"):
                 result = {"skipped": True, "reason": f"Domain is {entry_status}"}
-                self.client.complete_action(action_id, result)
+                self.client.complete_action(action, result)
                 self.client.insert_action_log(
                     action,
                     "action_skipped",
@@ -314,7 +315,7 @@ class GoogleSupabaseWorker:
             inboxes = self.client.get_domain_inboxes(domain_id)
             if not inboxes:
                 result = {"skipped": True, "reason": "No inboxes found"}
-                self.client.complete_action(action_id, result)
+                self.client.complete_action(action, result)
                 self.client.insert_action_log(action, "action_completed", "info", "No inboxes to process", result)
                 return
 
@@ -1358,7 +1359,7 @@ class GoogleSupabaseWorker:
                 )
                 complete_step(step, {"skipped": True, "reason": f"Domain is {fresh_status}"})
                 self.client.complete_action(
-                    action_id,
+                    action,
                     {
                         "skipped": True,
                         "reason": f"Domain is {fresh_status}",
@@ -1386,7 +1387,7 @@ class GoogleSupabaseWorker:
                 "dry_run": self.dry_run,
                 "steps": steps,
             }
-            self.client.complete_action(action_id, result)
+            self.client.complete_action(action, result)
             log_event("action_completed", "info", "Google provisioning completed", result)
 
         except Exception as exc:
@@ -1862,48 +1863,11 @@ class GoogleSupabaseWorker:
         user_updates: Dict[str, Dict[str, Any]],
         tool_settings: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        tool_bundle = self.client.get_domain_tool_credentials(domain_id)
-        if not tool_bundle:
-            return {
-                "tool": None,
-                "strict_validation": False,
-                "total_candidates": 0,
-                "uploaded_emails": [],
-                "failed_uploads": [],
-                "skipped_already_uploaded": 0,
-                "skipped": "No sending tool credentials assigned to domain",
-            }
-
-        tool_slug = self._normalize_sending_tool_slug(str(tool_bundle.get("slug") or ""))
-        credential = tool_bundle.get("credential") or {}
-        strict_validation = tool_slug in {"instantly.ai", "smartlead.ai"}
-        if not tool_slug:
-            return {
-                "tool": None,
-                "strict_validation": False,
-                "total_candidates": 0,
-                "uploaded_emails": [],
-                "failed_uploads": [],
-                "skipped_already_uploaded": 0,
-                "skipped": "Sending tool slug missing on credential",
-            }
-
-        if tool_slug not in {"instantly.ai", "smartlead.ai"}:
-            return {
-                "tool": tool_slug,
-                "strict_validation": False,
-                "total_candidates": 0,
-                "uploaded_emails": [],
-                "failed_uploads": [],
-                "skipped_already_uploaded": 0,
-                "skipped": f"Automated upload not implemented for {tool_slug}",
-            }
-
-        api_key = str(credential.get("api_key") or "").strip()
-        if not api_key:
+        tool_bundles = self.client.get_domain_tool_credentials_list(domain_id)
+        if not tool_bundles:
             raise RuntimeError(
-                f"Missing API key for {tool_slug} credential on domain {domain_name}. "
-                "Provide toolCredentials.api when placing the order."
+                f"No sending tool credentials assigned to domain {domain_name}; "
+                "upload_sending_tool cannot complete safely."
             )
 
         payloads: List[Dict[str, Any]] = []
@@ -1935,8 +1899,9 @@ class GoogleSupabaseWorker:
 
         if not payloads and failed_uploads:
             return {
-                "tool": tool_slug,
-                "strict_validation": strict_validation,
+                "tool": None,
+                "tools": [],
+                "strict_validation": True,
                 "total_candidates": len(failed_uploads),
                 "uploaded_emails": [],
                 "failed_uploads": failed_uploads,
@@ -1944,8 +1909,9 @@ class GoogleSupabaseWorker:
             }
         if not payloads:
             return {
-                "tool": tool_slug,
-                "strict_validation": strict_validation,
+                "tool": None,
+                "tools": [],
+                "strict_validation": False,
                 "total_candidates": 0,
                 "uploaded_emails": [],
                 "failed_uploads": [],
@@ -1954,46 +1920,94 @@ class GoogleSupabaseWorker:
             }
 
         provider_name = str(provider or "").strip().lower()
-        op_client: Optional[OnePasswordCliClient] = None
-        if (
-            tool_slug in {"instantly.ai", "smartlead.ai"}
-            and provider_name == "google"
-            and self.sending_tool_playwright_oauth
-        ):
-            try:
-                op_client = OnePasswordCliClient.from_env()
-            except Exception as op_exc:
-                if self.sending_tool_require_1password:
-                    raise RuntimeError(
-                        f"1Password is required for {tool_slug} Google OAuth upload but not configured: {op_exc}"
-                    ) from op_exc
-                logger.warning(
-                    "[upload_sending_tool] Proceeding without 1Password during Google OAuth upload for %s: %s",
-                    domain_name,
-                    op_exc,
+        uploaded_emails: List[str] = []
+        merged_failures: List[Dict[str, str]] = list(failed_uploads)
+        tool_results: List[Dict[str, Any]] = []
+        processed_tools: List[str] = []
+        skipped_already_uploaded = 0
+
+        for tool_bundle in tool_bundles:
+            tool_slug = self._normalize_sending_tool_slug(str(tool_bundle.get("slug") or ""))
+            credential = tool_bundle.get("credential") or {}
+            if not tool_slug:
+                raise RuntimeError(f"Sending tool slug missing on credential for domain {domain_name}")
+            if tool_slug not in {"instantly.ai", "smartlead.ai"}:
+                raise RuntimeError(f"Automated upload not implemented for {tool_slug} on domain {domain_name}")
+
+            api_key = str(credential.get("api_key") or "").strip()
+            if not api_key:
+                raise RuntimeError(
+                    f"Missing API key for {tool_slug} credential on domain {domain_name}. "
+                    "Provide toolCredentials.api when placing the order."
                 )
 
-        result = self._sending_tool_uploader.upload_and_validate(
-            tool=tool_slug,
-            api_key=api_key,
-            inboxes=payloads,
-            provider=provider_name,
-            credential=credential,
-            settings=tool_settings if isinstance(tool_settings, dict) else {},
-            onepassword=op_client,
-            headless=self.playwright_headless,
-            use_playwright_oauth=self.sending_tool_playwright_oauth,
-        )
+            op_client: Optional[OnePasswordCliClient] = None
+            if provider_name == "google" and self.sending_tool_playwright_oauth:
+                try:
+                    op_client = OnePasswordCliClient.from_env()
+                except Exception as op_exc:
+                    if self.sending_tool_require_1password:
+                        raise RuntimeError(
+                            f"1Password is required for {tool_slug} Google OAuth upload but not configured: {op_exc}"
+                        ) from op_exc
+                    logger.warning(
+                        "[upload_sending_tool] Proceeding without 1Password during Google OAuth upload for %s: %s",
+                        domain_name,
+                        op_exc,
+                    )
 
-        merged_failures = list(result.get("failed_uploads") or [])
-        merged_failures.extend(failed_uploads)
-        result["failed_uploads"] = merged_failures
-        result["strict_validation"] = strict_validation
-        result["total_candidates"] = max(
-            int(result.get("total_candidates") or 0),
-            len(payloads) + len(failed_uploads),
-        )
-        return result
+            result = self._sending_tool_uploader.upload_and_validate(
+                tool=tool_slug,
+                api_key=api_key,
+                inboxes=payloads,
+                provider=provider_name,
+                credential=credential,
+                settings=tool_settings if isinstance(tool_settings, dict) else {},
+                onepassword=op_client,
+                headless=self.playwright_headless,
+                use_playwright_oauth=self.sending_tool_playwright_oauth,
+            )
+
+            processed_tools.append(tool_slug)
+            tool_uploaded = [str(email or "").strip().lower() for email in (result.get("uploaded_emails") or [])]
+            for email in tool_uploaded:
+                if email:
+                    uploaded_emails.append(f"{tool_slug}:{email}")
+
+            tool_failures: List[Dict[str, str]] = []
+            for row in result.get("failed_uploads") or []:
+                if not isinstance(row, dict):
+                    continue
+                failure = {
+                    "tool": tool_slug,
+                    "email": str(row.get("email") or "").strip().lower(),
+                    "error": str(row.get("error") or "Unknown upload error"),
+                }
+                tool_failures.append(failure)
+                merged_failures.append(failure)
+
+            skipped_already_uploaded += int(result.get("skipped_already_uploaded") or 0)
+            tool_results.append(
+                {
+                    "tool": tool_slug,
+                    "total_candidates": int(result.get("total_candidates") or len(payloads)),
+                    "uploaded": len(tool_uploaded),
+                    "failed": len(tool_failures),
+                    "skipped_already_uploaded": int(result.get("skipped_already_uploaded") or 0),
+                }
+            )
+
+        return {
+            "tool": processed_tools[-1] if processed_tools else None,
+            "tools": processed_tools,
+            "tool_results": tool_results,
+            "strict_validation": True,
+            "total_candidates": len(payloads) + len(failed_uploads),
+            "total_upload_attempts": len(payloads) * len(processed_tools),
+            "uploaded_emails": uploaded_emails,
+            "failed_uploads": merged_failures,
+            "skipped_already_uploaded": skipped_already_uploaded,
+        }
 
     @staticmethod
     def _normalize_sending_tool_slug(raw: str) -> str:

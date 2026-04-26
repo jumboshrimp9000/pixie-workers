@@ -158,7 +158,9 @@ function Process-SingleAction {
         "Both - DNS Records Added", "Microsoft - Exchange Synced",
         "Both - Creating Mailboxes", "Microsoft - Mailboxes Created",
         "Microsoft - Configuring Mailboxes", "Microsoft - SMTP Enabled",
-        "Both - DKIM Complete", "Both - Failed"
+        "Both - DKIM Complete", "Both - Sending Tool Upload Pending",
+        "Both - Sending Tool Upload Blocked", "Both - Sending Tool Upload Failed",
+        "Both - Failed"
     )
 
     $needsPart1 = ($interimStatus -in $part1Statuses) -or (-not $domain.cloudflare_zone_id)
@@ -238,7 +240,12 @@ do {
         foreach ($action in $toProcess) {
             $claimedAction = Claim-Action -Action $action
             if (-not $claimedAction) { continue }
-            Process-SingleAction -Action $claimedAction
+            Start-ActionLeaseHeartbeat -Action $claimedAction | Out-Null
+            try {
+                Process-SingleAction -Action $claimedAction
+            } finally {
+                Stop-ActionLeaseHeartbeat -Action $claimedAction
+            }
         }
     } else {
         if (-not $Once) {

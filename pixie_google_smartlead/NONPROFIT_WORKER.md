@@ -1,5 +1,18 @@
 # Nonprofit Google Worker
 
+## Production deployment
+
+The production Google deploy runs both compose services from this folder:
+
+- `pixie-google-paid-worker` runs `main.py` and owns paid Google `google_*` actions.
+- `pixie-google-free-nonprofit-worker` runs `main_nonprofit.py` and owns `free_google_provision` plus `free_google_cancel_domain`.
+
+Both services read `.env.worker`. Keep the nonprofit worker enabled while the free trial offer can enqueue `free_google_provision` actions; otherwise those actions will remain pending.
+
+Use `docker compose up -d --build --remove-orphans pixie-google-paid-worker pixie-google-free-nonprofit-worker` for production parity with the GitHub deploy workflow.
+
+## Environment
+
 Environment variables:
 
 - `NONPROFIT_GOOGLE_ACTION_TYPES=free_google_provision,free_google_cancel_domain`
@@ -28,8 +41,6 @@ Shared variables reused from the paid Google worker:
 
 Notes:
 
-- The nonprofit worker uses two separate `OnePasswordCliClient` instances:
-- admin vault: `NONPROFIT_GOOGLE_ADMIN_OP_VAULT`
-- user vault: `NONPROFIT_GOOGLE_USER_OP_VAULT`
+- The nonprofit worker uses separate `OnePasswordCliClient` instances for admin credentials (`NONPROFIT_GOOGLE_ADMIN_OP_VAULT`) and user credentials (`NONPROFIT_GOOGLE_USER_OP_VAULT`).
 - Apps Script calls follow Google Apps Script `302` redirects manually before parsing JSON.
 - Provisioning failures do not release the panel assignment; retries reuse the same panel.

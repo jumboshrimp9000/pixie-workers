@@ -90,7 +90,8 @@ class GoogleInboxLifecycleWorker:
             if not claimed:
                 continue
             processed += 1
-            self._process_action(claimed)
+            with self.client.action_lease_heartbeat(claimed):
+                self._process_action(claimed)
         return processed
 
     def _process_action(self, action: Dict[str, Any]) -> None:
@@ -161,7 +162,7 @@ class GoogleInboxLifecycleWorker:
         def persist_progress() -> None:
             try:
                 self.client.update_action(
-                    action_id,
+                    action,
                     {
                         "result": {
                             "steps": steps,
@@ -221,7 +222,7 @@ class GoogleInboxLifecycleWorker:
             provider = str(domain.get("provider") or "").strip().lower()
             if provider != "google":
                 result = {"skipped": True, "reason": "Domain provider is not google"}
-                self.client.complete_action(action_id, result)
+                self.client.complete_action(action, result)
                 log_event("action_completed", "info", "Skipped non-google domain", result)
                 return
 
@@ -307,7 +308,7 @@ class GoogleInboxLifecycleWorker:
                 "summary": summary,
                 "steps": steps,
             }
-            self.client.complete_action(action_id, result)
+            self.client.complete_action(action, result)
             if mutation_request_id:
                 try:
                     self.client.update_mutation_request(

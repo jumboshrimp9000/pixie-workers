@@ -1,9 +1,14 @@
 import os
 import time
+import logging
+import threading
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import requests
+
+
+logger = logging.getLogger(__name__)
 
 
 class SupabaseError(RuntimeError):
@@ -29,6 +34,46 @@ def _parse_ts(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
+class _ActionLeaseHeartbeat:
+    def __init__(self, client: Any, action: Dict[str, Any], interval_seconds: float):
+        self.client = client
+        self.action = action
+        self.interval_seconds = interval_seconds
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def __enter__(self) -> "_ActionLeaseHeartbeat":
+        if "_lease_heartbeat_lock" not in self.action:
+            self.action["_lease_heartbeat_lock"] = threading.RLock()
+        self._thread = threading.Thread(target=self._run, name=f"action-lease-{self.action.get('id')}", daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.stop()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_seconds):
+            try:
+                lock = self.action.get("_lease_heartbeat_lock")
+                if lock:
+                    with lock:
+                        refreshed = self.client.heartbeat_action(self.action)
+                else:
+                    refreshed = self.client.heartbeat_action(self.action)
+                if not refreshed:
+                    logger.warning("Lease heartbeat lost fence for action %s", self.action.get("id"))
+                    self._stop.set()
+                    return
+            except Exception as exc:
+                logger.warning("Lease heartbeat failed for action %s: %s", self.action.get("id"), exc)
+
+
 class SupabaseRestClient:
     def __init__(self, supabase_url: str, service_role_key: str, timeout_seconds: int = 30):
         self.base_url = f"{supabase_url.rstrip('/')}/rest/v1"
@@ -42,6 +87,13 @@ class SupabaseRestClient:
             "Content-Type": "application/json",
         }
         self.session = requests.Session()
+        self.action_heartbeat_seconds = max(
+            5.0,
+            min(
+                self.action_lease_seconds / 3.0,
+                float(os.getenv("WORKER_ACTION_HEARTBEAT_SECONDS", "120")),
+            ),
+        )
 
     @classmethod
     def from_env(cls) -> "SupabaseRestClient":
@@ -181,44 +233,130 @@ class SupabaseRestClient:
             return None
         return claimed_rows[0]
 
-    def complete_action(self, action_id: str, result: Dict[str, Any]) -> None:
-        self._request(
+    def _action_fence_params(self, action: Dict[str, Any]) -> Dict[str, str]:
+        params = {
+            "id": f"eq.{action['id']}",
+            "status": "eq.in_progress",
+            "attempts": f"eq.{int(action.get('attempts') or 0)}",
+        }
+        if action.get("started_at"):
+            params["started_at"] = f"eq.{action.get('started_at')}"
+        else:
+            params["started_at"] = "is.null"
+        return params
+
+    def _action_params(self, action_or_id: Union[str, Dict[str, Any]]) -> Dict[str, str]:
+        if isinstance(action_or_id, dict):
+            return self._action_fence_params(action_or_id)
+        return {"id": f"eq.{action_or_id}"}
+
+    def heartbeat_action(self, action: Dict[str, Any]) -> bool:
+        next_started_at = _to_iso(_utc_now())
+        rows = self._request(
             "PATCH",
             "actions",
-            params={"id": f"eq.{action_id}"},
+            params=self._action_fence_params(action),
             payload={
-                "status": "completed",
-                "result": result,
-                "completed_at": _to_iso(_utc_now()),
-                "error": None,
-                "next_retry_at": None,
+                "started_at": next_started_at,
             },
         )
+        if not rows:
+            return False
+        action["started_at"] = rows[0].get("started_at") or next_started_at
+        return True
 
-    def update_action(self, action_id: str, fields: Dict[str, Any]) -> None:
-        self._request(
-            "PATCH",
-            "actions",
-            params={"id": f"eq.{action_id}"},
-            payload=fields,
-        )
+    def action_lease_heartbeat(self, action: Dict[str, Any]) -> "_ActionLeaseHeartbeat":
+        return _ActionLeaseHeartbeat(self, action, self.action_heartbeat_seconds)
 
-    def fail_action(self, action: Dict[str, Any], error_message: str, max_retries: int = 5) -> None:
+    def complete_action(self, action_or_id: Union[str, Dict[str, Any]], result: Dict[str, Any]) -> bool:
+        lock = action_or_id.get("_lease_heartbeat_lock") if isinstance(action_or_id, dict) else None
+        if lock:
+            with lock:
+                rows = self._request(
+                    "PATCH",
+                    "actions",
+                    params=self._action_params(action_or_id),
+                    payload={
+                        "status": "completed",
+                        "result": result,
+                        "completed_at": _to_iso(_utc_now()),
+                        "error": None,
+                        "next_retry_at": None,
+                    },
+                )
+        else:
+            rows = self._request(
+                "PATCH",
+                "actions",
+                params=self._action_params(action_or_id),
+                payload={
+                    "status": "completed",
+                    "result": result,
+                    "completed_at": _to_iso(_utc_now()),
+                    "error": None,
+                    "next_retry_at": None,
+                },
+            )
+        if not rows and isinstance(action_or_id, dict):
+            logger.warning("Skipped completion for action %s because the lease fence no longer matched", action_or_id.get("id"))
+        return bool(rows)
+
+    def update_action(self, action_or_id: Union[str, Dict[str, Any]], fields: Dict[str, Any]) -> bool:
+        lock = action_or_id.get("_lease_heartbeat_lock") if isinstance(action_or_id, dict) else None
+        if lock:
+            with lock:
+                rows = self._request(
+                    "PATCH",
+                    "actions",
+                    params=self._action_params(action_or_id),
+                    payload=fields,
+                )
+        else:
+            rows = self._request(
+                "PATCH",
+                "actions",
+                params=self._action_params(action_or_id),
+                payload=fields,
+            )
+        if not rows and isinstance(action_or_id, dict):
+            logger.warning("Skipped action update for %s because the lease fence no longer matched", action_or_id.get("id"))
+        return bool(rows)
+
+    def fail_action(self, action: Dict[str, Any], error_message: str, max_retries: int = 5) -> bool:
         attempts = int(action.get("attempts") or 1)
         is_final = attempts >= max_retries
         delay_seconds = min(2 ** max(0, attempts - 1), 300)
         next_retry = None if is_final else _to_iso(_utc_now() + timedelta(seconds=delay_seconds))
 
-        self._request(
-            "PATCH",
-            "actions",
-            params={"id": f"eq.{action['id']}"},
-            payload={
-                "status": "failed" if is_final else "pending",
-                "error": error_message[:4000],
-                "next_retry_at": next_retry,
-            },
-        )
+        lock = action.get("_lease_heartbeat_lock")
+        if lock:
+            with lock:
+                rows = self._request(
+                    "PATCH",
+                    "actions",
+                    params=self._action_fence_params(action),
+                    payload={
+                        "status": "failed" if is_final else "pending",
+                        "error": error_message[:4000],
+                        "next_retry_at": next_retry,
+                        "started_at": action.get("started_at") if is_final else None,
+                    },
+                )
+        else:
+            rows = self._request(
+                "PATCH",
+                "actions",
+                params=self._action_fence_params(action),
+                payload={
+                    "status": "failed" if is_final else "pending",
+                    "error": error_message[:4000],
+                    "next_retry_at": next_retry,
+                    "started_at": action.get("started_at") if is_final else None,
+                    },
+                )
+        if not rows:
+            logger.warning("Skipped failure update for action %s because the lease fence no longer matched", action.get("id"))
+        return bool(rows)
 
     def defer_action(
         self,
@@ -227,7 +365,7 @@ class SupabaseRestClient:
         *,
         delay_seconds: float = 60,
         consume_attempt: bool = False,
-    ) -> None:
+    ) -> bool:
         claimed_attempts = int(action.get("attempts") or 1)
         effective_attempts = claimed_attempts if consume_attempt else max(0, claimed_attempts - 1)
         next_retry = _to_iso(_utc_now() + timedelta(seconds=max(5.0, float(delay_seconds or 60))))
@@ -240,12 +378,25 @@ class SupabaseRestClient:
         if effective_attempts != claimed_attempts:
             payload["attempts"] = effective_attempts
 
-        self._request(
-            "PATCH",
-            "actions",
-            params={"id": f"eq.{action['id']}"},
-            payload=payload,
-        )
+        lock = action.get("_lease_heartbeat_lock")
+        if lock:
+            with lock:
+                rows = self._request(
+                    "PATCH",
+                    "actions",
+                    params=self._action_fence_params(action),
+                    payload=payload,
+                )
+        else:
+            rows = self._request(
+                "PATCH",
+                "actions",
+                params=self._action_fence_params(action),
+                payload=payload,
+            )
+        if not rows:
+            logger.warning("Skipped defer update for action %s because the lease fence no longer matched", action.get("id"))
+        return bool(rows)
 
     def insert_action_log(
         self,
@@ -409,39 +560,48 @@ class SupabaseRestClient:
             },
         )
 
-    def get_domain_tool_credentials(self, domain_id: str) -> Optional[Dict[str, Any]]:
+    def get_domain_tool_credentials_list(self, domain_id: str) -> List[Dict[str, Any]]:
         assignments = self._request(
             "GET",
             "domain_credentials",
-            params={"select": "*", "domain_id": f"eq.{domain_id}", "limit": "1"},
+            params={"select": "*", "domain_id": f"eq.{domain_id}"},
         )
         if not assignments:
-            return None
-        credential_id = assignments[0].get("credential_id")
-        if not credential_id:
-            return None
+            return []
 
-        cred_rows = self._request(
-            "GET",
-            "sending_tool_credentials",
-            params={"select": "*", "id": f"eq.{credential_id}", "limit": "1"},
-        )
-        if not cred_rows:
-            return None
-        credential = cred_rows[0]
+        bundles: List[Dict[str, Any]] = []
+        for assignment in assignments:
+            credential_id = assignment.get("credential_id")
+            if not credential_id:
+                continue
 
-        tool_id = credential.get("sending_tool_id")
-        slug = None
-        if tool_id:
-            tool_rows = self._request(
+            cred_rows = self._request(
                 "GET",
-                "sending_tools",
-                params={"select": "id,slug,name", "id": f"eq.{tool_id}", "limit": "1"},
+                "sending_tool_credentials",
+                params={"select": "*", "id": f"eq.{credential_id}", "limit": "1"},
             )
-            if tool_rows:
-                slug = tool_rows[0].get("slug")
+            if not cred_rows:
+                continue
+            credential = cred_rows[0]
 
-        return {"slug": slug, "credential": credential}
+            tool_id = credential.get("sending_tool_id")
+            slug = None
+            if tool_id:
+                tool_rows = self._request(
+                    "GET",
+                    "sending_tools",
+                    params={"select": "id,slug,name", "id": f"eq.{tool_id}", "limit": "1"},
+                )
+                if tool_rows:
+                    slug = tool_rows[0].get("slug")
+
+            bundles.append({"slug": slug, "credential": credential})
+
+        return bundles
+
+    def get_domain_tool_credentials(self, domain_id: str) -> Optional[Dict[str, Any]]:
+        bundles = self.get_domain_tool_credentials_list(domain_id)
+        return bundles[0] if bundles else None
 
     def get_mutation_request(self, request_id: str) -> Optional[Dict[str, Any]]:
         rows = self._request(

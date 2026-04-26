@@ -82,7 +82,8 @@ class NonprofitGoogleProvisionWorker:
             if not claimed:
                 continue
             processed += 1
-            self._process_action(claimed)
+            with self.client.action_lease_heartbeat(claimed):
+                self._process_action(claimed)
         return processed
 
     def _process_action(self, action: Dict[str, Any]) -> None:
@@ -143,7 +144,7 @@ class NonprofitGoogleProvisionWorker:
         def persist_progress(interim_status: Optional[str] = None, domain_status: Optional[str] = None) -> None:
             try:
                 self.client.update_action(
-                    action_id,
+                    action,
                     {"result": {"steps": steps, "lastUpdated": self._iso_now()}},
                 )
                 if domain_id and (interim_status or domain_status):
@@ -172,7 +173,7 @@ class NonprofitGoogleProvisionWorker:
                 raise RuntimeError(f"Domain {domain_id} not found")
             domain_status = str(domain.get("status") or "").strip().lower()
             if domain_status in ("queued_for_cancellation", "suspended", "cancelled"):
-                self.client.complete_action(action_id, {"skipped": True, "reason": f"Domain is {domain_status}"})
+                self.client.complete_action(action, {"skipped": True, "reason": f"Domain is {domain_status}"})
                 return
 
             domain_name = str(domain.get("domain") or "").strip().lower()
@@ -183,7 +184,7 @@ class NonprofitGoogleProvisionWorker:
             inboxes = self.client.get_domain_inboxes_all(domain_id)
             inboxes = [inbox for inbox in inboxes if str(inbox.get("status") or "").strip().lower() != "deleted"]
             if not inboxes:
-                self.client.complete_action(action_id, {"skipped": True, "reason": "No inboxes found"})
+                self.client.complete_action(action, {"skipped": True, "reason": "No inboxes found"})
                 return
 
             # Conditional: only flip to in_progress if the domain is still in an
@@ -334,7 +335,7 @@ class NonprofitGoogleProvisionWorker:
                         {"domain_status": fresh_status},
                     )
                     self.client.complete_action(
-                        action_id,
+                        action,
                         {
                             "steps": steps,
                             "skipped": True,
@@ -366,13 +367,13 @@ class NonprofitGoogleProvisionWorker:
                 complete_step(step, {"domain_status": "active", "panel_id": panel_id})
 
             result = {"steps": steps, "panel_id": panel_id, "domain": domain_name}
-            self.client.complete_action(action_id, result)
+            self.client.complete_action(action, result)
             log_event("action_completed", "info", f"Nonprofit Google provisioning complete for {domain_name}", result)
         except Exception as exc:
             message = str(exc)
             log_event("action_failed", "error", message)
             try:
-                self.client.update_action(action_id, {"result": {"steps": steps, "lastUpdated": self._iso_now()}})
+                self.client.update_action(action, {"result": {"steps": steps, "lastUpdated": self._iso_now()}})
             except Exception:
                 pass
             self.client.fail_action(action, message, max_retries=self.max_retries)

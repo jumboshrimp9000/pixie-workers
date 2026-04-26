@@ -36,6 +36,10 @@ $DynadotConfig = @{
 
 $AzureCliPublicClientId = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
 
+if (-not $global:ActionLeaseFences) {
+    $global:ActionLeaseFences = @{}
+}
+
 # ============================================================================
 # LOGGING
 # ============================================================================
@@ -48,6 +52,162 @@ function Write-Log {
     $colors = @{ "Info" = "Cyan"; "Success" = "Green"; "Warning" = "Yellow"; "Error" = "Red" }
     $prefix = @{ "Info" = "-->"; "Success" = "[OK]"; "Warning" = "[WARN]"; "Error" = "[ERR]" }
     Write-Host "[$timestamp] $($prefix[$Level]) $Message" -ForegroundColor $colors[$Level]
+}
+
+function Get-WorkerActionLeaseSeconds {
+    $leaseSeconds = 600
+    if ($env:WORKER_ACTION_LEASE_SECONDS) {
+        try { $leaseSeconds = [Math]::Max(30, [int][double]$env:WORKER_ACTION_LEASE_SECONDS) } catch { $leaseSeconds = 600 }
+    }
+    return $leaseSeconds
+}
+
+function Get-WorkerActionHeartbeatSeconds {
+    $configured = 120
+    if ($env:WORKER_ACTION_HEARTBEAT_SECONDS) {
+        try { $configured = [Math]::Max(5, [int][double]$env:WORKER_ACTION_HEARTBEAT_SECONDS) } catch { $configured = 120 }
+    }
+    return [Math]::Max(5, [Math]::Min([int]([double](Get-WorkerActionLeaseSeconds) / 3), $configured))
+}
+
+function Register-ActionLeaseFence {
+    param([object]$Action)
+
+    if (-not $Action -or -not $Action.id) { return }
+    $actionId = [string]$Action.id
+    $existing = if ($global:ActionLeaseFences.ContainsKey($actionId)) { $global:ActionLeaseFences[$actionId] } else { $null }
+    $global:ActionLeaseFences[$actionId] = [pscustomobject]@{
+        ActionId      = $actionId
+        Attempts      = if ($Action.attempts -ne $null) { [int]$Action.attempts } else { 0 }
+        StartedAt     = if ($Action.started_at) { [string]$Action.started_at } else { $null }
+        Timer         = if ($existing) { $existing.Timer } else { $null }
+        Subscription  = if ($existing) { $existing.Subscription } else { $null }
+        SourceId      = if ($existing) { $existing.SourceId } else { "action-lease-$actionId" }
+    }
+}
+
+function Get-ActionLeaseFence {
+    param(
+        [string]$ActionId,
+        [object]$Action = $null
+    )
+
+    if ($ActionId -and $global:ActionLeaseFences.ContainsKey($ActionId)) {
+        return $global:ActionLeaseFences[$ActionId]
+    }
+
+    if ($Action -and $Action.id) {
+        $actionKey = [string]$Action.id
+        if ($global:ActionLeaseFences.ContainsKey($actionKey)) {
+            return $global:ActionLeaseFences[$actionKey]
+        }
+        return [pscustomobject]@{
+            ActionId  = $actionKey
+            Attempts  = if ($Action.attempts -ne $null) { [int]$Action.attempts } else { 0 }
+            StartedAt = if ($Action.started_at) { [string]$Action.started_at } else { $null }
+        }
+    }
+
+    return $null
+}
+
+function Get-ActionFenceQuery {
+    param(
+        [string]$ActionId,
+        [object]$Action = $null,
+        [switch]$RequireFence
+    )
+
+    $query = "id=eq.$ActionId"
+    $fence = Get-ActionLeaseFence -ActionId $ActionId -Action $Action
+    if (-not $RequireFence) { return $query }
+    if (-not $fence) {
+        Write-Log "Missing lease fence for action $ActionId; refusing fenced action update" -Level Warning
+        return "$query&status=eq.__missing_lease_fence__"
+    }
+
+    $query += "&status=eq.in_progress&attempts=eq.$($fence.Attempts)"
+    if ($fence.StartedAt) {
+        $query += "&started_at=eq.$([uri]::EscapeDataString([string]$fence.StartedAt))"
+    } else {
+        $query += "&started_at=is.null"
+    }
+    return $query
+}
+
+function Start-ActionLeaseHeartbeat {
+    param([object]$Action)
+
+    if (-not $Action -or -not $Action.id) { return $null }
+    Register-ActionLeaseFence -Action $Action
+    $actionId = [string]$Action.id
+    $fence = $global:ActionLeaseFences[$actionId]
+    if ($fence.Timer) { return $fence }
+
+    $timer = [System.Timers.Timer]::new((Get-WorkerActionHeartbeatSeconds) * 1000)
+    $timer.AutoReset = $true
+    $sourceId = "action-lease-$actionId"
+    $messageData = @{
+        ActionId = $actionId
+        BaseUrl = $SupabaseConfig.Url
+        ServiceRoleKey = $SupabaseConfig.ServiceRoleKey
+    }
+    $subscription = Register-ObjectEvent -InputObject $timer -EventName Elapsed -SourceIdentifier $sourceId -MessageData $messageData -Action {
+        $data = $Event.MessageData
+        $actionId = [string]$data.ActionId
+        if (-not $global:ActionLeaseFences -or -not $global:ActionLeaseFences.ContainsKey($actionId)) { return }
+
+        $fence = $global:ActionLeaseFences[$actionId]
+        $nextStartedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $startedFilter = if ($fence.StartedAt) { "started_at=eq.$([uri]::EscapeDataString([string]$fence.StartedAt))" } else { "started_at=is.null" }
+        $query = "id=eq.$actionId&status=eq.in_progress&attempts=eq.$($fence.Attempts)&$startedFilter"
+        $headers = @{
+            "apikey"        = $data.ServiceRoleKey
+            "Authorization" = "Bearer $($data.ServiceRoleKey)"
+            "Content-Type"  = "application/json"
+            "Prefer"        = "return=representation"
+        }
+        $body = @{ started_at = $nextStartedAt } | ConvertTo-Json -Depth 4 -Compress
+        try {
+            $rows = Invoke-RestMethod -Method PATCH -Uri "$($data.BaseUrl)/rest/v1/actions?$query" -Headers $headers -Body $body -TimeoutSec 60 -ErrorAction Stop
+            $rowList = @($rows)
+            if ($rowList.Count -gt 0) {
+                $fence.StartedAt = if ($rowList[0].started_at) { [string]$rowList[0].started_at } else { $nextStartedAt }
+            } else {
+                Write-Host "[WARN] Action lease heartbeat lost fence for $actionId" -ForegroundColor Yellow
+                $Event.Sender.Stop()
+            }
+        } catch {
+            Write-Host "[WARN] Action lease heartbeat failed for $actionId`: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+
+    $fence.Timer = $timer
+    $fence.Subscription = $subscription
+    $fence.SourceId = $sourceId
+    $timer.Start()
+    return $fence
+}
+
+function Stop-ActionLeaseHeartbeat {
+    param([object]$Action)
+
+    if (-not $Action -or -not $Action.id) { return }
+    $actionId = [string]$Action.id
+    if (-not $global:ActionLeaseFences.ContainsKey($actionId)) { return }
+
+    $fence = $global:ActionLeaseFences[$actionId]
+    if ($fence.Timer) {
+        $fence.Timer.Stop()
+        $fence.Timer.Dispose()
+    }
+    if ($fence.SourceId) {
+        try { Unregister-Event -SourceIdentifier $fence.SourceId -ErrorAction SilentlyContinue } catch { }
+    }
+    if ($fence.Subscription) {
+        try { Remove-Job -Id $fence.Subscription.Id -Force -ErrorAction SilentlyContinue } catch { }
+    }
+    $global:ActionLeaseFences.Remove($actionId) | Out-Null
 }
 
 # ============================================================================
@@ -159,10 +319,7 @@ function Get-PendingActions {
     $pendingResult = Invoke-SupabaseApi -Method GET -Table "actions" -Query $pendingQuery
     if (-not $pendingResult.Success) { return @() }
 
-    $leaseSeconds = 600
-    if ($env:WORKER_ACTION_LEASE_SECONDS) {
-        try { $leaseSeconds = [Math]::Max(30, [int][double]$env:WORKER_ACTION_LEASE_SECONDS) } catch { $leaseSeconds = 600 }
-    }
+    $leaseSeconds = Get-WorkerActionLeaseSeconds
     $reclaimBefore = (Get-Date).ToUniversalTime().AddSeconds(-$leaseSeconds).ToString("yyyy-MM-ddTHH:mm:ssZ")
     $staleQuery = "type=in.($encodedTypes)&status=eq.in_progress&or=(started_at.is.null,started_at.lte.$reclaimBefore)&order=created_at.asc&limit=$Limit"
     $staleResult = Invoke-SupabaseApi -Method GET -Table "actions" -Query $staleQuery
@@ -198,17 +355,14 @@ function Claim-Action {
     $body = @{
         status = "in_progress"
         attempts = $attempts + 1
-        started_at = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
+        started_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
         error = $null
         next_retry_at = $null
     }
 
     $query = "id=eq.$($Action.id)&attempts=eq.$attempts&status=eq.$status"
     if ($status -eq "in_progress") {
-        $leaseSeconds = 600
-        if ($env:WORKER_ACTION_LEASE_SECONDS) {
-            try { $leaseSeconds = [Math]::Max(30, [int][double]$env:WORKER_ACTION_LEASE_SECONDS) } catch { $leaseSeconds = 600 }
-        }
+        $leaseSeconds = Get-WorkerActionLeaseSeconds
         $reclaimBefore = (Get-Date).ToUniversalTime().AddSeconds(-$leaseSeconds).ToString("yyyy-MM-ddTHH:mm:ssZ")
         if ($Action.started_at) {
             $query += "&started_at=lte.$reclaimBefore"
@@ -218,7 +372,10 @@ function Claim-Action {
     }
 
     $result = Invoke-SupabaseApi -Method PATCH -Table "actions" -Query $query -Body $body
-    if ($result.Success -and $result.Data -and $result.Data.Count -gt 0) { return $result.Data[0] }
+    if ($result.Success -and $result.Data -and $result.Data.Count -gt 0) {
+        Register-ActionLeaseFence -Action $result.Data[0]
+        return $result.Data[0]
+    }
     return $null
 }
 
@@ -228,17 +385,27 @@ function Update-ActionStatus {
         [string]$Status,
         [string]$Error = $null,
         [object]$Result = $null,
-        [string]$NextRetryAt = $null
+        [string]$NextRetryAt = $null,
+        [object]$Action = $null
     )
 
-    $body = @{ status = $Status; updated_at = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ") }
-    if ($Status -eq "in_progress") { $body.started_at = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ") }
-    if ($Status -eq "completed") { $body.completed_at = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ") }
+    $now = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $body = @{ status = $Status; updated_at = $now }
+    if ($Status -eq "in_progress") { $body.started_at = $now }
+    if ($Status -eq "completed") { $body.completed_at = $now }
     if ($Error) { $body.error = $Error }
     if ($Result) { $body.result = $Result }
     if ($PSBoundParameters.ContainsKey("NextRetryAt")) { $body.next_retry_at = $NextRetryAt }
 
-    Invoke-SupabaseApi -Method PATCH -Table "actions" -Query "id=eq.$ActionId" -Body $body | Out-Null
+    $query = Get-ActionFenceQuery -ActionId $ActionId -Action $Action -RequireFence
+    $result = Invoke-SupabaseApi -Method PATCH -Table "actions" -Query $query -Body $body
+    if ($result.Success -and $result.Data -and $result.Data.Count -gt 0) {
+        if ($Status -eq "in_progress") { Register-ActionLeaseFence -Action $result.Data[0] }
+        return $true
+    } elseif ($result.Success) {
+        Write-Log "Skipped action $ActionId status update to $Status because the lease fence no longer matched" -Level Warning
+    }
+    return $false
 }
 
 function Fail-Action {
@@ -254,16 +421,21 @@ function Fail-Action {
     $maxRetries = if ($Action.max_attempts -ne $null) { [int]$Action.max_attempts } else { $DefaultMaxRetries }
     $isFinal = $attempts -ge $maxRetries
     $delaySeconds = [Math]::Min([Math]::Pow(2, [Math]::Max(0, $attempts - 1)), 300)
-    $nextRetryAt = if ($isFinal) { $null } else { (Get-Date).AddSeconds($delaySeconds).ToString("yyyy-MM-ddTHH:mm:ssZ") }
+    $nextRetryAt = if ($isFinal) { $null } else { (Get-Date).ToUniversalTime().AddSeconds($delaySeconds).ToString("yyyy-MM-ddTHH:mm:ssZ") }
 
     $body = @{
         status = if ($isFinal) { "failed" } else { "pending" }
         error = if ($ErrorMessage) { $ErrorMessage.Substring(0, [Math]::Min(4000, $ErrorMessage.Length)) } else { "Unknown error" }
         next_retry_at = $nextRetryAt
-        updated_at = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
+        started_at = if ($isFinal) { $Action.started_at } else { $null }
+        updated_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     }
 
-    Invoke-SupabaseApi -Method PATCH -Table "actions" -Query "id=eq.$($Action.id)" -Body $body | Out-Null
+    $result = Invoke-SupabaseApi -Method PATCH -Table "actions" -Query (Get-ActionFenceQuery -ActionId ([string]$Action.id) -Action $Action -RequireFence) -Body $body
+    if ($result.Success -and (-not $result.Data -or $result.Data.Count -eq 0)) {
+        Write-Log "Skipped failure update for action $($Action.id) because the lease fence no longer matched" -Level Warning
+    }
+    return ($result.Success -and $result.Data -and $result.Data.Count -gt 0)
 }
 
 function Update-ActionResult {
@@ -271,8 +443,12 @@ function Update-ActionResult {
         [string]$ActionId,
         [object]$Result
     )
-    $body = @{ result = $Result; updated_at = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ") }
-    Invoke-SupabaseApi -Method PATCH -Table "actions" -Query "id=eq.$ActionId" -Body $body | Out-Null
+    $body = @{ result = $Result; updated_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") }
+    $result = Invoke-SupabaseApi -Method PATCH -Table "actions" -Query (Get-ActionFenceQuery -ActionId $ActionId -RequireFence) -Body $body
+    if ($result.Success -and (-not $result.Data -or $result.Data.Count -eq 0)) {
+        Write-Log "Skipped result update for action $ActionId because the lease fence no longer matched" -Level Warning
+    }
+    return ($result.Success -and $result.Data -and $result.Data.Count -gt 0)
 }
 
 function Get-Action {
@@ -422,7 +598,7 @@ function Requeue-ActionWithoutPenalty {
 
     $currentAttempts = if ($Action.attempts -ne $null) { [int]$Action.attempts } else { 1 }
     $restoredAttempts = [Math]::Max(0, $currentAttempts - 1)
-    $nextRetryAt = (Get-Date).AddSeconds($DelaySeconds).ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $nextRetryAt = (Get-Date).ToUniversalTime().AddSeconds($DelaySeconds).ToString("yyyy-MM-ddTHH:mm:ssZ")
     $body = @{
         status = "pending"
         error = if ($Reason) { $Reason.Substring(0, [Math]::Min(4000, $Reason.Length)) } else { "Pending retry" }
@@ -430,10 +606,14 @@ function Requeue-ActionWithoutPenalty {
         attempts = $restoredAttempts
         started_at = $null
         completed_at = $null
-        updated_at = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
+        updated_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     }
 
-    Invoke-SupabaseApi -Method PATCH -Table "actions" -Query "id=eq.$($Action.id)" -Body $body | Out-Null
+    $result = Invoke-SupabaseApi -Method PATCH -Table "actions" -Query (Get-ActionFenceQuery -ActionId ([string]$Action.id) -Action $Action -RequireFence) -Body $body
+    if ($result.Success -and (-not $result.Data -or $result.Data.Count -eq 0)) {
+        Write-Log "Skipped requeue for action $($Action.id) because the lease fence no longer matched" -Level Warning
+    }
+    return ($result.Success -and $result.Data -and $result.Data.Count -gt 0)
 }
 
 function Update-AdminUsage {

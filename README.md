@@ -5,8 +5,9 @@ This folder contains external/background workers that consume Supabase actions.
 ## Canonical folders
 
 - `pixie_google_smartlead/`
-  - canonical Google worker
-  - owns Google provisioning and Google inbox lifecycle updates
+  - canonical Google worker folder
+  - `pixie-google-paid-worker` owns paid Google provisioning and Google inbox lifecycle updates
+  - `pixie-google-free-nonprofit-worker` owns free/nonprofit Google provisioning and cancellation
 
 - `hyper-tide-google-feat-add-users-smartlead/`
   - legacy Google reference folder
@@ -43,7 +44,17 @@ Recommended ownership:
 - `prepare_domain` -> `AP`
 - `provision_inbox` -> `pixie-microsoft-rm-creation-process`
 - `microsoft_update_inboxes` -> `pixie-microsoft-rm-creation-process`
-- all `google_*` lifecycle + provisioning actions -> `pixie_google_smartlead`
+- paid `google_*` lifecycle + provisioning actions -> `pixie-google-paid-worker`
+- `free_google_provision` and `free_google_cancel_domain` -> `pixie-google-free-nonprofit-worker`
+
+## Production compose topology
+
+The Google production deploy runs `docker compose` from `pixie_google_smartlead/`, not from this top-level folder. That sub-compose must include both Google services:
+
+- `pixie-google-paid-worker` executes `main.py`
+- `pixie-google-free-nonprofit-worker` executes `main_nonprofit.py`
+
+The Microsoft production deploy runs `docker compose` from `pixie-microsoft-rm-creation-process/` and starts `pixie-microsoft`.
 
 ## Mutation tracking
 

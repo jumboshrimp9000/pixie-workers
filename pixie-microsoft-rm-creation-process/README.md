@@ -36,7 +36,8 @@ Part 2A: Microsoft provisioning (PowerShell)
   - fix UPNs / primary SMTP state
   - enable SMTP AUTH
   - enable DKIM
-  - finalize Supabase state
+  - enqueue `reupload_inboxes` for sending-tool upload/validation
+  - finalize Supabase state only after upload validation confirms the expected active inbox count
 
 Part 2B: Microsoft inbox mutations (PowerShell)
   - load the queued mutation request/items from Supabase
@@ -79,6 +80,16 @@ Important behavior:
 - Microsoft does not allow duplicate display names during initial creation, so provisioning uses temporary display names and renames them back after creation
 - room mailboxes delete non-calendar items by default unless calendar auto-processing is disabled
 - this worker must run `Set-CalendarProcessing -AutomateProcessing None -DeleteNonCalendarItems $false`
+
+## Sending Tool Upload Gate
+
+Microsoft provisioning does not mark a domain `active` immediately after DKIM. After room mailboxes are created and active inbox rows are verified, the worker enqueues a Supabase `actions.type='reupload_inboxes'` row with `payload.source='microsoft_provision'`.
+
+Endpoint strategy and tradeoff:
+- The PowerShell worker uses Supabase REST to enqueue and poll the existing `reupload_inboxes` action because the AP `ReuploadWorker` already owns provider-specific upload and API validation for Instantly/Smartlead.
+- While upload is pending, the domain stays `status='in_progress'` with `interim_status='Both - Sending Tool Upload Pending'`; the `provision_inbox` action is requeued without consuming attempts.
+- The domain is marked `active` only when the upload action is `completed`, has zero failed uploads, and reports `uploaded >= active inbox count`.
+- If no sending-tool credential is assigned, or the upload action fails validation, provisioning stops in an actionable upload-blocked/failed state instead of pretending completion.
 
 ## Microsoft Mutation Model
 
@@ -142,6 +153,13 @@ Practical effect:
 - one Microsoft admin can still own many domains over time
 - but only one domain action is actively processed on that admin at a time
 - once a domain is assigned to an admin, retries and later mutations/cancellation prefer that same admin
+
+Deployment/config notes:
+- the production compose service is `pixie-microsoft` and should not be co-deployed inside the Google-only compose project
+- one-admin-at-a-time behavior depends on the Supabase RPCs `acquire_microsoft_admin_lock`, `refresh_microsoft_admin_lock`, and `release_microsoft_admin_lock`
+- Microsoft admin rows must exist in `admin_credentials` with `provider=microsoft` and `active=true`
+- `WORKER_ACTION_LEASE_SECONDS` controls stale action reclaim for crashed workers; it does not disable or replace the per-admin Supabase lock
+- the admin lock lease defaults to 7200 seconds in `Acquire-MicrosoftAdminLock`; actions that cannot obtain the lock are requeued without consuming an attempt
 
 ## Files
 

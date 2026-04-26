@@ -952,7 +952,7 @@ function Test-RecoveryDnsblListings {
 function Invoke-RecoveryReadyEmail {
     param([string]$RecoveryPoolId)
     $baseUrl = [string]$env:PIXIE_APP_API_BASE_URL
-    if (-not $baseUrl) { $baseUrl = "https://api.simpleinboxes.com/api/v1" }
+    if (-not $baseUrl) { $baseUrl = "https://app.simpleinboxes.com/api/v1" }
     $uri = "$($baseUrl.TrimEnd('/'))/internal/recovery/fire-ready-email"
     $body = @{ recoveryPoolId = $RecoveryPoolId } | ConvertTo-Json -Depth 5
     Invoke-RestMethod -Method POST -Uri $uri -Headers @{ "X-Cron-Secret" = $env:CRON_SECRET } -Body $body -ContentType "application/json" -TimeoutSec 30 -ErrorAction Stop | Out-Null

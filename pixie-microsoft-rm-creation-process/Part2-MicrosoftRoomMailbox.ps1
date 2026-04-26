@@ -353,6 +353,284 @@ function Wait-ForExchangeSync {
 }
 
 # ============================================================================
+# SENDING TOOL UPLOAD COORDINATION
+# ============================================================================
+function Get-ActiveDomainInboxes {
+    param([string]$DomainId)
+
+    $result = Invoke-SupabaseApi -Method GET -Table "inboxes" -Query "domain_id=eq.$DomainId&status=eq.active&order=created_at.asc&select=*"
+    if ($result.Success) { return @($result.Data) }
+    return @()
+}
+
+function Get-DomainCredentialAssignments {
+    param([string]$DomainId)
+
+    $result = Invoke-SupabaseApi -Method GET -Table "domain_credentials" -Query "domain_id=eq.$DomainId&select=credential_id"
+    if ($result.Success) { return @($result.Data) }
+    return @()
+}
+
+function Get-SendingToolUploadActions {
+    param([string]$DomainId)
+
+    $result = Invoke-SupabaseApi -Method GET -Table "actions" -Query "domain_id=eq.$DomainId&type=eq.reupload_inboxes&order=created_at.desc&limit=20&select=*"
+    if ($result.Success) { return @($result.Data) }
+    return @()
+}
+
+function Test-ActionPayloadMatchesProvision {
+    param([object]$Action, [string]$ProvisionActionId)
+
+    if (-not $Action -or -not $Action.payload) { return $false }
+    $payload = $Action.payload
+    return ([string]$payload.provision_action_id -eq $ProvisionActionId)
+}
+
+function New-SendingToolUploadAction {
+    param(
+        [object]$DomainRecord,
+        [string]$ProvisionActionId,
+        [int]$ExpectedActiveInboxCount
+    )
+
+    $body = @{
+        customer_id = $DomainRecord.customer_id
+        domain_id = $DomainRecord.id
+        type = "reupload_inboxes"
+        status = "pending"
+        attempts = 0
+        max_attempts = 8
+        payload = @{
+            domain = $DomainRecord.domain
+            source = "microsoft_provision"
+            provision_action_id = $ProvisionActionId
+            expected_active_inboxes = $ExpectedActiveInboxCount
+        }
+    }
+
+    $result = Invoke-SupabaseApi -Method POST -Table "actions" -Body $body
+    if ($result.Success -and $result.Data -and $result.Data.Count -gt 0) { return $result.Data[0] }
+    return $null
+}
+
+function Ensure-SendingToolUploadAction {
+    param(
+        [object]$DomainRecord,
+        [string]$ProvisionActionId,
+        [int]$ExpectedActiveInboxCount
+    )
+
+    $credentialAssignments = @(Get-DomainCredentialAssignments -DomainId $DomainRecord.id)
+    if ($credentialAssignments.Count -eq 0) {
+        return @{
+            Success = $false
+            Blocked = $true
+            Reason = "No sending tool credentials assigned to domain"
+        }
+    }
+
+    $uploadActions = @(Get-SendingToolUploadActions -DomainId $DomainRecord.id)
+    $matchingActions = @($uploadActions | Where-Object { Test-ActionPayloadMatchesProvision -Action $_ -ProvisionActionId $ProvisionActionId })
+    $existingOpenAction = $matchingActions | Where-Object { $_.status -in @("pending", "in_progress") } | Select-Object -First 1
+    if ($existingOpenAction) {
+        return @{ Success = $true; UploadAction = $existingOpenAction; Created = $false }
+    }
+
+    $existingCompletedAction = $matchingActions | Where-Object { $_.status -eq "completed" } | Select-Object -First 1
+    if ($existingCompletedAction) {
+        return @{ Success = $true; UploadAction = $existingCompletedAction; Created = $false }
+    }
+
+    $existingFailedAction = $matchingActions | Where-Object { $_.status -eq "failed" } | Select-Object -First 1
+    if ($existingFailedAction) {
+        return @{ Success = $true; UploadAction = $existingFailedAction; Created = $false }
+    }
+
+    $newAction = New-SendingToolUploadAction -DomainRecord $DomainRecord -ProvisionActionId $ProvisionActionId -ExpectedActiveInboxCount $ExpectedActiveInboxCount
+    if (-not $newAction) {
+        return @{
+            Success = $false
+            Blocked = $false
+            Reason = "Failed to enqueue reupload_inboxes action"
+        }
+    }
+
+    return @{ Success = $true; UploadAction = $newAction; Created = $true }
+}
+
+function Test-SendingToolUploadValidation {
+    param(
+        [object]$UploadAction,
+        [int]$ExpectedActiveInboxCount
+    )
+
+    if (-not $UploadAction) {
+        return @{ Complete = $false; Failed = $true; Reason = "Missing upload action" }
+    }
+
+    $status = [string]$UploadAction.status
+    if ($status -in @("pending", "in_progress")) {
+        return @{ Complete = $false; Failed = $false; Pending = $true; Reason = "Upload action is $status" }
+    }
+    if ($status -eq "failed") {
+        $errorMessage = if ($UploadAction.error) { [string]$UploadAction.error } else { "Upload action failed" }
+        return @{ Complete = $false; Failed = $true; Reason = $errorMessage }
+    }
+    if ($status -ne "completed") {
+        return @{ Complete = $false; Failed = $true; Reason = "Unexpected upload action status: $status" }
+    }
+
+    $result = $UploadAction.result
+    if (-not $result) {
+        return @{ Complete = $false; Failed = $true; Reason = "Upload action completed without result payload" }
+    }
+
+    $message = if ($result.PSObject.Properties.Name -contains "message") { [string]$result.message } else { "" }
+    if ($message -match "No sending tool credentials assigned") {
+        return @{ Complete = $false; Failed = $true; Reason = $message }
+    }
+
+    $uploaded = 0
+    if ($result.PSObject.Properties.Name -contains "uploaded" -and $null -ne $result.uploaded) {
+        try { $uploaded = [int]$result.uploaded } catch { $uploaded = 0 }
+    }
+
+    $failed = 0
+    if ($result.PSObject.Properties.Name -contains "failed" -and $null -ne $result.failed) {
+        try { $failed = [int]$result.failed } catch { $failed = 0 }
+    }
+
+    if ($failed -gt 0) {
+        return @{ Complete = $false; Failed = $true; Reason = "Upload validation completed with $failed failed inbox(es)" }
+    }
+    if ($uploaded -lt $ExpectedActiveInboxCount) {
+        return @{ Complete = $false; Failed = $true; Reason = "Upload validation confirmed $uploaded inbox(es), expected at least $ExpectedActiveInboxCount" }
+    }
+
+    return @{ Complete = $true; Failed = $false; Uploaded = $uploaded; FailedCount = $failed }
+}
+
+function Set-ProvisionActionPendingWithoutPenalty {
+    param(
+        [string]$ActionId,
+        [string]$Reason,
+        [int]$DelaySeconds = 120,
+        [object]$Result = $null
+    )
+
+    if ($Result) { Update-ActionResult -ActionId $ActionId -Result $Result }
+    $currentAction = Get-Action -ActionId $ActionId
+    if ($currentAction) {
+        Requeue-ActionWithoutPenalty -Action $currentAction -Reason $Reason -DelaySeconds $DelaySeconds
+    } else {
+        $nextRetryAt = (Get-Date).AddSeconds($DelaySeconds).ToString("yyyy-MM-ddTHH:mm:ssZ")
+        Update-ActionStatus -ActionId $ActionId -Status "pending" -Error $Reason -NextRetryAt $nextRetryAt
+    }
+}
+
+function Resolve-MicrosoftProvisioningUploadState {
+    param(
+        [object]$DomainRecord,
+        [string]$ActionId,
+        [string]$History,
+        [int]$ActualMailboxCount = 0
+    )
+
+    $domainId = $DomainRecord.id
+    $domain = $DomainRecord.domain
+    $customerId = $DomainRecord.customer_id
+    $activeInboxes = @(Get-ActiveDomainInboxes -DomainId $domainId)
+    $expectedActiveCount = $activeInboxes.Count
+
+    if ($expectedActiveCount -eq 0) {
+        $reason = "No active inboxes found; refusing to mark Microsoft domain active"
+        $history = Add-HistoryEntry -History $History -Entry "FAILED: $reason"
+        Update-Domain -DomainId $domainId -Fields @{ status = "in_progress"; interim_status = "Both - Failed"; action_history = $history }
+        Update-ActionStatus -ActionId $ActionId -Status "failed" -Error $reason
+        Add-ActionLog -ActionId $ActionId -DomainId $domainId -CustomerId $customerId -EventType "provisioning_finalization_failed" -Severity "error" -Message $reason
+        return @{ Complete = $false; Failed = $true; History = $history }
+    }
+
+    if ($ActualMailboxCount -gt 0 -and $ActualMailboxCount -lt $expectedActiveCount) {
+        $reason = "Mailbox count check failed: Exchange has $ActualMailboxCount mailbox(es), Supabase has $expectedActiveCount active inbox(es)"
+        $history = Add-HistoryEntry -History $History -Entry "FAILED: $reason"
+        Update-Domain -DomainId $domainId -Fields @{ status = "in_progress"; interim_status = "Both - Failed"; action_history = $history }
+        Update-ActionStatus -ActionId $ActionId -Status "failed" -Error $reason
+        Add-ActionLog -ActionId $ActionId -DomainId $domainId -CustomerId $customerId -EventType "provisioning_finalization_failed" -Severity "error" -Message $reason
+        return @{ Complete = $false; Failed = $true; History = $history }
+    }
+
+    $uploadActionResult = Ensure-SendingToolUploadAction -DomainRecord $DomainRecord -ProvisionActionId $ActionId -ExpectedActiveInboxCount $expectedActiveCount
+    if (-not $uploadActionResult.Success) {
+        $reason = $uploadActionResult.Reason
+        $interimStatus = if ($uploadActionResult.Blocked) { "Both - Sending Tool Upload Blocked" } else { "Both - Sending Tool Upload Failed" }
+        $history = Add-HistoryEntry -History $History -Entry "UPLOAD BLOCKED: $reason"
+        Update-Domain -DomainId $domainId -Fields @{ status = "in_progress"; interim_status = $interimStatus; action_history = $history }
+        Update-ActionStatus -ActionId $ActionId -Status "failed" -Error "Sending-tool upload blocked: $reason"
+        Add-ActionLog -ActionId $ActionId -DomainId $domainId -CustomerId $customerId -EventType "sending_tool_upload_blocked" -Severity "error" -Message $reason -Metadata @{ expected_active_inboxes = $expectedActiveCount }
+        return @{ Complete = $false; Failed = $true; History = $history }
+    }
+
+    $uploadAction = $uploadActionResult.UploadAction
+    $uploadActionId = [string]$uploadAction.id
+    $validation = Test-SendingToolUploadValidation -UploadAction $uploadAction -ExpectedActiveInboxCount $expectedActiveCount
+
+    if ($validation.Complete) {
+        $uploaded = [int]$validation.Uploaded
+        $history = Add-HistoryEntry -History $History -Entry "Sending-tool upload validated: $uploaded uploaded for $expectedActiveCount active inboxes"
+        Update-Domain -DomainId $domainId -Fields @{
+            status = "active"
+            interim_status = "Both - Provisioning Complete"
+            action_history = $history
+        }
+        Update-ActionStatus -ActionId $ActionId -Status "completed" -Result @{
+            domain = $domain
+            mailboxes_created = if ($ActualMailboxCount -gt 0) { $ActualMailboxCount } else { $expectedActiveCount }
+            active_inboxes_verified = $expectedActiveCount
+            upload_action_id = $uploadActionId
+            upload_validated = $true
+            uploaded = $uploaded
+        }
+        Add-ActionLog -ActionId $ActionId -DomainId $domainId -CustomerId $customerId -EventType "provisioning_complete" -Severity "info" -Message "Complete: $expectedActiveCount active inboxes, upload validated by action $uploadActionId" -Metadata @{ upload_action_id = $uploadActionId; uploaded = $uploaded; expected_active_inboxes = $expectedActiveCount }
+        return @{ Complete = $true; Failed = $false; History = $history; UploadActionId = $uploadActionId }
+    }
+
+    if ($validation.Failed) {
+        $reason = $validation.Reason
+        $history = Add-HistoryEntry -History $History -Entry "UPLOAD FAILED: $reason"
+        Update-Domain -DomainId $domainId -Fields @{ status = "in_progress"; interim_status = "Both - Sending Tool Upload Failed"; action_history = $history }
+        Update-ActionStatus -ActionId $ActionId -Status "failed" -Error "Sending-tool upload validation failed: $reason"
+        Add-ActionLog -ActionId $ActionId -DomainId $domainId -CustomerId $customerId -EventType "sending_tool_upload_failed" -Severity "error" -Message $reason -Metadata @{ upload_action_id = $uploadActionId; expected_active_inboxes = $expectedActiveCount }
+        return @{ Complete = $false; Failed = $true; History = $history; UploadActionId = $uploadActionId }
+    }
+
+    $delaySeconds = 120
+    if ($env:MICROSOFT_UPLOAD_POLL_SECONDS) {
+        try { $delaySeconds = [Math]::Max(30, [int]$env:MICROSOFT_UPLOAD_POLL_SECONDS) } catch { $delaySeconds = 120 }
+    }
+    $pendingEntry = if ($uploadActionResult.Created) {
+        "Queued sending-tool upload action $uploadActionId for $expectedActiveCount active inboxes"
+    } else {
+        "Sending-tool upload action $uploadActionId is $($uploadAction.status); waiting for validation"
+    }
+    $history = Add-HistoryEntry -History $History -Entry $pendingEntry
+    Update-Domain -DomainId $domainId -Fields @{
+        status = "in_progress"
+        interim_status = "Both - Sending Tool Upload Pending"
+        action_history = $history
+    }
+    Set-ProvisionActionPendingWithoutPenalty -ActionId $ActionId -Reason "Sending-tool upload pending (action $uploadActionId)" -DelaySeconds $delaySeconds -Result @{
+        domain = $domain
+        upload_pending = $true
+        upload_action_id = $uploadActionId
+        expected_active_inboxes = $expectedActiveCount
+    }
+    Add-ActionLog -ActionId $ActionId -DomainId $domainId -CustomerId $customerId -EventType "sending_tool_upload_pending" -Severity "warn" -Message "Waiting for reupload_inboxes action $uploadActionId before marking domain active" -Metadata @{ upload_action_id = $uploadActionId; expected_active_inboxes = $expectedActiveCount; retry_delay_seconds = $delaySeconds }
+    return @{ Complete = $false; Failed = $false; Pending = $true; History = $history; UploadActionId = $uploadActionId }
+}
+
+# ============================================================================
 # ORPHAN USER CLEANUP
 # ============================================================================
 function Remove-OrphanUsersForEmail {
@@ -1059,7 +1337,9 @@ function Process-MicrosoftDomain {
         "Both - DNS Records Added", "Microsoft - Exchange Synced",
         "Both - Creating Mailboxes", "Microsoft - Mailboxes Created",
         "Microsoft - Configuring Mailboxes", "Microsoft - SMTP Enabled",
-        "Both - DKIM Complete", "Both - Provisioning Complete", "Both - Failed"
+        "Both - DKIM Complete", "Both - Sending Tool Upload Pending",
+        "Both - Sending Tool Upload Blocked", "Both - Sending Tool Upload Failed",
+        "Both - Provisioning Complete", "Both - Failed"
     )
 
     if ($interimStatus -eq "Both - Provisioning Complete") {
@@ -1382,7 +1662,7 @@ function Process-MicrosoftDomain {
         $interimStatus = "Both - DKIM Complete"
     }
 
-    # ── STEP 11: Finalize ──
+    # ── STEP 11: Queue/validate sending-tool upload, then finalize ──
     if ($interimStatus -eq "Both - DKIM Complete") {
         $actualCount = 0
         if (-not $DryRun) {
@@ -1390,24 +1670,20 @@ function Process-MicrosoftDomain {
         }
 
         if ($failedSteps.Count -eq 0) {
-            $history = Add-HistoryEntry -History $history -Entry "PROVISIONING COMPLETE: $actualCount room mailboxes"
-            Update-Domain -DomainId $DomainId -Fields @{
-                status = "active"
-                interim_status = "Both - Provisioning Complete"
-                action_history = $history
-            }
-            Update-ActionStatus -ActionId $ActionId -Status "completed" -Result @{
-                domain = $Domain
-                mailboxes_created = $actualCount
-                dkim_enabled = $dkimSuccess
-            }
-            Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "provisioning_complete" -Severity "info" -Message "Complete: $actualCount room mailboxes, DKIM=$dkimSuccess"
-
             # Record admin assignment so retries and future mutations stay on the same tenant.
             Ensure-DomainAdminAssignment -DomainId $DomainId -AdminCredId $AdminRecord.id
             Update-AdminUsage -AdminId $AdminRecord.id -InboxCount $Inboxes.Count
 
-            Write-Host "  [COMPLETE] $Domain - $actualCount room mailboxes" -ForegroundColor Green
+            $uploadState = Resolve-MicrosoftProvisioningUploadState -DomainRecord $DomainRecord -ActionId $ActionId -History $history -ActualMailboxCount $actualCount
+            $history = $uploadState.History
+
+            if ($uploadState.Complete) {
+                Write-Host "  [COMPLETE] $Domain - $actualCount room mailboxes, upload validated" -ForegroundColor Green
+            } elseif ($uploadState.Pending) {
+                Write-Host "  [UPLOAD PENDING] $Domain - $actualCount room mailboxes, waiting for upload action $($uploadState.UploadActionId)" -ForegroundColor Yellow
+            } else {
+                Write-Host "  [PARTIAL] $Domain - Upload validation not complete" -ForegroundColor Yellow
+            }
         } else {
             $history = Add-HistoryEntry -History $history -Entry "FAILED STEPS: $($failedSteps -join ', ')"
             Update-Domain -DomainId $DomainId -Fields @{
@@ -1463,9 +1739,26 @@ if (-not $actionRecord) {
 $inboxes = Get-DomainInboxes -DomainId $DomainId -Status "pending"
 if ($inboxes.Count -eq 0) {
     Write-Log "No pending inboxes for $($domainRecord.domain)" -Level Warning
-    Update-Domain -DomainId $DomainId -Fields @{ status = "active" }
-    Update-ActionStatus -ActionId $ActionId -Status "completed" -Result @{ message = "No pending inboxes" }
-    exit 0
+
+    $existingHistory = if ($domainRecord.action_history) { $domainRecord.action_history } else { "" }
+    $activeInboxes = @(Get-ActiveDomainInboxes -DomainId $DomainId)
+    if ($activeInboxes.Count -eq 0) {
+        $reason = "No pending inboxes and no active inboxes found; refusing to mark Microsoft domain active"
+        $history = Add-HistoryEntry -History $existingHistory -Entry "FAILED: $reason"
+        Update-Domain -DomainId $DomainId -Fields @{ status = "in_progress"; interim_status = "Both - Failed"; action_history = $history }
+        Update-ActionStatus -ActionId $ActionId -Status "failed" -Error $reason
+        Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $domainRecord.customer_id -EventType "provisioning_finalization_failed" -Severity "error" -Message $reason
+        exit 1
+    }
+
+    $interimStatus = if ($domainRecord.interim_status) { [string]$domainRecord.interim_status } else { "" }
+    if ($interimStatus -in @("Both - DKIM Complete", "Both - Sending Tool Upload Pending", "Both - Sending Tool Upload Blocked", "Both - Sending Tool Upload Failed", "Both - Provisioning Complete")) {
+        Resolve-MicrosoftProvisioningUploadState -DomainRecord $domainRecord -ActionId $ActionId -History $existingHistory -ActualMailboxCount 0 | Out-Null
+        exit 0
+    }
+
+    Write-Log "Continuing provisioning with $($activeInboxes.Count) verified active inbox row(s)" -Level Info
+    $inboxes = $activeInboxes
 }
 
 Write-Log "Domain: $($domainRecord.domain), Inboxes: $($inboxes.Count)" -Level Info
