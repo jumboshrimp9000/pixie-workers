@@ -679,7 +679,7 @@ class GoogleSupabaseWorker:
                     dns_summary = {"created": len(dns_records), "skipped": 0, "failed": 0, "dry_run": True}
                 else:
                     dns_summary = self._get_cloudflare().upsert_dns_records(cloudflare_zone_id, dns_records)
-                    if dns_summary.get("failed", 0) > 0 and dns_summary.get("created", 0) == 0:
+                    if int(dns_summary.get("failed") or 0) > 0:
                         dns_errors = dns_summary.get("errors") or []
                         auth_related = any(
                             "authentication" in str(err.get("message", "")).lower()
@@ -692,7 +692,7 @@ class GoogleSupabaseWorker:
                                 "or configure CLOUDFLARE_GLOBAL_KEY and CLOUDFLARE_EMAIL."
                             )
                         else:
-                            guidance = "All DNS record writes failed in Cloudflare."
+                            guidance = "One or more required Google DNS records failed to write in Cloudflare."
                         fail_step(step, f"{guidance} summary={dns_summary}")
                         persist_progress(INTERIM_STATUSES["FAILED"])
                         log_event("step_failed", "error", f"[add_dns_records] {guidance}", {"dns_summary": dns_summary})
