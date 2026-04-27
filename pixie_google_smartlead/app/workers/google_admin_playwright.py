@@ -1888,7 +1888,7 @@ class GoogleAdminPlaywrightClient:
         return "authenticating email with dkim" in status_text
 
     def _dismiss_dkim_overlays(self) -> None:
-        self._click_any(
+        self._click_dkim_text_control_dom("got it") or self._click_any(
             [
                 "//span[translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='got it']",
                 "//button[.//span[translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='got it']]",
@@ -1899,11 +1899,17 @@ class GoogleAdminPlaywrightClient:
         time.sleep(0.4)
 
     def _click_start_dkim_authentication_dom(self) -> bool:
+        return self._click_dkim_text_control_dom("start authentication")
+
+    def _click_dkim_text_control_dom(self, label: str) -> bool:
         page = self._require_page()
+        expected_label = str(label or "").strip().lower()
+        if not expected_label:
+            return False
         try:
             return bool(
                 page.evaluate(
-                    """() => {
+                    """({ expectedLabel }) => {
                       const visible = (el) => {
                         const style = window.getComputedStyle(el);
                         const rect = el.getBoundingClientRect();
@@ -1920,20 +1926,21 @@ class GoogleAdminPlaywrightClient:
                       const controls = Array.from(document.querySelectorAll('button, [role="button"]'));
                       for (const el of controls) {
                         const text = (el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-                        if (!text.includes('start authentication') || !visible(el)) continue;
+                        if (!text.includes(expectedLabel) || !visible(el)) continue;
                         if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
                         return clickTarget(el);
                       }
                       const labels = Array.from(document.querySelectorAll('span, div'));
                       for (const el of labels) {
                         const text = (el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-                        if (text !== 'start authentication' || !visible(el)) continue;
+                        if (text !== expectedLabel || !visible(el)) continue;
                         const target = el.closest('button, [role="button"]') || el;
                         if (target.disabled || target.getAttribute('aria-disabled') === 'true') continue;
                         return clickTarget(target);
                       }
                       return false;
-                    }"""
+                    }""",
+                    {"expectedLabel": expected_label},
                 )
             )
         except Exception:
