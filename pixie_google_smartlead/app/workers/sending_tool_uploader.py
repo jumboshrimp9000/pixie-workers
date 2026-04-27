@@ -735,6 +735,11 @@ class SendingToolUploader:
                 payload["daily_rampup"] = payload.pop("warmup_rampup_increment")
             elif "rampup_increment" in payload:
                 payload["daily_rampup"] = payload.pop("rampup_increment")
+        if "daily_rampup" in payload:
+            try:
+                payload["daily_rampup"] = max(5, int(float(payload["daily_rampup"])))
+            except Exception:
+                payload.pop("daily_rampup", None)
 
         return payload
 
@@ -814,6 +819,8 @@ class SendingToolUploader:
             warmup_payload["increment"] = warmup_payload.pop("warmup_rampup_increment")
         if settings.get("enableWarmup") is not None:
             warmup_payload["enabled"] = bool(settings.get("enableWarmup"))
+        if "advanced" in warmup_payload and not isinstance(warmup_payload.get("advanced"), dict):
+            warmup_payload.pop("advanced", None)
         if warmup_payload:
             payload["warmup"] = warmup_payload
 
