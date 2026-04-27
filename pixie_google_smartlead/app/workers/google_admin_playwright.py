@@ -1692,6 +1692,10 @@ class GoogleAdminPlaywrightClient:
                 [
                     "//div[@role='listbox' and contains(@aria-label,'Selected domain')]",
                     "//div[@role='listbox'][contains(@aria-label,'domain')]",
+                    "//*[@role='combobox' and contains(@aria-label,'Selected domain')]",
+                    "//*[@role='combobox' and contains(@aria-label,'domain')]",
+                    "//button[contains(@aria-label,'Selected domain')]",
+                    "//button[contains(@aria-label,'domain')]",
                 ],
                 timeout_ms=2_000,
                 optional=True,
@@ -1704,15 +1708,19 @@ class GoogleAdminPlaywrightClient:
             [
                 "//div[@role='listbox' and contains(@aria-label,'Selected domain')]",
                 "//div[@role='listbox'][contains(@aria-label,'domain')]",
+                "//*[@role='combobox' and contains(@aria-label,'Selected domain')]",
+                "//*[@role='combobox' and contains(@aria-label,'domain')]",
+                "//button[contains(@aria-label,'Selected domain')]",
+                "//button[contains(@aria-label,'domain')]",
             ],
             timeout_ms=8_000,
             optional=True,
         )
         clicked = self._click_any(
             [
-                f"//div[@role='option' and @data-value='{domain_name}']",
-                f"//div[@role='option' and normalize-space()='{domain_name}']",
-                f"//div[@role='option' and contains(normalize-space(), '{domain_name}')]",
+                f"//*[@role='option' and @data-value='{domain_name}']",
+                f"//*[@role='option' and normalize-space()='{domain_name}']",
+                f"//*[@role='option' and contains(normalize-space(), '{domain_name}')]",
             ],
             timeout_ms=8_000,
             optional=True,
@@ -1724,10 +1732,9 @@ class GoogleAdminPlaywrightClient:
 
         for _ in range(120):
             for selector in [
-                f"//div[@role='option' and @data-value='{domain_name}']",
-                f"//li[@role='option' and @data-value='{domain_name}']",
-                f"//div[@role='option' and contains(translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{domain_name}')]",
-                f"//li[@role='option' and contains(translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{domain_name}')]",
+                f"//*[@role='option' and @data-value='{domain_name}']",
+                f"//*[@role='option' and contains(translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{domain_name}')]",
+                f"//*[(@data-value='{domain_name}' or @data-domain='{domain_name}') and (self::div or self::li or self::span)]",
             ]:
                 option = page.locator(self._selector(selector)).first
                 try:
@@ -1743,7 +1750,7 @@ class GoogleAdminPlaywrightClient:
             scroll_result = page.evaluate(
                 """() => {
                     const candidates = Array.from(document.querySelectorAll(
-                      '[role="listbox"], [role="presentation"] [role="list"], [role="presentation"], .VfPpkd-xl07Ob-XxIAqe'
+                      '[role="listbox"], [role="menu"], [role="presentation"] [role="list"], [role="presentation"], .VfPpkd-xl07Ob-XxIAqe'
                     ));
                     const popup = candidates.find((el) => el.scrollHeight > el.clientHeight + 8)
                       || candidates.find((el) => el.querySelector && el.querySelector('[role="option"]'));
