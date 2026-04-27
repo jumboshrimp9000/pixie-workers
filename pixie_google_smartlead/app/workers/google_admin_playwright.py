@@ -1901,6 +1901,22 @@ class GoogleAdminPlaywrightClient:
                   };
                   const normalize = (text) => (text || '').replace(/\\s+/g, ' ').trim();
                   const domainRe = /[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+/ig;
+
+                  const selectedOption = document.querySelector(
+                    '[role="listbox"][aria-label*="Selected domain" i] [role="option"][aria-selected="true"], ' +
+                    '[role="listbox"][aria-label*="domain" i] [role="option"][aria-selected="true"]'
+                  );
+                  if (selectedOption) {
+                    const explicitValue = normalize(selectedOption.getAttribute('data-value') || '').toLowerCase();
+                    if (explicitValue && domainRe.test(explicitValue)) return explicitValue;
+                    domainRe.lastIndex = 0;
+                    const selectedText = normalize(selectedOption.textContent).toLowerCase();
+                    const selectedMatches = [...selectedText.matchAll(domainRe)].map((m) => m[0].toLowerCase());
+                    const selectedUnique = [...new Set(selectedMatches)];
+                    if (selectedUnique.length === 1) return selectedUnique[0];
+                  }
+                  domainRe.lastIndex = 0;
+
                   const elements = Array.from(document.querySelectorAll('body *')).filter(visible);
                   const labels = elements
                     .map((el) => ({ el, text: normalize(el.textContent).toLowerCase(), rect: el.getBoundingClientRect() }))
