@@ -1736,7 +1736,7 @@ class GoogleAdminPlaywrightClient:
                 }
 
             self._dismiss_dkim_overlays()
-            self._click_start_dkim_authentication_dom() or self._click_any(
+            clicked_start = self._click_start_dkim_authentication_dom() or self._click_any(
                 [
                     "//div[@role='button'][.//span[translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='start authentication']]",
                     "//button[.//span[translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='start authentication']]",
@@ -1744,6 +1744,16 @@ class GoogleAdminPlaywrightClient:
                 timeout_ms=12_000,
                 optional=True,
             )
+            if clicked_start:
+                time.sleep(0.8)
+                self._click_dkim_text_control_dom("save") or self._click_any(
+                    [
+                        "//div[@role='button'][.//span[translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='save']]",
+                        "//button[.//span[translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='save']]",
+                    ],
+                    timeout_ms=8_000,
+                    optional=True,
+                )
             time.sleep(1.8)
 
             self._open_dkim_page()
