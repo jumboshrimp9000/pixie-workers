@@ -682,13 +682,14 @@ class NonprofitGoogleProvisionWorker:
             if self.dkim_dns_wait_seconds > 0:
                 time.sleep(self.dkim_dns_wait_seconds)
 
-            public_dkim = self._check_public_txt_record(dns_host, dns_value)
+            public_dkim_name = domain_name if dkim_name == "@" else f"{dkim_name}.{domain_name}"
+            public_dkim = self._check_public_txt_record(public_dkim_name, dns_value)
             step_details["public_dns"] = public_dkim
             if not public_dkim.get("visible"):
                 raise DeferredNonprofitAction(
                     (
                         f"Waiting for DKIM DNS propagation: Google DKIM TXT for {domain_name} "
-                        f"is not publicly visible yet at {dns_host}."
+                        f"is not publicly visible yet at {public_dkim_name}."
                     ),
                     delay_seconds=self.dkim_retry_seconds,
                     consume_attempt=False,
