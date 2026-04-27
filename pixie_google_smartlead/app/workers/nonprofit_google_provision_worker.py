@@ -324,6 +324,21 @@ class NonprofitGoogleProvisionWorker:
                 complete_step(step, dns_summary)
                 persist_progress(INTERIM_STATUSES["TXT_WRITTEN"], "in_progress")
 
+            mail_dns_checkpoint = checkpoint("write_google_mail_dns")
+            if not mail_dns_checkpoint:
+                step = start_step("write_google_mail_dns")
+                dns_summary = self._get_cloudflare().upsert_dns_records(
+                    zone_id,
+                    self._default_google_mail_dns_records(),
+                )
+                if int(dns_summary.get("failed") or 0) > 0:
+                    fail_message = f"Cloudflare Google mail DNS write failed for {domain_name}: {dns_summary}"
+                    fail_step(step, fail_message, dns_summary)
+                    persist_progress(INTERIM_STATUSES["FAILED"], "in_progress")
+                    raise RuntimeError(fail_message)
+                complete_step(step, dns_summary)
+                persist_progress(INTERIM_STATUSES["TXT_WRITTEN"], "in_progress")
+
             txt_visible_checkpoint = checkpoint("wait_public_txt")
             if not txt_visible_checkpoint:
                 step = start_step("wait_public_txt")
@@ -866,6 +881,21 @@ class NonprofitGoogleProvisionWorker:
             params={"select": "*", "id": f"eq.{panel_id}", "limit": "1"},
         )
         return rows[0] if rows else None
+
+    @staticmethod
+    def _default_google_mail_dns_records() -> List[Dict[str, Any]]:
+        return [
+            {
+                "type": "MX",
+                "name": "@",
+                "content": "smtp.google.com",
+                "priority": 1,
+                "ttl": 3600,
+                "replace_existing": True,
+            },
+            {"type": "TXT", "name": "@", "content": "v=spf1 include:_spf.google.com ~all", "ttl": 3600},
+            {"type": "TXT", "name": "_dmarc", "content": "v=DMARC1; p=none", "ttl": 3600},
+        ]
 
     @staticmethod
     def _panel_step_details(panel_details: Dict[str, Any]) -> Dict[str, Any]:

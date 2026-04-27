@@ -2020,11 +2020,14 @@ class GoogleSupabaseWorker:
 
     def _default_google_dns_records(self, _domain_name: str) -> List[Dict[str, Any]]:
         return [
-            {"type": "MX", "name": "@", "content": "ASPMX.L.GOOGLE.COM", "priority": 1, "ttl": 3600},
-            {"type": "MX", "name": "@", "content": "ALT1.ASPMX.L.GOOGLE.COM", "priority": 5, "ttl": 3600},
-            {"type": "MX", "name": "@", "content": "ALT2.ASPMX.L.GOOGLE.COM", "priority": 5, "ttl": 3600},
-            {"type": "MX", "name": "@", "content": "ALT3.ASPMX.L.GOOGLE.COM", "priority": 10, "ttl": 3600},
-            {"type": "MX", "name": "@", "content": "ALT4.ASPMX.L.GOOGLE.COM", "priority": 10, "ttl": 3600},
+            {
+                "type": "MX",
+                "name": "@",
+                "content": "smtp.google.com",
+                "priority": 1,
+                "ttl": 3600,
+                "replace_existing": True,
+            },
             {"type": "TXT", "name": "@", "content": "v=spf1 include:_spf.google.com ~all", "ttl": 3600},
             {"type": "TXT", "name": "_dmarc", "content": "v=DMARC1; p=none", "ttl": 3600},
         ]
