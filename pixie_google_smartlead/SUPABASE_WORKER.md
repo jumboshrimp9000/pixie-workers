@@ -162,7 +162,7 @@ For each Google action:
      - daily limit -> `max_email_per_day` (reflected by Smartlead as `message_per_day`)
      - signature -> `signature`
      - escaped signature line breaks (`\\n`) are normalized to real newlines before submit
-   - Smartlead warmup payload uses `warmup_enabled` (not `enabled`)
+   - Smartlead warmup payload uses `warmup_enabled` (not `enabled`), clamps `daily_rampup` to Smartlead's minimum of 5, and verifies daily warmup from `fetch-warmup-details-by-email-account-id/{id}`
 14. Mark inboxes active in Supabase and store generated/assigned credentials.
 15. Mark the domain active and complete the action.
 

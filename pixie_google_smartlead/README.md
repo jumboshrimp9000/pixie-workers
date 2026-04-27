@@ -15,6 +15,10 @@ Free/nonprofit Google service (`pixie-google-free-nonprofit-worker`, `main_nonpr
 - `free_google_provision`
 - `free_google_cancel_domain`
 
+Free/nonprofit actions use Google nonprofit panel credentials and do not call
+PartnerHub. Free Google promo domains must arrive as `free_google_provision`
+actions; paid `google_provision` is reserved for paid Google fulfillment.
+
 ## Fulfillment capabilities
 
 Initial Google provisioning:
@@ -46,7 +50,11 @@ Google OAuth anti-regression rules:
 Sending-tool settings behavior:
 - this worker only applies settings for newly processed domains (future orders)
 - Instantly settings include account patch + warmup enable + tag assignment (tag create/lookup first)
+- Instantly Google OAuth treats the Instantly callback URL as OAuth completion and relies on account validation for final proof
 - Smartlead settings include account update + warmup update + tag update
+- Smartlead Google OAuth supports both the old `Connect Mailbox` entry point and the current `Add` account UI
+- Smartlead warmup normalizes `enabled` to `warmup_enabled` and clamps `daily_rampup` to Smartlead's minimum of 5; the requested daily warmup count remains `total_warmup_per_day`
+- Smartlead warmup verification reads back `fetch-warmup-details-by-email-account-id/{id}` and checks active status plus the daily warmup limit fields
 - upload validation remains strict; if settings apply fails for any expected inbox, the step fails with actionable logs
 
 Existing-domain lifecycle:
