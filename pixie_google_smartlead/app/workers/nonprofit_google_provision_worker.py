@@ -15,7 +15,6 @@ from app import get_order_logger
 from app.workers.google_admin_playwright import GoogleAdminPlaywrightClient, GoogleAdminUser
 from app.workers.google_fulfillment_clients import CloudflareClient
 from app.workers.nonprofit_google_admin_playwright import (
-    enable_dkim_for_domain,
     setup_user_2fa,
     verify_domain_in_admin,
 )
@@ -36,6 +35,8 @@ INTERIM_STATUSES = {
     "TXT_VISIBLE": "Free Google - DNS TXT Visible",
     "DOMAIN_VERIFIED": "Free Google - Domain Verified",
     "USERS_CREATED": "Free Google - Users Created",
+    "ADMIN_APPS": "Free Google - Admin Apps Configured",
+    "DKIM_PROPAGATING": "Free Google - Waiting for DKIM DNS",
     "DKIM_ENABLED": "Free Google - DKIM Enabled",
     "MFA_ENROLLMENT": "Free Google - 2FA Enrolling",
     "SENDING_TOOL_UPLOAD": "Free Google - Sending Tool Upload",
@@ -43,12 +44,28 @@ INTERIM_STATUSES = {
     "FAILED": "Free Google - Failed",
 }
 
+DEFAULT_SMARTLEAD_APP_ID = "1021517043376-ipe8289dof3t2v9apjpae8hs2q9abetp.apps.googleusercontent.com"
+DEFAULT_INSTANTLY_APP_ID = "536726988839-pt93oro4685dtb1emb0pp2vjgjol5mls.apps.googleusercontent.com"
+OPTIONAL_GOOGLE_APP_IDS = {
+    "master_inbox": "563322621692-2vfek77q0f6trjlt3afr7ag6cf0pvfeh.apps.googleusercontent.com",
+    "warmy": "964878161904-5uqi9bsrj16frjku01ep27qs0504ujjr.apps.googleusercontent.com",
+    "plusvibe": "915060167262-mt46cccq569tgg2rb5qk375pf95obh6e.apps.googleusercontent.com",
+}
+
 
 class DeferredNonprofitAction(RuntimeError):
-    def __init__(self, message: str, *, delay_seconds: float, consume_attempt: bool = False) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        delay_seconds: float,
+        consume_attempt: bool = False,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
         super().__init__(message)
         self.delay_seconds = delay_seconds
         self.consume_attempt = consume_attempt
+        self.details = details or {}
 
 
 class NonprofitGoogleProvisionWorker:
@@ -63,9 +80,25 @@ class NonprofitGoogleProvisionWorker:
             os.getenv("NONPROFIT_GOOGLE_REQUIRE_MFA_ENROLLMENT", "true"),
             default=True,
         )
+        default_required_ids = self._parse_google_app_ids(os.getenv("GOOGLE_REQUIRED_ADMIN_APP_IDS", ""))
+        self.required_google_app_ids = default_required_ids or [DEFAULT_SMARTLEAD_APP_ID, DEFAULT_INSTANTLY_APP_ID]
+        self.require_admin_apps = self._as_bool(os.getenv("GOOGLE_REQUIRE_ADMIN_APPS"), default=True)
+        self.admin_apps_attempts = max(1, int(os.getenv("GOOGLE_ADMIN_APPS_ATTEMPTS", "3")))
+        self.admin_apps_retry_delay_seconds = max(
+            5.0,
+            float(os.getenv("GOOGLE_ADMIN_APPS_RETRY_DELAY_SECONDS", "20")),
+        )
+        self.require_dkim_enabled = self._as_bool(os.getenv("GOOGLE_REQUIRE_DKIM_ENABLED"), default=True)
+        self.dkim_auth_attempts = max(1, int(os.getenv("GOOGLE_DKIM_AUTH_ATTEMPTS", "5")))
+        self.dkim_auth_interval_seconds = max(5.0, float(os.getenv("GOOGLE_DKIM_AUTH_INTERVAL_SECONDS", "45")))
+        self.dkim_dns_wait_seconds = max(0.0, float(os.getenv("GOOGLE_DKIM_DNS_WAIT_SECONDS", "10")))
         self.dns_propagation_retry_seconds = max(
             60.0,
             float(os.getenv("NONPROFIT_GOOGLE_DNS_PROPAGATION_RETRY_SECONDS", "300")),
+        )
+        self.dkim_retry_seconds = max(
+            60.0,
+            float(os.getenv("NONPROFIT_GOOGLE_DKIM_RETRY_SECONDS", str(self.dns_propagation_retry_seconds))),
         )
         self.admin_vault = str(os.getenv("NONPROFIT_GOOGLE_ADMIN_OP_VAULT") or "").strip()
         self.user_vault = str(os.getenv("NONPROFIT_GOOGLE_USER_OP_VAULT") or "icje7jpscrdm6xtlcr252zxinq").strip()
@@ -241,6 +274,7 @@ class NonprofitGoogleProvisionWorker:
             panel_id = str(panel_details.get("panel_id") or panel_details.get("id") or "").strip()
             if not panel_id:
                 raise RuntimeError("Panel assignment RPC did not return panel_id")
+            app_plan = self._resolve_google_admin_app_ids(payload)
 
             panel_record = self._get_panel_record(panel_id)
             if not panel_record:
@@ -394,10 +428,40 @@ class NonprofitGoogleProvisionWorker:
                 complete_step(step, create_result)
                 persist_progress(INTERIM_STATUSES["USERS_CREATED"], "in_progress")
 
+            app_config_checkpoint = checkpoint("configure_admin_apps")
+            if not app_config_checkpoint:
+                step = start_step("configure_admin_apps")
+                try:
+                    apps_result = self._configure_admin_apps(app_plan, admin_creds)
+                except Exception as exc:
+                    message = f"Google Admin app allowlist failed for {domain_name}: {exc}"
+                    fail_step(step, message)
+                    persist_progress(INTERIM_STATUSES["FAILED"], "in_progress")
+                    raise RuntimeError(message) from exc
+                complete_step(step, apps_result)
+                persist_progress(INTERIM_STATUSES["ADMIN_APPS"], "in_progress")
+
             dkim_checkpoint = checkpoint("enable_dkim")
             if not dkim_checkpoint:
                 step = start_step("enable_dkim")
-                dkim_result = asyncio.run(self._enable_dkim(domain_name, admin_creds))
+                try:
+                    dkim_result = self._enable_dkim(domain_name, zone_id, admin_creds)
+                except DeferredNonprofitAction as exc:
+                    message = str(exc)
+                    step["status"] = "waiting"
+                    step["completedAt"] = self._iso_now()
+                    step["error"] = message
+                    step["details"] = {
+                        **getattr(exc, "details", {}),
+                        "nextRetrySeconds": exc.delay_seconds,
+                    }
+                    persist_progress(INTERIM_STATUSES["DKIM_PROPAGATING"], "in_progress")
+                    raise
+                except Exception as exc:
+                    message = f"DKIM setup failed for {domain_name}: {exc}"
+                    fail_step(step, message)
+                    persist_progress(INTERIM_STATUSES["FAILED"], "in_progress")
+                    raise RuntimeError(message) from exc
                 complete_step(step, dkim_result)
                 persist_progress(INTERIM_STATUSES["DKIM_ENABLED"], "in_progress")
 
@@ -528,16 +592,121 @@ class NonprofitGoogleProvisionWorker:
                 await context.close()
                 await browser.close()
 
-    async def _enable_dkim(self, domain_name: str, admin_creds: Dict[str, Any]) -> Dict[str, Any]:
-        async with async_playwright() as pw:
-            browser = await pw.chromium.launch(headless=self.playwright_headless)
-            context = await browser.new_context(viewport={"width": 1920, "height": 1080}, locale="en-US")
-            page = await context.new_page()
+    def _enable_dkim(self, domain_name: str, cloudflare_zone_id: str, admin_creds: Dict[str, Any]) -> Dict[str, Any]:
+        admin_email = str(admin_creds.get("admin_email") or "").strip().lower()
+        admin_password = str(admin_creds.get("admin_password") or "").strip()
+        if not admin_email or not admin_password:
+            raise RuntimeError("Panel admin credentials are required for DKIM setup")
+
+        op_client = admin_creds.get("_op_client")
+        if not isinstance(op_client, OnePasswordCliClient):
+            op_client = None
+
+        with GoogleAdminPlaywrightClient(headless=self.playwright_headless, timeout_seconds=90) as browser:
+            browser.login(
+                admin_email,
+                admin_password,
+                onepassword=op_client,
+                totp_secret=str(admin_creds.get("totp_secret") or "").strip(),
+            )
+
             try:
-                return await enable_dkim_for_domain(page, domain_name, admin_creds, logger.info)
-            finally:
-                await context.close()
-                await browser.close()
+                dkim_record = browser.fetch_dkim_txt_record(domain_name)
+            except RuntimeError as exc:
+                if self._is_dkim_domain_pending_error(str(exc)):
+                    raise DeferredNonprofitAction(
+                        (
+                            f"Waiting for Google Admin DKIM selector to list {domain_name}. "
+                            "The domain is verified and users exist, but Google Admin has not exposed it on the DKIM page yet."
+                        ),
+                        delay_seconds=self.dkim_retry_seconds,
+                        consume_attempt=False,
+                        details={
+                            "classification": "google_admin_dkim_domain_pending",
+                            "domain": domain_name,
+                            "error": str(exc),
+                            "playwrightAttempted": True,
+                        },
+                    ) from exc
+                raise
+
+            step_details: Dict[str, Any] = dict(dkim_record)
+            if bool(dkim_record.get("already_enabled")):
+                step_details["authentication"] = {
+                    "enabled": True,
+                    "already_enabled": True,
+                }
+                return step_details
+
+            dns_host = str(dkim_record.get("dns_host") or "").strip()
+            dns_value = str(dkim_record.get("dns_value") or "").strip()
+            if not dns_host or not dns_value:
+                raise RuntimeError(f"Google Admin did not return DKIM DNS values for {domain_name}")
+
+            dkim_name = self._normalize_dns_name_for_zone(dns_host, domain_name)
+            dkim_record_payload = {
+                "type": "TXT",
+                "name": dkim_name,
+                "content": dns_value,
+                "ttl": 3600,
+            }
+            dkim_dns_summary = self._get_cloudflare().upsert_dns_records(
+                cloudflare_zone_id,
+                [dkim_record_payload],
+            )
+            step_details["dns_write"] = {
+                "name": dkim_name,
+                "summary": dkim_dns_summary,
+            }
+            if (
+                int(dkim_dns_summary.get("failed") or 0) > 0
+                and int(dkim_dns_summary.get("created") or 0) == 0
+                and int(dkim_dns_summary.get("skipped") or 0) == 0
+            ):
+                raise RuntimeError(f"Cloudflare DKIM TXT write failed: {dkim_dns_summary}")
+
+            if self.dkim_dns_wait_seconds > 0:
+                time.sleep(self.dkim_dns_wait_seconds)
+
+            public_dkim = self._check_public_txt_record(dns_host, dns_value)
+            step_details["public_dns"] = public_dkim
+            if not public_dkim.get("visible"):
+                raise DeferredNonprofitAction(
+                    (
+                        f"Waiting for DKIM DNS propagation: Google DKIM TXT for {domain_name} "
+                        f"is not publicly visible yet at {dns_host}."
+                    ),
+                    delay_seconds=self.dkim_retry_seconds,
+                    consume_attempt=False,
+                    details={
+                        **step_details,
+                        "classification": "dkim_dns_propagation",
+                        "playwrightAttempted": True,
+                    },
+                )
+
+            dkim_auth = browser.start_dkim_authentication(
+                domain_name,
+                attempts=self.dkim_auth_attempts,
+                sleep_seconds=self.dkim_auth_interval_seconds,
+            )
+            step_details["authentication"] = dkim_auth
+            if not bool(dkim_auth.get("enabled")) and self.require_dkim_enabled:
+                raise DeferredNonprofitAction(
+                    (
+                        f"Waiting for Google to accept DKIM authentication for {domain_name}. "
+                        f"Public DKIM TXT is visible, but Google has not marked DKIM enabled yet."
+                    ),
+                    delay_seconds=self.dkim_retry_seconds,
+                    consume_attempt=False,
+                    details={
+                        **step_details,
+                        "classification": "google_dkim_authentication_pending",
+                        "playwrightAttempted": True,
+                    },
+                )
+
+            return step_details
 
     async def _setup_all_user_2fa(
         self,
@@ -831,6 +1000,126 @@ class NonprofitGoogleProvisionWorker:
             "method": "google_admin_playwright",
         }
 
+    def _configure_admin_apps(self, app_plan: Dict[str, List[str]], admin_creds: Dict[str, Any]) -> Dict[str, Any]:
+        step_details: Dict[str, Any] = {
+            "required_app_ids": app_plan.get("required") or [],
+            "optional_app_ids": app_plan.get("optional") or [],
+            "invalid_app_ids": app_plan.get("invalid") or [],
+            "max_attempts": self.admin_apps_attempts,
+        }
+        requested = list(app_plan.get("all") or [])
+        if not requested:
+            step_details["requested"] = []
+            step_details["skipped"] = "No Google app client IDs requested"
+            return step_details
+
+        admin_email = str(admin_creds.get("admin_email") or "").strip().lower()
+        admin_password = str(admin_creds.get("admin_password") or "").strip()
+        if not admin_email or not admin_password:
+            raise RuntimeError("Panel admin credentials are required for Google app allowlisting")
+
+        op_client = admin_creds.get("_op_client")
+        if not isinstance(op_client, OnePasswordCliClient):
+            op_client = None
+
+        required_unresolved = list(app_plan.get("required") or [])
+        attempt_records: List[Dict[str, Any]] = []
+        added_ids: set = set()
+        already_configured_ids: set = set()
+        invalid_ids: set = set(app_plan.get("invalid") or [])
+        failed_by_id: Dict[str, Dict[str, str]] = {}
+
+        with GoogleAdminPlaywrightClient(headless=self.playwright_headless, timeout_seconds=90) as browser:
+            browser.login(
+                admin_email,
+                admin_password,
+                onepassword=op_client,
+                totp_secret=str(admin_creds.get("totp_secret") or "").strip(),
+            )
+
+            for attempt in range(1, self.admin_apps_attempts + 1):
+                request_ids = requested if attempt == 1 else required_unresolved
+                if not request_ids:
+                    break
+
+                apps_result = browser.add_trusted_apps(request_ids)
+                attempt_records.append(
+                    {
+                        "attempt": attempt,
+                        "requested": request_ids,
+                        "result": apps_result,
+                    }
+                )
+
+                for client_id in apps_result.get("added") or []:
+                    clean = str(client_id or "").strip()
+                    if clean:
+                        added_ids.add(clean)
+                        failed_by_id.pop(clean, None)
+                for client_id in apps_result.get("already_configured") or []:
+                    clean = str(client_id or "").strip()
+                    if clean:
+                        already_configured_ids.add(clean)
+                        failed_by_id.pop(clean, None)
+                for client_id in apps_result.get("invalid") or []:
+                    clean = str(client_id or "").strip()
+                    if clean:
+                        invalid_ids.add(clean)
+                        failed_by_id.pop(clean, None)
+                for row in apps_result.get("failed") or []:
+                    if not isinstance(row, dict):
+                        continue
+                    clean = str(row.get("client_id") or "").strip()
+                    if clean:
+                        failed_by_id[clean] = {
+                            "client_id": clean,
+                            "error": str(row.get("error") or "").strip(),
+                        }
+
+                required_unresolved = [
+                    client_id
+                    for client_id in (app_plan.get("required") or [])
+                    if client_id not in added_ids and client_id not in already_configured_ids
+                ]
+                if required_unresolved and attempt < self.admin_apps_attempts:
+                    time.sleep(min(120.0, self.admin_apps_retry_delay_seconds * attempt))
+
+        failed_rows: List[Dict[str, str]] = []
+        for client_id in requested:
+            if client_id in added_ids or client_id in already_configured_ids:
+                continue
+            if client_id in failed_by_id:
+                failed_rows.append(failed_by_id[client_id])
+            else:
+                failed_rows.append(
+                    {
+                        "client_id": client_id,
+                        "error": "No success confirmation from Google Admin app flow",
+                    }
+                )
+
+        required_failed = sorted(
+            client_id
+            for client_id in (app_plan.get("required") or [])
+            if client_id not in added_ids and client_id not in already_configured_ids
+        )
+        step_details.update(
+            {
+                "attempts": attempt_records,
+                "requested": requested,
+                "added": sorted(added_ids),
+                "already_configured": sorted(already_configured_ids),
+                "invalid": sorted(invalid_ids),
+                "failed": failed_rows,
+                "required_failed": required_failed,
+            }
+        )
+        if required_failed and self.require_admin_apps:
+            raise RuntimeError(
+                f"Required Google app allowlist failed for {required_failed}. failed={failed_rows}"
+            )
+        return step_details
+
     def _resolve_inbox_email(self, inbox: Dict[str, Any], domain_name: str) -> str:
         explicit = str(inbox.get("email") or inbox.get("google_email") or inbox.get("workspace_email") or "").strip().lower()
         if "@" in explicit:
@@ -863,6 +1152,131 @@ class NonprofitGoogleProvisionWorker:
         if "smartlead" in text:
             return "smartlead.ai"
         return text
+
+    def _resolve_google_admin_app_ids(self, payload: Dict[str, Any]) -> Dict[str, List[str]]:
+        required = [v for v in self.required_google_app_ids if self._is_valid_google_app_id(v)]
+        optional: List[str] = []
+        invalid: List[str] = []
+
+        if self._as_bool(payload.get("master_inbox_enable"), default=False):
+            optional.append(OPTIONAL_GOOGLE_APP_IDS["master_inbox"])
+        if self._as_bool(payload.get("warmy_enable"), default=False) or self._as_bool(
+            payload.get("warmy_enabled"),
+            default=False,
+        ):
+            optional.append(OPTIONAL_GOOGLE_APP_IDS["warmy"])
+        if self._as_bool(payload.get("plusvibe_enable"), default=False) or self._as_bool(
+            payload.get("plusvibe_enabled"),
+            default=False,
+        ):
+            optional.append(OPTIONAL_GOOGLE_APP_IDS["plusvibe"])
+
+        bison_app_id = str(payload.get("bison_app_id") or "").strip()
+        if bison_app_id:
+            if self._is_valid_google_app_id(bison_app_id):
+                optional.append(bison_app_id)
+            else:
+                invalid.append(bison_app_id)
+
+        raw_additional = (
+            payload.get("additional_tools_id")
+            or payload.get("additional_app_ids")
+            or payload.get("google_app_ids")
+            or payload.get("admin_app_ids")
+        )
+        for entry in self._flatten_google_app_id_input(raw_additional):
+            if self._is_valid_google_app_id(entry):
+                optional.append(entry)
+            else:
+                invalid.append(entry)
+
+        merged: List[str] = []
+        seen = set()
+        for candidate in required + optional:
+            clean = str(candidate or "").strip()
+            if not clean or clean in seen:
+                continue
+            seen.add(clean)
+            merged.append(clean)
+
+        return {
+            "required": [v for v in required if v in merged],
+            "optional": [v for v in optional if v in merged and v not in required],
+            "invalid": sorted({v for v in invalid if v}),
+            "all": merged,
+        }
+
+    def _parse_google_app_ids(self, value: Any) -> List[str]:
+        parsed: List[str] = []
+        seen = set()
+
+        for entry in self._flatten_google_app_id_input(value):
+            clean = str(entry or "").strip()
+            if not clean:
+                continue
+            if not self._is_valid_google_app_id(clean):
+                logger.warning("Ignoring invalid GOOGLE_REQUIRED_ADMIN_APP_IDS entry: %s", clean)
+                continue
+            if clean in seen:
+                continue
+            seen.add(clean)
+            parsed.append(clean)
+
+        return parsed
+
+    def _flatten_google_app_id_input(self, value: Any) -> List[str]:
+        if value is None:
+            return []
+
+        parsed = value
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return []
+            if text.startswith("["):
+                try:
+                    parsed = json.loads(text)
+                except Exception:
+                    parsed = text
+            elif "," in text:
+                parsed = [v.strip() for v in text.split(",") if v.strip()]
+            else:
+                parsed = text
+
+        if isinstance(parsed, list):
+            return [str(v).strip() for v in parsed if str(v or "").strip()]
+        if isinstance(parsed, dict):
+            values: List[str] = []
+            for candidate in parsed.values():
+                values.extend(self._flatten_google_app_id_input(candidate))
+            return values
+
+        text = str(parsed or "").strip()
+        return [text] if text else []
+
+    @staticmethod
+    def _is_valid_google_app_id(value: str) -> bool:
+        text = str(value or "").strip().lower()
+        return bool(text and text.endswith(".apps.googleusercontent.com"))
+
+    @staticmethod
+    def _normalize_dns_name_for_zone(dns_host: str, domain_name: str) -> str:
+        host = str(dns_host or "").strip().rstrip(".").lower()
+        domain = str(domain_name or "").strip().rstrip(".").lower()
+        if not host:
+            return "@"
+        if host == domain:
+            return "@"
+        suffix = f".{domain}"
+        if host.endswith(suffix):
+            relative = host[: -len(suffix)].strip(".")
+            return relative or "@"
+        return host
+
+    @staticmethod
+    def _is_dkim_domain_pending_error(message: str) -> bool:
+        text = str(message or "").strip().lower()
+        return "could not select dkim domain" in text or "dkim domain" in text and "not selectable" in text
 
     def _rpc(self, fn: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         response = self.client.session.post(

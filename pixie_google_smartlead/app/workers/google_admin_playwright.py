@@ -1682,6 +1682,24 @@ class GoogleAdminPlaywrightClient:
         )
 
     def _select_dkim_domain(self, domain: str) -> None:
+        domain_name = str(domain or "").strip().lower()
+        if not domain_name:
+            raise RuntimeError("DKIM domain is required")
+        page = self._require_page()
+
+        def selected_text() -> str:
+            return self._inner_text_any(
+                [
+                    "//div[@role='listbox' and contains(@aria-label,'Selected domain')]",
+                    "//div[@role='listbox'][contains(@aria-label,'domain')]",
+                ],
+                timeout_ms=2_000,
+                optional=True,
+            ).lower()
+
+        if domain_name in selected_text():
+            return
+
         self._click_any(
             [
                 "//div[@role='listbox' and contains(@aria-label,'Selected domain')]",
@@ -1690,15 +1708,61 @@ class GoogleAdminPlaywrightClient:
             timeout_ms=8_000,
             optional=True,
         )
-        self._click_any(
+        clicked = self._click_any(
             [
-                f"//div[@role='option' and @data-value='{domain}']",
-                f"//div[@role='option' and normalize-space()='{domain}']",
-                f"//div[@role='option' and contains(normalize-space(), '{domain}')]",
+                f"//div[@role='option' and @data-value='{domain_name}']",
+                f"//div[@role='option' and normalize-space()='{domain_name}']",
+                f"//div[@role='option' and contains(normalize-space(), '{domain_name}')]",
             ],
             timeout_ms=8_000,
             optional=True,
         )
+        if clicked:
+            time.sleep(0.8)
+            if domain_name in selected_text():
+                return
+
+        for _ in range(120):
+            for selector in [
+                f"//div[@role='option' and @data-value='{domain_name}']",
+                f"//li[@role='option' and @data-value='{domain_name}']",
+                f"//div[@role='option' and contains(translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{domain_name}')]",
+                f"//li[@role='option' and contains(translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{domain_name}')]",
+            ]:
+                option = page.locator(self._selector(selector)).first
+                try:
+                    option.wait_for(state="attached", timeout=350)
+                    option.scroll_into_view_if_needed(timeout=1_000)
+                    option.click(timeout=1_500)
+                    time.sleep(0.8)
+                    if domain_name in selected_text():
+                        return
+                except Exception:
+                    pass
+
+            scroll_result = page.evaluate(
+                """() => {
+                    const candidates = Array.from(document.querySelectorAll(
+                      '[role="listbox"], [role="presentation"] [role="list"], [role="presentation"], .VfPpkd-xl07Ob-XxIAqe'
+                    ));
+                    const popup = candidates.find((el) => el.scrollHeight > el.clientHeight + 8)
+                      || candidates.find((el) => el.querySelector && el.querySelector('[role="option"]'));
+                    if (!popup) return { scrolled: false, reason: 'no-scroll-container' };
+                    const before = popup.scrollTop || 0;
+                    const maxTop = Math.max(0, popup.scrollHeight - popup.clientHeight);
+                    const delta = Math.max(260, Math.floor((popup.clientHeight || 420) * 0.85));
+                    popup.scrollTop = Math.min(maxTop, before + delta);
+                    popup.dispatchEvent(new Event('scroll', { bubbles: true }));
+                    return { scrolled: popup.scrollTop > before, before, after: popup.scrollTop, maxTop };
+                }"""
+            )
+            time.sleep(0.25)
+            if isinstance(scroll_result, dict) and not scroll_result.get("scrolled"):
+                if float(scroll_result.get("after") or 0) >= float(scroll_result.get("maxTop") or 0):
+                    break
+
+        debug = self._capture_debug_state(f"dkim_domain_not_selectable_{self._slug(domain_name)}")
+        raise RuntimeError(f"Could not select DKIM domain {domain_name}. {debug}")
 
     def _is_dkim_enabled(self) -> bool:
         if self._exists(
