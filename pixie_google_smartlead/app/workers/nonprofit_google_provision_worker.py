@@ -185,10 +185,12 @@ class NonprofitGoogleProvisionWorker:
             if details:
                 step["details"] = details
 
-        def fail_step(step: Dict[str, Any], error: str) -> None:
+        def fail_step(step: Dict[str, Any], error: str, details: Optional[Dict[str, Any]] = None) -> None:
             step["status"] = "failed"
             step["completedAt"] = self._iso_now()
             step["error"] = error
+            if details is not None:
+                step["details"] = details
 
         def skip_step(step_name: str, reason: str) -> None:
             steps.append({"step": step_name, "status": "skipped", "details": {"reason": reason}})
@@ -505,7 +507,8 @@ class NonprofitGoogleProvisionWorker:
                 upload_result = self._upload_to_sending_tool(domain_id, domain_name, inboxes)
                 if upload_result.get("skipped"):
                     fail_message = f"Sending-tool upload skipped: {upload_result.get('skipped')}"
-                    fail_step(step, fail_message)
+                    fail_step(step, fail_message, upload_result)
+                    log_event("step_failed", "error", f"[upload_sending_tool] {fail_message}", {"upload_result": upload_result})
                     persist_progress(INTERIM_STATUSES["FAILED"], "in_progress")
                     raise RuntimeError(fail_message)
                 if upload_result.get("failed_uploads"):
@@ -513,7 +516,8 @@ class NonprofitGoogleProvisionWorker:
                         f"{upload_result.get('tool') or 'sending tool'} upload validation failed for "
                         f"{len(upload_result.get('failed_uploads') or [])}/{upload_result.get('total_candidates') or 0} inbox(es)"
                     )
-                    fail_step(step, fail_message)
+                    fail_step(step, fail_message, upload_result)
+                    log_event("step_failed", "error", f"[upload_sending_tool] {fail_message}", {"upload_result": upload_result})
                     persist_progress(INTERIM_STATUSES["FAILED"], "in_progress")
                     raise RuntimeError(fail_message)
                 complete_step(step, upload_result)

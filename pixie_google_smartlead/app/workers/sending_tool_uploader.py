@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -156,7 +157,8 @@ class SendingToolUploader:
             playwright = sync_playwright().start()
             browser = self._launch_playwright_browser(playwright, headless=headless)
 
-            for inbox in inboxes:
+            total_inboxes = len(inboxes)
+            for index, inbox in enumerate(inboxes, start=1):
                 email = self._normalize_email(inbox.get("email"))
                 password = str(inbox.get("password") or "").strip()
                 if not email:
@@ -166,6 +168,13 @@ class SendingToolUploader:
                     continue
                 context = None
                 page = None
+                started_at = time.time()
+                logger.info(
+                    "[SendingToolUploader:Instantly] [%s/%s] Starting OAuth for %s",
+                    index,
+                    total_inboxes,
+                    email,
+                )
                 try:
                     context, page = self._create_oauth_context_page(browser)
                     auth_url, session_id = self._instantly_init_oauth_session(api_key)
@@ -180,8 +189,32 @@ class SendingToolUploader:
                     ok, status_error = self._poll_instantly_oauth_status(api_key, session_id)
                     if not ok:
                         provisional_errors[email] = status_error or "Instantly OAuth session failed"
+                        logger.warning(
+                            "[SendingToolUploader:Instantly] [%s/%s] OAuth status failed for %s (%.1fs): %s",
+                            index,
+                            total_inboxes,
+                            email,
+                            time.time() - started_at,
+                            provisional_errors[email],
+                        )
+                    else:
+                        logger.info(
+                            "[SendingToolUploader:Instantly] [%s/%s] OAuth accepted for %s (%.1fs)",
+                            index,
+                            total_inboxes,
+                            email,
+                            time.time() - started_at,
+                        )
                 except Exception as exc:
                     provisional_errors[email] = str(exc)
+                    logger.warning(
+                        "[SendingToolUploader:Instantly] [%s/%s] OAuth failed for %s (%.1fs): %s",
+                        index,
+                        total_inboxes,
+                        email,
+                        time.time() - started_at,
+                        exc,
+                    )
                 finally:
                     if context is not None and page is not None:
                         self._close_non_primary_pages(context, page)
@@ -1467,7 +1500,8 @@ class SendingToolUploader:
 
         # Wait for the email-accounts page to render — look for either
         # the "Connect Mailbox" button or an existing email row.
-        connect_or_email_selectors = [
+        add_account_selectors = self._smartlead_add_account_selectors()
+        connect_or_email_selectors = add_account_selectors + [
             "text='Connect Mailbox'",
             "text='Add Account(s)'",
             "button:has-text('Connect Mailbox')",
@@ -1497,18 +1531,7 @@ class SendingToolUploader:
             return page, True
 
         try:
-            self._click_any(
-                page,
-                [
-                    "text='Connect Mailbox'",
-                    "text='Add Account(s)'",
-                    "button:has-text('Connect Mailbox')",
-                    "button:has-text('Add Account')",
-                    "//span[text()='Add Account(s)']",
-                    "//span[text()='Connect Mailbox']",
-                ],
-                timeout_ms=20_000,
-            )
+            self._click_smartlead_add_account_entry(page, timeout_ms=20_000)
         except RuntimeError:
             # Capture page state for debugging before re-raising
             page_url = str(getattr(page, "url", "") or "")
@@ -1523,6 +1546,27 @@ class SendingToolUploader:
             )
             raise
         time.sleep(1.0)
+
+        self._click_any(
+            page,
+            [
+                "text='Email Account'",
+                "text='Email Accounts'",
+                "text='Add Email Account'",
+                "text='Connect Email Account'",
+                "text='Connect Mailbox'",
+                "button:has-text('Email Account')",
+                "button:has-text('Add Email Account')",
+                "button:has-text('Connect Email Account')",
+                "button:has-text('Connect Mailbox')",
+                "//span[normalize-space()='Email Account']",
+                "//span[normalize-space()='Add Email Account']",
+                "//span[normalize-space()='Connect Email Account']",
+                "//span[normalize-space()='Connect Mailbox']",
+            ],
+            timeout_ms=5_000,
+            optional=True,
+        )
 
         self._click_any(
             page,
@@ -1568,6 +1612,64 @@ class SendingToolUploader:
         )
         oauth_page = self._detect_oauth_page(context=context, fallback_page=page, previous_pages=before_pages)
         return oauth_page, False
+
+    @staticmethod
+    def _smartlead_add_account_selectors() -> List[str]:
+        return [
+            "text='Connect Mailbox'",
+            "text='Add Account(s)'",
+            "button:has-text('Connect Mailbox')",
+            "button:has-text('Add Account(s)')",
+            "button:has-text('Add Account')",
+            "button:has-text('Add')",
+            "[role='button']:has-text('Connect Mailbox')",
+            "[role='button']:has-text('Add Account(s)')",
+            "[role='button']:has-text('Add Account')",
+            "[role='button']:has-text('Add')",
+            "//button[.//span[normalize-space()='Connect Mailbox'] or normalize-space()='Connect Mailbox']",
+            "//button[.//span[normalize-space()='Add Account(s)'] or normalize-space()='Add Account(s)']",
+            "//button[.//span[normalize-space()='Add Account'] or normalize-space()='Add Account']",
+            "//button[.//span[normalize-space()='Add'] or normalize-space()='Add']",
+            "//*[@role='button' and (.//span[normalize-space()='Connect Mailbox'] or normalize-space()='Connect Mailbox')]",
+            "//*[@role='button' and (.//span[normalize-space()='Add Account(s)'] or normalize-space()='Add Account(s)')]",
+            "//*[@role='button' and (.//span[normalize-space()='Add Account'] or normalize-space()='Add Account')]",
+            "//*[@role='button' and (.//span[normalize-space()='Add'] or normalize-space()='Add')]",
+        ]
+
+    def _click_smartlead_add_account_entry(self, page: Any, *, timeout_ms: int = 20_000) -> None:
+        role_pattern = re.compile(r"^(connect mailbox|add account\(s\)|add account|add)$", re.I)
+        try:
+            button = page.get_by_role("button", name=role_pattern).first
+            button.wait_for(state="visible", timeout=timeout_ms)
+            button.click(timeout=timeout_ms)
+            return
+        except Exception:
+            pass
+
+        selectors = self._smartlead_add_account_selectors()
+        if self._click_any(page, selectors, timeout_ms=timeout_ms, optional=True):
+            return
+
+        candidates = self._visible_control_texts(page)
+        raise RuntimeError(f"Could not click Smartlead add-account entry. Visible controls: {candidates}")
+
+    def _visible_control_texts(self, page: Any, *, limit: int = 30) -> List[str]:
+        try:
+            values = page.locator("button, [role='button'], .q-btn").evaluate_all(
+                """els => els
+                    .filter(el => {
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style && style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
+                    })
+                    .map(el => (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim())
+                    .filter(Boolean)
+                    .slice(0, 30)
+                """
+            )
+            return [str(value)[:120] for value in values[:limit]]
+        except Exception:
+            return []
 
     def _finalize_smartlead_connection(self, *, page: Any, context: Any, oauth_page: Any) -> None:
         try:
