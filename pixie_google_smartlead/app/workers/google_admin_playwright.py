@@ -3092,11 +3092,13 @@ class GoogleAdminPlaywrightClient:
             "Admin console page redirected to Google sign-in for %s; reauthenticating session",
             self._admin_email,
         )
-        self._login_google_account(
-            self._admin_email,
-            self._admin_password,
+        self._complete_google_signin_flow(
+            email=self._admin_email,
+            password=self._admin_password,
             onepassword=self._admin_onepassword,
+            context="admin_console_reauth",
         )
+        self._drain_google_login_interstitials(self._admin_email, self._admin_onepassword)
         return True
 
     def _open_admin_console_page(
