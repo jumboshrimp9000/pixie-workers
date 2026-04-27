@@ -772,6 +772,10 @@ class GoogleAdminPlaywrightClient:
     def add_users(self, users: List[GoogleAdminUser], domain: str) -> Dict[str, int]:
         added = 0
         failed = 0
+        already_existing = 0
+        domain_name = str(domain or "").strip().lower()
+        if not domain_name:
+            raise RuntimeError("domain is required when adding Google Admin users")
         for user in users:
             try:
                 self._open_users_page()
@@ -802,16 +806,7 @@ class GoogleAdminPlaywrightClient:
                 self._fill_any(["//input[contains(@aria-label,'First name')]"], user.first_name)
                 self._fill_any(["//input[contains(@aria-label,'Last name')]"], user.last_name)
 
-                self._click_any(
-                    ["//div[@role='combobox' and @aria-label='Primary email domain']"],
-                    timeout_ms=4_000,
-                    optional=True,
-                )
-                self._click_any(
-                    [f"//li[@role='option' and contains(., '@{domain}')]"],
-                    timeout_ms=4_000,
-                    optional=True,
-                )
+                self._select_primary_email_domain(domain_name)
 
                 self._click_any(["//label[contains(text(), 'Create password')]"], timeout_ms=4_000, optional=True)
                 self._fill_any(
@@ -832,11 +827,118 @@ class GoogleAdminPlaywrightClient:
                     ]
                 )
                 time.sleep(2.5)
-                added += 1
+                if self._add_user_dialog_has_existing_user_error():
+                    if self._user_exists(user.email):
+                        already_existing += 1
+                    else:
+                        raise RuntimeError(f"Google reported user already exists, but {user.email} was not found")
+                else:
+                    added += 1
             except Exception as exc:
                 failed += 1
                 logger.warning("Playwright add user failed for %s: %s", user.email, exc)
-        return {"added": added, "failed": failed}
+        return {"added": added, "failed": failed, "already_existing": already_existing}
+
+    def _select_primary_email_domain(self, domain: str) -> None:
+        domain_name = str(domain or "").strip().lower().lstrip("@")
+        if not domain_name:
+            raise RuntimeError("Primary email domain is required")
+
+        page = self._require_page()
+        selectors = [
+            "//div[@role='combobox' and @aria-label='Primary email domain']",
+            "//*[@role='combobox' and contains(@aria-label,'Primary email domain')]",
+            "//button[contains(@aria-label,'Primary email domain')]",
+            "//*[contains(normalize-space(),'Primary email domain')]/following::*[@role='combobox'][1]",
+        ]
+
+        def selected_text() -> str:
+            return self._inner_text_any(selectors, timeout_ms=2_000, optional=True).lower()
+
+        if domain_name in selected_text():
+            return
+
+        if not self._click_any(selectors, timeout_ms=6_000, optional=True):
+            if self._exists([f"//*[contains(normalize-space(), '@{domain_name}')]"], timeout_ms=2_000):
+                return
+            raise RuntimeError(f"Primary email domain selector not found for @{domain_name}")
+
+        for _ in range(80):
+            for selector in [
+                f"//*[@role='option' and contains(translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '@{domain_name}')]",
+                f"//*[@role='option' and contains(translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{domain_name}')]",
+                f"//*[(@data-value='@{domain_name}' or @data-value='{domain_name}' or @data-domain='{domain_name}') and (self::div or self::li or self::span)]",
+            ]:
+                option = page.locator(self._selector(selector)).first
+                try:
+                    option.wait_for(state="attached", timeout=400)
+                    option.scroll_into_view_if_needed(timeout=1_000)
+                    option.click(timeout=1_500)
+                    time.sleep(0.8)
+                    if domain_name in selected_text() or self._exists(
+                        [
+                            f"//*[contains(normalize-space(), '@{domain_name}') and @aria-selected='true']",
+                            f"//*[@data-value='@{domain_name}' and @aria-selected='true']",
+                            f"//*[@data-value='{domain_name}' and @aria-selected='true']",
+                        ],
+                        timeout_ms=1_000,
+                    ):
+                        return
+                except Exception:
+                    pass
+
+            scroll_result = page.evaluate(
+                """() => {
+                    const candidates = Array.from(document.querySelectorAll(
+                      '[role="listbox"], [role="menu"], [role="presentation"] [role="list"], [role="presentation"], .VfPpkd-xl07Ob-XxIAqe'
+                    ));
+                    const popup = candidates.find((el) => el.scrollHeight > el.clientHeight + 8)
+                      || candidates.find((el) => el.querySelector && el.querySelector('[role="option"]'));
+                    if (!popup) return { scrolled: false, reason: 'no-scroll-container' };
+                    const before = popup.scrollTop || 0;
+                    const maxTop = Math.max(0, popup.scrollHeight - popup.clientHeight);
+                    const delta = Math.max(240, Math.floor((popup.clientHeight || 360) * 0.85));
+                    popup.scrollTop = Math.min(maxTop, before + delta);
+                    popup.dispatchEvent(new Event('scroll', { bubbles: true }));
+                    return { scrolled: popup.scrollTop > before, before, after: popup.scrollTop, maxTop };
+                }"""
+            )
+            time.sleep(0.25)
+            if isinstance(scroll_result, dict) and not scroll_result.get("scrolled"):
+                if float(scroll_result.get("after") or 0) >= float(scroll_result.get("maxTop") or 0):
+                    break
+
+        debug = self._capture_debug_state(f"primary_email_domain_not_selectable_{self._slug(domain_name)}")
+        raise RuntimeError(f"Could not select primary email domain @{domain_name}. {debug}")
+
+    def _add_user_dialog_has_existing_user_error(self) -> bool:
+        try:
+            text = self._require_page().locator("body").inner_text(timeout=2_000).lower()
+        except Exception:
+            return False
+        return "already exists" in text or "email address is already in use" in text
+
+    def _user_exists(self, email: str) -> bool:
+        clean_email = str(email or "").strip().lower()
+        if not clean_email:
+            return False
+        try:
+            self._open_users_page()
+            search = self._find_any(
+                [
+                    "//input[contains(@aria-label,'Search')]",
+                    "//input[contains(@placeholder,'Search')]",
+                    "//input[@type='search']",
+                ],
+                timeout_ms=8_000,
+            )
+            search.fill(clean_email)
+            search.press("Enter")
+            time.sleep(3.0)
+            text = self._require_page().locator("body").inner_text(timeout=5_000).lower()
+            return clean_email in text
+        except Exception:
+            return False
 
     # -----------------------------------------------------------------
     # Update users (name/username)

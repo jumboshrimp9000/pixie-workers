@@ -55,6 +55,7 @@ OPTIONAL_GOOGLE_APP_IDS = {
     "plusvibe": "915060167262-mt46cccq569tgg2rb5qk375pf95obh6e.apps.googleusercontent.com",
 }
 LIVE_STATUSES = {"pending", "provisioning", "active"}
+FREE_GOOGLE_PROMO_BILLING_TYPE = "free_inboxes_promo"
 
 
 class GoogleSupabaseWorker:
@@ -364,6 +365,27 @@ class GoogleSupabaseWorker:
                 raise RuntimeError(
                     "Final delivery check failed: no inbox rows exist for this domain, so delivery cannot be verified."
                 )
+
+            if self._is_free_google_promo(action, payload, inboxes):
+                reroute_result = self._ensure_free_google_action(action, payload, domain, inboxes)
+                message = (
+                    "Blocked PartnerHub google_provision for a free Google promo domain. "
+                    "Fulfillment must run through free_google_provision/nonprofit panels."
+                )
+                result = {
+                    "skipped": True,
+                    "reason": "free_google_promo_requires_nonprofit_fulfillment",
+                    **reroute_result,
+                }
+                self.client.complete_action(action, result)
+                self.client.insert_action_log(
+                    action,
+                    "action_blocked",
+                    "warn",
+                    message,
+                    result,
+                )
+                return
 
             # Domain enters in-progress while fulfillment runs.
             # Conditional update: only set in_progress if status is still in an
@@ -2007,6 +2029,120 @@ class GoogleSupabaseWorker:
             {"type": "TXT", "name": "_dmarc", "content": "v=DMARC1; p=none", "ttl": 3600},
         ]
 
+    def _is_free_google_promo(
+        self,
+        action: Dict[str, Any],
+        payload: Dict[str, Any],
+        inboxes: List[Dict[str, Any]],
+    ) -> bool:
+        if str(action.get("type") or "").strip() != "google_provision":
+            return False
+
+        fulfillment_process = str(payload.get("fulfillment_process") or "").strip().lower()
+        if fulfillment_process in {"free_google_nonprofit", "free_google_provision", "nonprofit"}:
+            return True
+        if self._truthy(payload.get("free_google_promo")):
+            return True
+
+        try:
+            if int(payload.get("promo_inbox_count") or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+
+        return any(
+            str(inbox.get("billing_type") or "").strip().lower() == FREE_GOOGLE_PROMO_BILLING_TYPE
+            for inbox in inboxes
+        )
+
+    def _ensure_free_google_action(
+        self,
+        action: Dict[str, Any],
+        payload: Dict[str, Any],
+        domain: Dict[str, Any],
+        inboxes: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        domain_id = str(action.get("domain_id") or "")
+        existing_rows = self.client._request(
+            "GET",
+            "actions",
+            params={
+                "select": "id,status,error",
+                "domain_id": f"eq.{domain_id}",
+                "type": "eq.free_google_provision",
+                "order": "created_at.desc",
+                "limit": "10",
+            },
+        )
+        existing = next(
+            (
+                row
+                for row in existing_rows
+                if str(row.get("status") or "").strip().lower() in {"pending", "in_progress", "completed"}
+            ),
+            None,
+        )
+        if existing:
+            return {
+                "freeGoogleActionId": existing.get("id"),
+                "freeGoogleActionStatus": existing.get("status"),
+                "freeGoogleActionCreated": False,
+            }
+
+        failed = next(
+            (row for row in existing_rows if str(row.get("status") or "").strip().lower() == "failed"),
+            None,
+        )
+        if failed:
+            return {
+                "freeGoogleActionId": failed.get("id"),
+                "freeGoogleActionStatus": failed.get("status"),
+                "freeGoogleActionCreated": False,
+                "nextAction": "Review and retry the existing failed free_google_provision action.",
+            }
+
+        free_payload = dict(payload)
+        promo_count = sum(
+            1
+            for inbox in inboxes
+            if str(inbox.get("billing_type") or "").strip().lower() == FREE_GOOGLE_PROMO_BILLING_TYPE
+        )
+        try:
+            payload_promo_count = int(free_payload.get("promo_inbox_count") or 0)
+        except (TypeError, ValueError):
+            payload_promo_count = 0
+        free_payload.update(
+            {
+                "domain": str(domain.get("domain") or "").strip().lower(),
+                "provider": "google",
+                "source": str(domain.get("source") or "own").strip().lower(),
+                "free_google_promo": True,
+                "fulfillment_process": "free_google_nonprofit",
+                "promo_inbox_count": max(promo_count, payload_promo_count),
+                "blocked_partnerhub_action_id": action.get("id"),
+            }
+        )
+
+        inserted = self.client._request(
+            "POST",
+            "actions",
+            payload={
+                "domain_id": domain_id,
+                "order_batch_id": action.get("order_batch_id"),
+                "customer_id": action.get("customer_id"),
+                "type": "free_google_provision",
+                "status": "pending",
+                "payload": free_payload,
+                "max_attempts": 8,
+            },
+        )
+        created = inserted[0] if inserted else {}
+        return {
+            "freeGoogleActionId": created.get("id"),
+            "freeGoogleActionStatus": created.get("status") or "pending",
+            "freeGoogleActionCreated": True,
+        }
+
     def _get_dynadot(self) -> DynadotClient:
         if self._dynadot is None:
             api_key = os.getenv("DYNADOT_API_KEY", "").strip()
@@ -2064,6 +2200,14 @@ class GoogleSupabaseWorker:
         if value is None:
             return default
         return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    @staticmethod
+    def _truthy(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
     @staticmethod
     def _failure_hint(error_message: str) -> str:

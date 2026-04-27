@@ -50,6 +50,8 @@ class NonprofitGoogleCancelWorker:
         action_logger = get_order_logger(action_id)
         prior_result = action.get("result") or {}
         prior_steps_raw = prior_result.get("steps") if isinstance(prior_result, dict) else []
+        if not isinstance(prior_steps_raw, list):
+            prior_steps_raw = []
         steps: List[Dict[str, Any]] = [row for row in prior_steps_raw if isinstance(row, dict)]
         last_step_status = {str(row.get("step") or ""): str(row.get("status") or "").lower() for row in steps}
         last_step_details = {

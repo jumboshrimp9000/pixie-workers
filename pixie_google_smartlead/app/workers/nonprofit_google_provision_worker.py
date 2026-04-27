@@ -352,9 +352,23 @@ class NonprofitGoogleProvisionWorker:
             verify_checkpoint = checkpoint("verify_domain")
             if not verify_checkpoint:
                 step = start_step("verify_domain")
-                verify_result = panel_client.verify_domain_via_api(domain_name)
-                if not self._domain_verification_succeeded(verify_result):
-                    verify_result = asyncio.run(self._verify_domain_ui(domain_name, admin_creds))
+                api_verify_result = panel_client.verify_domain_via_api(domain_name)
+                if self._domain_verification_succeeded(api_verify_result):
+                    admin_verify_result = asyncio.run(self._verify_domain_ui(domain_name, admin_creds))
+                    verify_result = {
+                        "verified": self._domain_verification_succeeded(admin_verify_result),
+                        "method": "api_then_admin_ui",
+                        "api": api_verify_result,
+                        "admin": admin_verify_result,
+                    }
+                else:
+                    admin_verify_result = asyncio.run(self._verify_domain_ui(domain_name, admin_creds))
+                    verify_result = {
+                        "verified": self._domain_verification_succeeded(admin_verify_result),
+                        "method": "admin_ui",
+                        "api": api_verify_result,
+                        "admin": admin_verify_result,
+                    }
                 if not self._domain_verification_succeeded(verify_result):
                     if verify_result.get("timedOut") or "verification failed" in str(verify_result.get("error") or "").lower():
                         message = (
@@ -737,17 +751,9 @@ class NonprofitGoogleProvisionWorker:
         return results
 
     def _upload_to_sending_tool(self, domain_id: str, domain_name: str, inboxes: List[Dict[str, Any]]) -> Dict[str, Any]:
-        bundle = self.client.get_domain_tool_credentials(domain_id)
-        if not bundle:
+        bundles = self.client.get_domain_tool_credentials_list(domain_id)
+        if not bundles:
             return {"skipped": "No sending tool credentials assigned"}
-        tool_slug = self._normalize_tool_slug(str(bundle.get("slug") or ""))
-        if not tool_slug:
-            return {"skipped": "Unsupported sending tool slug"}
-
-        credential = bundle.get("credential") or {}
-        api_key = str(credential.get("api_key") or credential.get("apiKey") or "").strip()
-        if not api_key:
-            return {"skipped": "Sending tool api_key missing"}
 
         user_op_client = self._maybe_build_op_client(self.user_vault)
         payloads = []
@@ -761,17 +767,66 @@ class NonprofitGoogleProvisionWorker:
                 }
             )
 
-        return self._sending_tool_uploader.upload_and_validate(
-            tool=tool_slug,
-            api_key=api_key,
-            inboxes=payloads,
-            provider="google",
-            credential=credential,
-            settings=credential.get("settings") if isinstance(credential.get("settings"), dict) else {},
-            onepassword=user_op_client,
-            headless=self.playwright_headless,
-            use_playwright_oauth=True,
-        )
+        results: List[Dict[str, Any]] = []
+        skipped: List[Dict[str, Any]] = []
+        failed_uploads: List[Dict[str, Any]] = []
+
+        for bundle in bundles:
+            tool_slug = self._normalize_tool_slug(str(bundle.get("slug") or ""))
+            credential = bundle.get("credential") or {}
+            if not tool_slug:
+                skipped_row = {"reason": "Unsupported sending tool slug", "slug": bundle.get("slug")}
+                skipped.append(skipped_row)
+                failed_uploads.append({"tool": str(bundle.get("slug") or ""), "error": skipped_row["reason"]})
+                continue
+
+            extra_fields = credential.get("extra_fields") if isinstance(credential.get("extra_fields"), dict) else {}
+            api_key = str(
+                credential.get("api_key")
+                or credential.get("apiKey")
+                or extra_fields.get("apiKey")
+                or ""
+            ).strip()
+            if not api_key:
+                skipped_row = {"tool": tool_slug, "reason": "Sending tool api_key missing"}
+                skipped.append(skipped_row)
+                failed_uploads.append({"tool": tool_slug, "error": skipped_row["reason"]})
+                continue
+
+            settings = {}
+            if isinstance(extra_fields.get("settings"), dict):
+                settings = dict(extra_fields.get("settings") or {})
+            elif isinstance(credential.get("settings"), dict):
+                settings = dict(credential.get("settings") or {})
+
+            upload_result = self._sending_tool_uploader.upload_and_validate(
+                tool=tool_slug,
+                api_key=api_key,
+                inboxes=payloads,
+                provider="google",
+                credential=credential,
+                settings=settings,
+                onepassword=user_op_client,
+                headless=self.playwright_headless,
+                use_playwright_oauth=True,
+            )
+            results.append({"tool": tool_slug, **upload_result})
+            for failure in upload_result.get("failed_uploads") or []:
+                failed_uploads.append({"tool": tool_slug, **(failure if isinstance(failure, dict) else {"error": str(failure)})})
+
+        if not results:
+            return {"skipped": skipped or "No supported sending tool credentials assigned"}
+
+        total_candidates = sum(int(row.get("total_candidates") or 0) for row in results)
+        total_uploaded = sum(len(row.get("uploaded_emails") or []) for row in results)
+        return {
+            "tool": "multiple" if len(results) > 1 else results[0].get("tool"),
+            "tools": results,
+            "skipped_tools": skipped,
+            "failed_uploads": failed_uploads,
+            "total_candidates": total_candidates,
+            "uploaded": total_uploaded,
+        }
 
     def _assign_or_reuse_panel(self, *, domain_id: str, customer_id: str, user_count: int) -> Dict[str, Any]:
         existing = self._get_existing_panel_assignment(domain_id)

@@ -4,6 +4,8 @@ import logging
 import os
 import re
 import subprocess
+import time
+from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 from urllib.parse import urlparse
 
@@ -47,6 +49,40 @@ async def _click_button(page: Page, names: list[str], *, exact: bool = False, ti
 
 def _panel_client_from_credentials(panel_credentials: Dict[str, Any]) -> NonprofitGooglePanelClient:
     return NonprofitGooglePanelClient(str(panel_credentials.get("apps_script_url") or "").strip())
+
+
+def _safe_debug_slug(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(value or "").strip())[:120] or "debug"
+
+
+async def _capture_debug_artifacts(
+    page: Page,
+    tag: str,
+    *,
+    log: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Any]:
+    debug_dir = Path(os.getenv("GOOGLE_PLAYWRIGHT_DEBUG_DIR") or "app/logs/playwright_debug")
+    try:
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        prefix = debug_dir / f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}_{_safe_debug_slug(tag)}"
+        screenshot_path = f"{prefix}.png"
+        html_path = f"{prefix}.html"
+        text_path = f"{prefix}.txt"
+        await page.screenshot(path=screenshot_path, full_page=True)
+        html_path_obj = Path(html_path)
+        text_path_obj = Path(text_path)
+        html_path_obj.write_text(await page.content(), encoding="utf-8")
+        text_path_obj.write_text(await page.text_content("body") or "", encoding="utf-8")
+        result = {
+            "url": page.url,
+            "screenshot": screenshot_path,
+            "html": html_path,
+            "text": text_path,
+        }
+        _log(log, f"  [debug] captured {result}")
+        return result
+    except Exception as exc:
+        return {"url": page.url, "error": f"debug_capture_failed: {exc}"}
 
 
 def _generate_totp_from_secret(raw_secret: str) -> str:
@@ -356,9 +392,13 @@ async def _ensure_admin_session(
     raise RuntimeError("Could not log into admin console")
 
 
-async def _is_domain_verified_via_api(domain: str, panel_client: NonprofitGooglePanelClient) -> bool:
+def _directory_api_auth_error(error_text: str) -> bool:
+    return "not authorized to access this resource/api" in str(error_text or "").lower()
+
+
+async def _check_domain_verified_via_api(domain: str, panel_client: NonprofitGooglePanelClient) -> Dict[str, Any]:
+    test_email = f"_verifycheck_{int(asyncio.get_running_loop().time() * 1000)}@{domain}"
     try:
-        test_email = f"_verifycheck_{int(asyncio.get_running_loop().time() * 1000)}@{domain}"
         result = await asyncio.to_thread(
             panel_client.batch_create_users,
             [
@@ -377,15 +417,163 @@ async def _is_domain_verified_via_api(domain: str, panel_client: NonprofitGoogle
                 await asyncio.to_thread(panel_client.delete_user, test_email, True)
             except Exception:
                 pass
-            return True
+            return {
+                "available": True,
+                "verified": True,
+                "method": "temp_user_create",
+                "testEmail": test_email,
+            }
         error_text = str((((result.get("errors") or [{}])[0]) or {}).get("error") or "")
         if "Domain not found" in error_text:
-            return False
+            return {
+                "available": True,
+                "verified": False,
+                "method": "temp_user_create",
+                "error": error_text,
+                "classification": "domain_not_found",
+            }
         if "already exists" in error_text:
-            return True
-    except Exception:
-        return False
-    return False
+            return {
+                "available": True,
+                "verified": True,
+                "method": "temp_user_create",
+                "error": error_text,
+                "classification": "test_user_already_exists",
+            }
+        if _directory_api_auth_error(error_text):
+            return {
+                "available": False,
+                "verified": False,
+                "method": "temp_user_create",
+                "error": error_text,
+                "classification": "directory_api_unauthorized",
+            }
+        return {
+            "available": True,
+            "verified": False,
+            "method": "temp_user_create",
+            "error": error_text or json.dumps(result)[:500],
+            "classification": "inconclusive",
+        }
+    except Exception as exc:
+        return {
+            "available": False,
+            "verified": False,
+            "method": "temp_user_create",
+            "error": str(exc),
+            "classification": "api_exception",
+        }
+
+
+async def _scroll_admin_domain_list(page: Page) -> Dict[str, Any]:
+    return await page.evaluate(
+        """() => {
+            const scrollables = Array.from(document.querySelectorAll('*'))
+              .filter((el) => {
+                const style = window.getComputedStyle(el);
+                return el.scrollHeight > el.clientHeight + 20
+                  && ['auto', 'scroll'].includes(style.overflowY);
+              })
+              .sort((a, b) => (b.clientHeight * b.clientWidth) - (a.clientHeight * a.clientWidth));
+            const target = scrollables[0] || document.scrollingElement || document.documentElement;
+            const before = target.scrollTop || 0;
+            const maxTop = Math.max(0, target.scrollHeight - target.clientHeight);
+            const delta = Math.max(350, Math.floor((target.clientHeight || 600) * 0.75));
+            target.scrollTop = Math.min(maxTop, before + delta);
+            target.dispatchEvent(new Event('scroll', { bubbles: true }));
+            return { before, after: target.scrollTop || 0, maxTop, scrolled: (target.scrollTop || 0) > before };
+        }"""
+    )
+
+
+async def _find_domain_row_state(page: Page, domain: str, *, click_verify: bool = False) -> Dict[str, Any]:
+    clean_domain = str(domain or "").strip().lower()
+    return await page.evaluate(
+        """({ domain, clickVerify }) => {
+            const normalize = (value) => String(value || '').replace(/\\s+/g, ' ').trim();
+            const lower = (value) => normalize(value).toLowerCase();
+            const inspectRow = (row, matchType) => {
+              if (!row) return null;
+              const text = normalize(row.textContent);
+              const verified = (
+                /\\bverified\\b/i.test(text)
+                || /gmail\\s+activated/i.test(text)
+                || /domain\\s+is\\s+ready/i.test(text)
+              ) && !/not\\s+verified|unverified|verify\\s+domain/i.test(text);
+
+              const controls = Array.from(row.querySelectorAll('button, a, [role="button"]'));
+              const verifyControl = controls.find((control) => {
+                const controlText = lower(control.textContent || control.getAttribute('aria-label') || '');
+                return /verify|start verification|confirm|set up gmail/.test(controlText);
+              });
+              const domainControl = controls.find((control) => lower(control.textContent).includes(domain))
+                || row.querySelector(`[data-domain-name="${domain}"]`)
+                || row.querySelector('a, button, [role="button"]');
+
+              if (clickVerify && verifyControl) {
+                verifyControl.scrollIntoView({ block: 'center', inline: 'nearest' });
+                verifyControl.click();
+                return { found: true, clickedVerify: true, verified, matchType, text: text.slice(0, 500) };
+              }
+              if (clickVerify && !verified && domainControl) {
+                domainControl.scrollIntoView({ block: 'center', inline: 'nearest' });
+                domainControl.click();
+                return { found: true, clickedRow: true, verified, matchType, text: text.slice(0, 500) };
+              }
+              return { found: true, verified, hasVerifyControl: Boolean(verifyControl), matchType, text: text.slice(0, 500) };
+            };
+
+            const cells = Array.from(document.querySelectorAll('td, [role="gridcell"]'));
+            for (const cell of cells) {
+              if (lower(cell.textContent) !== domain) continue;
+              const state = inspectRow(cell.closest('tr, [role="row"], li, [role="listitem"]'), 'exact_cell');
+              if (state) return state;
+            }
+
+            const rowSelectors = [
+              'tr',
+              '[role="row"]',
+              '[data-domain-name]',
+              '[data-testid*="domain" i]',
+              'li',
+              '[role="listitem"]'
+            ];
+            const rows = Array.from(document.querySelectorAll(rowSelectors.join(',')));
+            for (const row of rows) {
+              const text = normalize(row.textContent);
+              const rowLower = text.toLowerCase();
+              const attrDomain = lower(row.getAttribute('data-domain-name') || row.getAttribute('data-domain') || '');
+              if (!rowLower.includes(domain) && attrDomain !== domain) continue;
+              const state = inspectRow(row, attrDomain === domain ? 'domain_attribute' : 'row_text');
+              if (state) return state;
+            }
+            return { found: false };
+        }""",
+        {"domain": clean_domain, "clickVerify": bool(click_verify)},
+    )
+
+
+async def _find_domain_in_admin_list(
+    page: Page,
+    domain: str,
+    *,
+    click_verify: bool = False,
+    log: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Any]:
+    clean_domain = str(domain or "").strip().lower()
+    for idx in range(90):
+        state = await _find_domain_row_state(page, clean_domain, click_verify=click_verify)
+        if state.get("found"):
+            state["scrollAttempts"] = idx
+            return state
+        scroll_state = await _scroll_admin_domain_list(page)
+        if idx > 0 and idx % 15 == 0:
+            _log(log, f"  [domains] still searching for {clean_domain}; scroll={scroll_state}")
+        await page.wait_for_timeout(350)
+        if isinstance(scroll_state, dict) and not scroll_state.get("scrolled"):
+            if float(scroll_state.get("after") or 0) >= float(scroll_state.get("maxTop") or 0):
+                break
+    return {"found": False, "scrollAttempts": 90}
 
 
 async def verify_domain_in_admin(
@@ -399,14 +587,17 @@ async def verify_domain_in_admin(
     panel_client = _panel_client_from_credentials(panel_credentials)
 
     _log(log, f"[verify_domain] {clean_domain}")
-    if await _is_domain_verified_via_api(clean_domain, panel_client):
-        _log(log, "  already verified via API")
-        return {"verified": True, "alreadyVerified": True, "method": "api_precheck"}
+    api_precheck = await _check_domain_verified_via_api(clean_domain, panel_client)
+    if api_precheck.get("verified"):
+        _log(log, "  domain already accepts users via Apps Script API; ensuring Admin console agrees")
+    elif not api_precheck.get("available", True):
+        _log(log, f"  API verification unavailable; continuing with Admin UI proof: {api_precheck.get('classification')}")
 
     await _ensure_admin_session(page, panel_credentials, op_client=op_client, log=log)
     await page.goto("https://admin.google.com/ac/domains/manage")
     await page.wait_for_timeout(5000)
 
+    domain_state: Dict[str, Any] = {}
     search_bar = page.get_by_role("textbox", name=re.compile(r"Search", re.I)).first
     if await _visible(search_bar, 5000):
         await search_bar.click()
@@ -414,61 +605,37 @@ async def verify_domain_in_admin(
         await page.wait_for_timeout(2000)
         await page.keyboard.press("Enter")
         await page.wait_for_timeout(5000)
+        domain_state = await _find_domain_in_admin_list(page, clean_domain, click_verify=True, log=log)
 
-    body_text = await page.text_content("body") or ""
     clicked = False
-    if clean_domain not in body_text:
+    added_to_workspace = False
+    if domain_state.get("verified"):
+        return {
+            "verified": True,
+            "method": "admin_row_verified",
+            "apiPrecheck": api_precheck,
+            "addedToWorkspace": False,
+            "domainRow": domain_state,
+        }
+    if domain_state.get("clickedVerify") or domain_state.get("clickedRow"):
+        clicked = True
+    if not domain_state.get("found"):
         await page.goto("https://admin.google.com/ac/domains/manage")
         await page.wait_for_timeout(5000)
 
-        for _ in range(50):
-            result = await page.evaluate(
-                """(d) => {
-                    const cells = document.querySelectorAll("td, [role=gridcell]");
-                    for (const cell of cells) {
-                      const text = (cell.textContent || "").trim().toLowerCase();
-                      if (text !== d) continue;
-                      const row = cell.closest("tr, [role=row]");
-                      if (!row) continue;
-                      const rowText = (row.textContent || "");
-                      if (rowText.includes("Verified")) return { found: true, alreadyVerified: true };
-                      const buttons = [...row.querySelectorAll("button, a")];
-                      const btn = buttons.find((b) => (b.textContent || "").includes("Verify"));
-                      if (btn) { btn.scrollIntoView(); btn.click(); return { found: true, clicked: true }; }
-                      return { found: true, clicked: false, text: rowText.slice(0, 150) };
-                    }
-                    return { found: false };
-                }""",
-                clean_domain,
-            )
-            if result.get("found"):
-                if result.get("alreadyVerified") and await _is_domain_verified_via_api(clean_domain, panel_client):
-                    return {"verified": True, "method": "ui_already_verified"}
-                if result.get("clicked"):
-                    clicked = True
-                    break
-                break
+        domain_state = await _find_domain_in_admin_list(page, clean_domain, click_verify=True, log=log)
+        if domain_state.get("verified"):
+            return {
+                "verified": True,
+                "method": "admin_row_verified_after_scroll",
+                "apiPrecheck": api_precheck,
+                "addedToWorkspace": False,
+                "domainRow": domain_state,
+            }
+        if domain_state.get("clickedVerify") or domain_state.get("clickedRow"):
+            clicked = True
 
-            await page.evaluate(
-                """() => {
-                    const containers = [
-                      document.querySelector('[role="grid"]')?.parentElement,
-                      document.querySelector('table')?.parentElement,
-                      document.querySelector('main'),
-                      document.querySelector('[class*="content"]'),
-                    ];
-                    for (const c of containers) {
-                      if (c && c.scrollHeight > c.clientHeight) {
-                        c.scrollTop += 500;
-                        return;
-                      }
-                    }
-                    window.scrollBy(0, 500);
-                }"""
-            )
-            await page.wait_for_timeout(500)
-
-        if not clicked:
+        if not domain_state.get("found") and not clicked:
             add_btn = page.get_by_role("button", name="Add a domain").first
             if await _visible(add_btn, 3000):
                 await add_btn.click()
@@ -477,7 +644,22 @@ async def verify_domain_in_admin(
                 if await _visible(domain_input.first, 5000):
                     await domain_input.first.fill(clean_domain)
                     await page.wait_for_timeout(1000)
-                    add_verify_btn = page.get_by_role("button", name="Add domain & start")
+                    for selector in [
+                        page.get_by_role("radio", name=re.compile(r"Secondary domain", re.I)).first,
+                        page.get_by_text(re.compile(r"Secondary domain", re.I)).first,
+                        page.get_by_text(re.compile(r"create user accounts", re.I)).first,
+                    ]:
+                        try:
+                            if await _visible(selector, 1000):
+                                await selector.click()
+                                await page.wait_for_timeout(500)
+                                break
+                        except Exception:
+                            pass
+                    add_verify_btn = page.get_by_role(
+                        "button",
+                        name=re.compile(r"Add domain( & start| and start|$)|Start verification", re.I),
+                    )
                     for _ in range(10):
                         try:
                             if await add_verify_btn.first.is_enabled(timeout=2000):
@@ -488,9 +670,17 @@ async def verify_domain_in_admin(
                     await add_verify_btn.first.click()
                     await page.wait_for_timeout(5000)
                     clicked = True
+                    added_to_workspace = True
 
         if not clicked:
-            return {"verified": False, "error": "Domain not found in admin list"}
+            debug = await _capture_debug_artifacts(page, f"verify_not_found_{clean_domain}", log=log)
+            return {
+                "verified": False,
+                "error": "Domain not found in admin list after Playwright search and scroll",
+                "domainRow": domain_state,
+                "apiPrecheck": api_precheck,
+                "debug": debug,
+            }
 
     await page.wait_for_timeout(5000)
     await _click_button(page, ["Get started"], timeout_ms=5000)
@@ -517,25 +707,83 @@ async def verify_domain_in_admin(
         await page.wait_for_timeout(5000)
 
     for idx in range(60):
-        if idx > 0 and idx % 4 == 0 and await _is_domain_verified_via_api(clean_domain, panel_client):
+        if idx > 0 and idx % 4 == 0:
+            api_poll = await _check_domain_verified_via_api(clean_domain, panel_client)
+            if api_poll.get("verified"):
+                for name in ["Continue", "Done", "Next", "Finish", "Go to setup"]:
+                    await _click_button(page, [name], timeout_ms=800)
+                return {
+                    "verified": True,
+                    "method": "api_poll_temp_user",
+                    "apiPrecheck": api_precheck,
+                    "apiPoll": api_poll,
+                    "addedToWorkspace": added_to_workspace,
+                }
+            if not api_poll.get("available", True):
+                _log(log, f"  [verify_domain] API poll unavailable: {api_poll.get('classification')}")
             for name in ["Continue", "Done", "Next", "Finish", "Go to setup"]:
                 await _click_button(page, [name], timeout_ms=800)
-            return {"verified": True, "method": "api_poll"}
+            await page.goto("https://admin.google.com/ac/domains/manage")
+            await page.wait_for_timeout(4000)
+            poll_state = await _find_domain_in_admin_list(page, clean_domain, click_verify=False, log=log)
+            if poll_state.get("verified"):
+                return {
+                    "verified": True,
+                    "method": "admin_row_poll",
+                    "apiPrecheck": api_precheck,
+                    "apiPoll": api_poll,
+                    "addedToWorkspace": added_to_workspace,
+                    "domainRow": poll_state,
+                }
 
         text = await page.text_content("body") or ""
         if any(token in text for token in ["Domain is ready", "successfully", "Congratulations"]):
             for name in ["Continue", "Done", "Next", "Finish"]:
                 await _click_button(page, [name], timeout_ms=800)
             await page.wait_for_timeout(5000)
-            if await _is_domain_verified_via_api(clean_domain, panel_client):
-                return {"verified": True, "method": "ui_then_api"}
+            api_success_check = await _check_domain_verified_via_api(clean_domain, panel_client)
+            if api_success_check.get("verified"):
+                return {
+                    "verified": True,
+                    "method": "ui_success_api_confirmed",
+                    "apiPrecheck": api_precheck,
+                    "apiPoll": api_success_check,
+                    "addedToWorkspace": added_to_workspace,
+                }
+            if api_success_check.get("available", True):
+                _log(log, "  [verify_domain] UI reports success but API does not confirm yet; waiting")
+                await page.wait_for_timeout(15_000)
+                continue
+            await page.goto("https://admin.google.com/ac/domains/manage")
+            await page.wait_for_timeout(4000)
+            success_state = await _find_domain_in_admin_list(page, clean_domain, click_verify=False, log=log)
+            return {
+                "verified": True,
+                "method": "ui_success_api_unavailable",
+                "apiPrecheck": api_precheck,
+                "apiPoll": api_success_check,
+                "addedToWorkspace": added_to_workspace,
+                "domainRow": success_state,
+            }
 
         if "couldn't verify" in text or "verification failed" in text:
-            return {"verified": False, "error": "Google verification failed"}
+            debug = await _capture_debug_artifacts(page, f"verify_failed_{clean_domain}", log=log)
+            return {
+                "verified": False,
+                "error": "Google verification failed",
+                "apiPrecheck": api_precheck,
+                "debug": debug,
+            }
 
         await page.wait_for_timeout(15_000)
 
-    return {"verified": False, "timedOut": True}
+    debug = await _capture_debug_artifacts(page, f"verify_timeout_{clean_domain}", log=log)
+    return {
+        "verified": False,
+        "timedOut": True,
+        "apiPrecheck": api_precheck,
+        "debug": debug,
+    }
 
 
 async def enable_dkim_for_domain(
