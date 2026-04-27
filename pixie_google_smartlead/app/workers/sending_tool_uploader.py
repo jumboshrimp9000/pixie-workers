@@ -1941,6 +1941,8 @@ class SendingToolUploader:
 
     def _is_google_signin_prompt(self, page: Any) -> bool:
         url = str(getattr(page, "url", "") or "").lower()
+        if self._is_sending_tool_oauth_callback_url(url):
+            return False
         if "accounts.google.com" in url:
             # The consent page is handled by _complete_google_consent, not the signin loop.
             # Check only the path (before '?') — the query string often contains a
@@ -1961,6 +1963,17 @@ class SendingToolUploader:
             ],
             timeout_ms=1_200,
         )
+
+    @staticmethod
+    def _is_sending_tool_oauth_callback_url(url: str) -> bool:
+        lowered = str(url or "").lower()
+        callback_markers = [
+            "iapi.instantly.ai/oauth/google/redirect",
+            "app.instantly.ai/oauth",
+            "api.instantly.ai/oauth",
+            "smartlead.ai/oauth",
+        ]
+        return any(marker in lowered for marker in callback_markers)
 
     @staticmethod
     def _url_path(url: str) -> str:
