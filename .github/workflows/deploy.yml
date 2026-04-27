@@ -18,6 +18,7 @@ jobs:
             cd /opt/pixie/microsoft-worker
             git fetch origin main
             git reset --hard origin/main
+            git clean -fd
             cd pixie-microsoft-rm-creation-process
             docker compose up -d --build --remove-orphans pixie-microsoft
 
@@ -34,5 +35,6 @@ jobs:
             cd /opt/pixie-google
             git fetch origin main
             git reset --hard origin/main
+            git clean -fd
             cd pixie_google_smartlead
             docker compose up -d --build --remove-orphans pixie-google-paid-worker pixie-google-free-nonprofit-worker

@@ -10,12 +10,12 @@ The production worker source of truth is:
 - Production branch: `main`
 - Local repo path: `/Users/omermullick/Downloads/Projects/job-workers`
 
-This repo deploys to live worker servers through `.github/workflows/deploy.yml`. A push to `main` runs the `Deploy pixie-workers` GitHub Actions workflow, which SSHes into the servers with `DEPLOY_SSH_KEY`, fetches `origin/main`, hard-resets the server checkout to that exact commit, and rebuilds/restarts Docker services:
+This repo deploys to live worker servers through `.github/workflows/deploy.yml`. A push to `main` runs the `Deploy pixie-workers` GitHub Actions workflow, which SSHes into the servers with `DEPLOY_SSH_KEY`, fetches `origin/main`, hard-resets the server checkout to that exact commit, removes untracked non-ignored files, and rebuilds/restarts Docker services:
 
 - Microsoft worker server: `143.198.126.147`, path `/opt/pixie/microsoft-worker`, service `pixie-microsoft`
 - Google worker server: `157.245.129.244`, path `/opt/pixie-google`, services `pixie-google-paid-worker` and `pixie-google-free-nonprofit-worker`
 
-Do not rely on the outer `/Users/omermullick/Downloads/Projects` Git repo for worker deployment. The nested `job-workers` repo is the deployable repo; commit and push from there. Production worker servers must not carry manual local edits, because deployment intentionally overwrites tracked server changes with `origin/main`.
+Do not rely on the outer `/Users/omermullick/Downloads/Projects` Git repo for worker deployment. The nested `job-workers` repo is the deployable repo; commit and push from there. Production worker servers must not carry manual local edits, because deployment intentionally overwrites tracked server changes with `origin/main` and removes untracked non-ignored files.
 
 To verify a live deploy after pushing:
 
