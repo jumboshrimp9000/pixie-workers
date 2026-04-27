@@ -549,11 +549,10 @@ class NonprofitGoogleProvisionWorker:
 
                 step = start_step("finalize")
                 item_ids = self._item_ids_from_mfa_results(mfa_details)
-                now_iso = self._iso_now()
                 for inbox in inboxes:
                     inbox_id = str(inbox.get("id") or "").strip()
                     email = self._resolve_inbox_email(inbox, domain_name)
-                    fields: Dict[str, Any] = {"status": "active", "email": email, "activated_at": now_iso}
+                    fields: Dict[str, Any] = {"status": "active", "email": email}
                     if email in item_ids:
                         fields["onepassword_item_id"] = item_ids[email]
                     self.client.update_inbox(inbox_id, fields)
@@ -562,8 +561,6 @@ class NonprofitGoogleProvisionWorker:
                     {
                         "status": "active",
                         "interim_status": INTERIM_STATUSES["COMPLETE"],
-                        "nonprofit_panel_id": panel_id,
-                        "activated_at": now_iso,
                     },
                 )
                 complete_step(step, {"domain_status": "active", "panel_id": panel_id})
