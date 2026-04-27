@@ -400,6 +400,47 @@ class PartnerHubClient:
             raise RuntimeError(f"PartnerHub get order by id failed: {data}")
         return data
 
+    def resolve_order_id_by_domain(self, domain: str) -> Optional[str]:
+        clean_domain = str(domain or "").strip().lower()
+        if not clean_domain:
+            return None
+
+        data, status_code, ok = self._request(
+            "GET",
+            "/integration/orders",
+            params={"domain": clean_domain, "page": 1, "limit": 100},
+        )
+        if ok:
+            order_id = self.extract_order_id(data, clean_domain)
+            if order_id:
+                return order_id
+        elif status_code not in {404, 410}:
+            raise RuntimeError(f"PartnerHub order lookup failed for {clean_domain}: status={status_code} response={data}")
+
+        max_pages = max(1, int(os.getenv("PARTNERHUB_RESOLVE_MAX_PAGES", "20")))
+        page_size = max(1, min(200, int(os.getenv("PARTNERHUB_RESOLVE_PAGE_SIZE", "100"))))
+        for page in range(1, max_pages + 1):
+            page_data, page_status, page_ok = self._request(
+                "GET",
+                "/integration/orders",
+                params={"page": page, "limit": page_size},
+            )
+            if not page_ok:
+                raise RuntimeError(
+                    f"PartnerHub order list failed while resolving {clean_domain}: "
+                    f"page={page} status={page_status} response={page_data}"
+                )
+
+            order_id = self.extract_order_id(page_data, clean_domain)
+            if order_id:
+                return order_id
+
+            rows = self._extract_order_rows(page_data)
+            if len(rows) < page_size:
+                break
+
+        return None
+
     def increase_license(
         self,
         order_id: str,
@@ -442,14 +483,36 @@ class PartnerHubClient:
         if organization_name:
             payload["organisationName"] = organization_name
 
-        data, status_code, ok = self._request(
-            "POST",
+        endpoints = [
+            "/integration/order/amendment-order-licence-users",
             "/integration/orders/amendment-order-licence-users",
-            payload=payload,
-        )
-        if not ok:
-            raise RuntimeError(f"PartnerHub add license users failed: status={status_code} response={data}")
-        return data
+        ]
+        attempted: List[Dict[str, Any]] = []
+        for endpoint in endpoints:
+            data, status_code, ok = self._request("POST", endpoint, payload=payload)
+            attempted.append({"endpoint": endpoint, "status": status_code, "ok": ok})
+            if ok:
+                if isinstance(data, dict):
+                    data["_endpoint"] = endpoint
+                return data
+            message = str(data).lower()
+            if "same email exists in order licence users" in message or "same email exists in order license users" in message:
+                return {
+                    "success": True,
+                    "already_exists": True,
+                    "_endpoint": endpoint,
+                    "response": data,
+                }
+            if endpoint.endswith("/order/amendment-order-licence-users") and (
+                status_code in {404, 405} or "cannot post" in message or "not found" in message
+            ):
+                continue
+            raise RuntimeError(
+                "PartnerHub add license users failed: "
+                f"endpoint={endpoint} status={status_code} response={data}"
+            )
+
+        raise RuntimeError(f"PartnerHub add license users failed. Attempts={attempted}")
 
     def sync_order_users(
         self,
@@ -506,21 +569,38 @@ class PartnerHubClient:
             raise RuntimeError(f"PartnerHub profile photo update failed: status={status_code} response={data}")
         return data
 
-    def extract_order_id(self, payload: Dict[str, Any]) -> Optional[str]:
+    @staticmethod
+    def _extract_order_rows(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         if not isinstance(payload, dict):
-            return None
+            return []
+        rows: List[Dict[str, Any]] = []
         data = payload.get("data") or {}
         if isinstance(data, dict):
             order = data.get("order")
             if isinstance(order, dict):
-                oid = order.get("id")
-                if oid:
-                    return str(oid)
-            rows = data.get("rows")
-            if isinstance(rows, list) and rows:
-                first = rows[0]
-                if isinstance(first, dict) and first.get("id"):
-                    return str(first.get("id"))
+                rows.append(order)
+            listed_rows = data.get("rows")
+            if isinstance(listed_rows, list):
+                rows.extend([row for row in listed_rows if isinstance(row, dict)])
+        if payload.get("id"):
+            rows.append(payload)
+        return rows
+
+    def extract_order_id(self, payload: Dict[str, Any], domain: Optional[str] = None) -> Optional[str]:
+        rows = self._extract_order_rows(payload)
+        if not rows:
+            return None
+        clean_domain = str(domain or "").strip().lower()
+
+        def row_matches(candidate: Dict[str, Any]) -> bool:
+            if not clean_domain:
+                return True
+            candidate_domain = str(candidate.get("domain") or "").strip().lower()
+            return bool(candidate_domain and candidate_domain == clean_domain)
+
+        for row in rows:
+            if row.get("id") and row_matches(row):
+                return str(row.get("id"))
         return None
 
     def extract_dns_records(self, payload: Dict[str, Any], domain: str) -> List[Dict[str, Any]]:

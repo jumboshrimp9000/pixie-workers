@@ -7,9 +7,14 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from app import get_order_logger
-from app.workers.google_admin_playwright import GoogleAdminPlaywrightClient, GoogleMfaUser
+from app.workers.google_admin_playwright import (
+    GoogleAdminPlaywrightClient,
+    GoogleMfaUser,
+    GoogleSignInChallengeBlocked,
+)
 from app.workers.google_fulfillment_clients import PartnerHubClient
 from app.workers.onepassword_client import OnePasswordCliClient
+from app.workers.sending_tool_uploader import SendingToolUploader
 from app.workers.supabase_client import SupabaseRestClient
 
 
@@ -61,8 +66,25 @@ class GoogleInboxLifecycleWorker:
             os.getenv("GOOGLE_PLAYWRIGHT_HEADLESS", os.getenv("GOOGLE_SELENIUM_HEADLESS", "true")),
             default=True,
         )
+        self.sending_tool_playwright_oauth = self._as_bool(
+            os.getenv("GOOGLE_SENDING_TOOL_USE_PLAYWRIGHT_OAUTH"),
+            default=True,
+        )
+        self.sending_tool_require_1password = self._as_bool(
+            os.getenv("GOOGLE_SENDING_TOOL_OAUTH_REQUIRE_1PASSWORD"),
+            default=True,
+        )
+        self.disable_login_challenge_before_mfa = self._as_bool(
+            os.getenv("GOOGLE_DISABLE_LOGIN_CHALLENGE_BEFORE_MFA"),
+            default=True,
+        )
+        self.require_login_challenge_disable = self._as_bool(
+            os.getenv("GOOGLE_REQUIRE_LOGIN_CHALLENGE_DISABLE"),
+            default=False,
+        )
 
         self._partnerhub: Optional[PartnerHubClient] = None
+        self._sending_tool_uploader = SendingToolUploader()
 
     def run_forever(self) -> None:
         logger.info(
@@ -114,9 +136,11 @@ class GoogleInboxLifecycleWorker:
             step_name = str(row.get("step") or "").strip()
             if not step_name:
                 continue
-            last_step_status[step_name] = str(row.get("status") or "").strip().lower()
+            status = str(row.get("status") or "").strip().lower()
+            if status == "completed" or step_name not in last_step_status:
+                last_step_status[step_name] = status
             details = row.get("details")
-            if isinstance(details, dict):
+            if status == "completed" and isinstance(details, dict):
                 last_step_details[step_name] = details
 
         def start_step(step_name: str) -> Dict[str, Any]:
@@ -330,11 +354,16 @@ class GoogleInboxLifecycleWorker:
         except Exception as exc:
             message = str(exc)
             action_logger.exception("Lifecycle action failed")
-            self.client.fail_action(action, message, max_retries=self.max_retries)
+            hard_stop = (
+                isinstance(exc, GoogleSignInChallengeBlocked)
+                or self._is_google_signin_challenge_blocked(message)
+                or self._is_partnerhub_non_retryable_error(message)
+            )
+            self.client.fail_action(action, message, max_retries=1 if hard_stop else self.max_retries)
             if mutation_request_id:
                 try:
                     attempts = int(action.get("attempts") or 1)
-                    is_final = attempts >= self.max_retries
+                    is_final = hard_stop or attempts >= self.max_retries
                     request_status = "failed" if is_final else "needs_attention"
                     self.client.update_mutation_request(
                         mutation_request_id,
@@ -434,41 +463,148 @@ class GoogleInboxLifecycleWorker:
         resolved_rows = self.client.get_inboxes_by_ids(domain_id, resolved_ids)
 
         order_info = checkpoint("resolve_partnerhub_order")
+        stored_order_id = str(domain.get("partnerhub_order_id") or "").strip()
+        trusted_stored_order_id = ""
+        if stored_order_id:
+            try:
+                stored_details = self._get_partnerhub().get_order_by_id(stored_order_id)
+                matched_order_id = str(
+                    self._get_partnerhub().extract_order_id(stored_details, domain_name) or ""
+                ).strip()
+                if matched_order_id == stored_order_id:
+                    trusted_stored_order_id = stored_order_id
+                else:
+                    log_event(
+                        "step_warning",
+                        "warn",
+                        f"[resolve_partnerhub_order] Stored partnerhub_order_id did not match {domain_name}; resolving fresh.",
+                        {"stored_order_id": stored_order_id, "matched_order_id": matched_order_id},
+                    )
+            except Exception as stored_exc:
+                log_event(
+                    "step_warning",
+                    "warn",
+                    f"[resolve_partnerhub_order] Could not validate stored partnerhub_order_id for {domain_name}; resolving fresh.",
+                    {"stored_order_id": stored_order_id, "error": str(stored_exc)},
+                )
         if order_info:
+            checkpoint_domain = str(order_info.get("domain") or "").strip().lower()
             order_id = str(order_info.get("order_id") or "")
+            if not order_id or checkpoint_domain != domain_name:
+                step = start_step("resolve_partnerhub_order")
+                order_id = trusted_stored_order_id or str(self._get_partnerhub().resolve_order_id_by_domain(domain_name) or "")
+                if not order_id:
+                    fail_step(step, f"Could not resolve exact PartnerHub order id for {domain_name}")
+                    persist_progress()
+                    raise RuntimeError(f"Could not resolve exact PartnerHub order id for {domain_name}")
+                complete_step(
+                    step,
+                    {
+                        "order_id": order_id,
+                        "domain": domain_name,
+                        "re_resolved_from_stale_checkpoint": True,
+                    },
+                )
+                persist_progress()
         else:
             step = start_step("resolve_partnerhub_order")
-            order_payload = self._get_partnerhub().get_order_details(domain_name)
-            order_id = str(self._get_partnerhub().extract_order_id(order_payload) or "")
+            order_id = trusted_stored_order_id or str(self._get_partnerhub().resolve_order_id_by_domain(domain_name) or "")
             if not order_id:
-                fail_step(step, f"Could not resolve PartnerHub order id for {domain_name}")
+                fail_step(step, f"Could not resolve exact PartnerHub order id for {domain_name}")
                 persist_progress()
-                raise RuntimeError(f"Could not resolve PartnerHub order id for {domain_name}")
-            complete_step(step, {"order_id": order_id})
+                raise RuntimeError(f"Could not resolve exact PartnerHub order id for {domain_name}")
+            complete_step(
+                step,
+                {
+                    "order_id": order_id,
+                    "domain": domain_name,
+                    "source": "supabase_domain" if trusted_stored_order_id else "partnerhub_exact_lookup",
+                },
+            )
             persist_progress()
+
+        if order_id and stored_order_id != order_id:
+            try:
+                self.client.update_domain(domain_id, {"partnerhub_order_id": order_id})
+                domain["partnerhub_order_id"] = order_id
+            except Exception as persist_exc:
+                log_event(
+                    "step_warning",
+                    "warn",
+                    f"[resolve_partnerhub_order] Failed to persist partnerhub_order_id for {domain_name}",
+                    {"order_id": order_id, "error": str(persist_exc)},
+                )
+
+        users = self._build_partnerhub_users(
+            domain_name,
+            resolved_rows,
+            default_user_type="normal",
+        )
+        if not users:
+            step = start_step("sync_partnerhub_add")
+            fail_step(step, "No users to add for google_add_inboxes")
+            persist_progress()
+            raise RuntimeError("No users to add for google_add_inboxes")
+
+        organization_name = (
+            str(payload.get("organization_name") or "").strip()
+            or str(payload.get("client_name") or "").strip()
+            or domain_name
+        )
+        plan_id = str(payload.get("plan_id") or self.partnerhub_plan_id).strip()
 
         sync_info = checkpoint("sync_partnerhub_add")
         if sync_info:
             synced_count = int(sync_info.get("user_count") or 0)
         else:
-            step = start_step("sync_partnerhub_add")
-            users = self._build_partnerhub_users(
-                domain_name,
-                resolved_rows,
-                default_user_type="normal",
-            )
-            if not users:
-                fail_step(step, "No users to add for google_add_inboxes")
+            increase_info = checkpoint("increase_partnerhub_license")
+            if not increase_info:
+                step = start_step("increase_partnerhub_license")
+                try:
+                    increase_response = self._get_partnerhub().increase_license(
+                        order_id=order_id,
+                        number_of_licenses=len(users),
+                        plan_id=plan_id,
+                    )
+                except Exception as increase_exc:
+                    details = {
+                        "failing_step": "increase_partnerhub_license",
+                        "why": str(increase_exc),
+                        "current_state": (
+                            "PartnerHub order was resolved, but the worker could not add the "
+                            "required paid seats before adding the new users."
+                        ),
+                        "next_action": (
+                            "Check PartnerHub balance/order status/plan id, then retry this add-inbox action. "
+                            "Do not proceed to Google user MFA/upload until PartnerHub confirms the extra seats."
+                        ),
+                        "order_id": order_id,
+                        "domain": domain_name,
+                        "license_count": len(users),
+                    }
+                    step["details"] = details
+                    fail_step(step, str(increase_exc))
+                    persist_progress()
+                    raise
+
+                complete_step(
+                    step,
+                    {
+                        "order_id": order_id,
+                        "domain": domain_name,
+                        "license_count": len(users),
+                        "response": self._partnerhub_response_summary(increase_response),
+                    },
+                )
                 persist_progress()
-                raise RuntimeError("No users to add for google_add_inboxes")
+                log_event(
+                    "step_completed",
+                    "info",
+                    f"[increase_partnerhub_license] added {len(users)} seats to order {order_id}",
+                    self._partnerhub_response_summary(increase_response),
+                )
 
-            organization_name = (
-                str(payload.get("organization_name") or "").strip()
-                or str(payload.get("client_name") or "").strip()
-                or domain_name
-            )
-            plan_id = str(payload.get("plan_id") or self.partnerhub_plan_id)
-
+            step = start_step("sync_partnerhub_add")
             add_response = self._get_partnerhub().add_license_users(
                 order_id=order_id,
                 license_users=users,
@@ -477,7 +613,14 @@ class GoogleInboxLifecycleWorker:
                 plan_id=plan_id,
             )
             synced_count = len(users)
-            complete_step(step, {"user_count": synced_count, "order_id": order_id})
+            step_details: Dict[str, Any] = {
+                "user_count": synced_count,
+                "order_id": order_id,
+                "endpoint": str(add_response.get("_endpoint") or "/integration/order/amendment-order-licence-users")
+                if isinstance(add_response, dict)
+                else "/integration/order/amendment-order-licence-users",
+            }
+            complete_step(step, step_details)
             persist_progress()
             log_event(
                 "step_completed",
@@ -487,6 +630,78 @@ class GoogleInboxLifecycleWorker:
             )
 
         mfa_summary = checkpoint("mfa_enrollment_summary") or {}
+        login_challenge_checkpoint = checkpoint("disable_login_challenges")
+        if not mfa_summary and not login_challenge_checkpoint and self.disable_login_challenge_before_mfa:
+            step = start_step("disable_login_challenges")
+            target_emails = [
+                str(row.get("email") or f"{str(row.get('username') or '').strip().lower()}@{domain_name}").strip().lower()
+                for row in self.client.get_inboxes_by_ids(domain_id, resolved_ids)
+            ]
+            target_emails = [email for email in target_emails if email]
+            try:
+                admin_row = self._resolve_domain_admin_login_row(domain_id, domain_name)
+                admin_email = str(admin_row.get("email") or "").strip().lower()
+                admin_password = str(admin_row.get("password") or "").strip()
+                op_client = OnePasswordCliClient.from_env()
+                with GoogleAdminPlaywrightClient(headless=self.playwright_headless) as browser:
+                    challenge_result = browser.disable_login_challenges_for_users(
+                        admin_email,
+                        admin_password,
+                        target_emails,
+                        onepassword=op_client,
+                        totp_item_ids_by_email={
+                            admin_email: str(admin_row.get("onepassword_item_id") or "").strip(),
+                        },
+                    )
+            except GoogleSignInChallengeBlocked as challenge_exc:
+                fail_message = str(challenge_exc)
+                step["details"] = {
+                    "domain": domain_name,
+                    "target_emails": target_emails,
+                    "failing_step": "disable_login_challenges",
+                    "why": fail_message,
+                    "current_state": "admin-side login challenge disable was blocked by Google",
+                    "next_action": "Manually clear the Google Admin sign-in challenge, then retry the add-inbox action.",
+                }
+                fail_step(step, fail_message)
+                persist_progress()
+                raise
+            except Exception as disable_exc:
+                challenge_result = {
+                    "disabled": 0,
+                    "already_off": 0,
+                    "failed": len(target_emails) or 1,
+                    "target_emails": target_emails,
+                    "error": str(disable_exc),
+                    "current_state": "login-challenge disable attempt failed before MFA enrollment",
+                    "next_action": (
+                        "Review Playwright debug artifacts and Google Admin UI selectors. "
+                        "The worker will still attempt MFA unless GOOGLE_REQUIRE_LOGIN_CHALLENGE_DISABLE=true."
+                    ),
+                }
+                log_event(
+                    "step_warning",
+                    "warn",
+                    f"[disable_login_challenges] Could not disable login challenge for added users on {domain_name}",
+                    challenge_result,
+                )
+                if self.require_login_challenge_disable:
+                    fail_step(step, str(disable_exc))
+                    step["details"] = challenge_result
+                    persist_progress()
+                    raise RuntimeError(
+                        f"Required login-challenge disable failed for {domain_name}: {disable_exc}"
+                    ) from disable_exc
+
+            complete_step(step, challenge_result)
+            persist_progress()
+            log_event(
+                "step_completed",
+                "info",
+                f"[disable_login_challenges] Login challenge disable result for added users on {domain_name}",
+                challenge_result,
+            )
+
         if not mfa_summary:
             mfa_users = self._build_mfa_users(domain_name, resolved_rows)
             if not mfa_users:
@@ -515,10 +730,26 @@ class GoogleInboxLifecycleWorker:
                                 mfa_summary["completed"] += 1
                                 continue
                             step = start_step(step_name)
-                            result = browser.enroll_users_mfa_with_1password(
-                                [mfa_user],
-                                op_client,
-                            )
+                            try:
+                                result = browser.enroll_users_mfa_with_1password(
+                                    [mfa_user],
+                                    op_client,
+                                )
+                            except GoogleSignInChallengeBlocked as challenge_exc:
+                                message = str(challenge_exc)
+                                step["details"] = {
+                                    "email": mfa_user.email,
+                                    "failing_step": step_name,
+                                    "why": message,
+                                    "current_state": "Google blocked first login for the added user",
+                                    "next_action": (
+                                        "Disable the user's login challenge in Google Admin or complete the "
+                                        "manual verification, then retry the add-inbox action."
+                                    ),
+                                }
+                                fail_step(step, message)
+                                persist_progress()
+                                raise
                             details = result.get("results") or {}
                             row = details.get(mfa_user.email) or details.get(mfa_user.email.lower()) or {}
                             if int(result.get("failed") or 0) > 0:
@@ -607,8 +838,122 @@ class GoogleInboxLifecycleWorker:
             complete_step(step, mfa_summary)
             persist_progress()
 
+        upload_details = checkpoint("upload_sending_tool")
+        if upload_details:
+            upload_ok, upload_reason = self._upload_result_strictly_valid(upload_details)
+            if not upload_ok:
+                step = start_step("upload_sending_tool")
+                fail_message = (
+                    f"Previous sending-tool upload checkpoint for added Google inboxes on {domain_name} "
+                    f"is not safe to reuse: {upload_reason}."
+                )
+                step["details"] = {
+                    "domain": domain_name,
+                    "target_inbox_ids": resolved_ids,
+                    "reason": upload_reason,
+                    "previous_upload_details": upload_details,
+                    "failing_step": "upload_sending_tool",
+                    "current_state": "add-inbox action has not proven provider-side upload completion",
+                    "next_action": "Clear the stale upload_sending_tool checkpoint or create a retry action after fixing credentials.",
+                }
+                fail_step(step, fail_message)
+                persist_progress()
+                log_event("step_failed", "error", f"[upload_sending_tool] {fail_message}", step["details"])
+                raise RuntimeError(fail_message)
+        else:
+            step = start_step("upload_sending_tool")
+            fresh_rows = self.client.get_inboxes_by_ids(domain_id, resolved_ids)
+            try:
+                upload_result = self._upload_inboxes_to_sending_tool(
+                    domain_id=domain_id,
+                    domain_name=domain_name,
+                    provider="google",
+                    inboxes=fresh_rows,
+                    tool_settings=domain.get("fulfillment_settings"),
+                )
+            except Exception as upload_exc:
+                fail_message = (
+                    f"Sending-tool upload failed for added Google inboxes on {domain_name}: {upload_exc}"
+                )
+                step["details"] = {
+                    "domain": domain_name,
+                    "target_inbox_ids": resolved_ids,
+                    "failing_step": "upload_sending_tool",
+                    "why": str(upload_exc),
+                    "current_state": "new Google inboxes were created/MFA-processed but not proven uploaded",
+                    "next_action": "Fix assigned sending-tool credentials or Google OAuth challenge, then retry this action.",
+                }
+                fail_step(step, fail_message)
+                persist_progress()
+                log_event("step_failed", "error", f"[upload_sending_tool] {fail_message}", step["details"])
+                raise RuntimeError(fail_message) from upload_exc
+
+            upload_ok, upload_reason = self._upload_result_strictly_valid(upload_result)
+            if not upload_ok:
+                fail_message = (
+                    f"Sending-tool upload validation failed for added Google inboxes on {domain_name}: "
+                    f"{upload_reason}"
+                )
+                step["details"] = {
+                    **upload_result,
+                    "domain": domain_name,
+                    "target_inbox_ids": resolved_ids,
+                    "failing_step": "upload_sending_tool",
+                    "why": upload_reason,
+                    "current_state": "upload finished but did not produce strict provider-side validation evidence",
+                    "next_action": "Confirm the inbox exists in the assigned sending tool, then retry the add-inbox action.",
+                }
+                fail_step(step, fail_message)
+                persist_progress()
+                log_event("step_failed", "error", f"[upload_sending_tool] {fail_message}", step["details"])
+                raise RuntimeError(fail_message)
+
+            upload_details = upload_result
+            complete_step(step, upload_result)
+            persist_progress()
+            log_event(
+                "step_completed",
+                "info",
+                f"[upload_sending_tool] Upload result for added Google inboxes on {domain_name}",
+                upload_result,
+            )
+
         checkpoint_data = checkpoint("finalize_add")
         if checkpoint_data:
+            current_rows = self.client.get_inboxes_by_ids(domain_id, resolved_ids)
+            inactive_rows = [
+                row for row in current_rows if str(row.get("status") or "").strip().lower() != "active"
+            ]
+            if inactive_rows:
+                step = start_step("repair_finalize_add")
+                repaired_ids: List[str] = []
+                for row in inactive_rows:
+                    inbox_id = str(row.get("id") or "").strip()
+                    username = str(row.get("username") or "").strip().lower()
+                    if not inbox_id or not username:
+                        continue
+                    updates: Dict[str, Any] = {
+                        "status": "active",
+                        "email": f"{username}@{domain_name}",
+                        "is_admin": bool(row.get("is_admin")),
+                    }
+                    if not row.get("password"):
+                        updates["password"] = self._generate_password()
+                    self.client.update_inbox(inbox_id, updates)
+                    repaired_ids.append(inbox_id)
+                repair_details = {
+                    "repaired_active_inbox_ids": repaired_ids,
+                    "reason": "finalize_add checkpoint existed but one or more inbox rows were not active",
+                }
+                complete_step(step, repair_details)
+                persist_progress()
+                log_event(
+                    "step_completed",
+                    "info",
+                    f"[repair_finalize_add] Activated stale finalized inbox rows for {domain_name}",
+                    repair_details,
+                )
+                return {**checkpoint_data, **repair_details}
             return checkpoint_data
 
         step = start_step("finalize_add")
@@ -653,6 +998,7 @@ class GoogleInboxLifecycleWorker:
             "added": len(resolved_ids),
             "synced_users": synced_count,
             "mfa": mfa_summary,
+            "upload": upload_details,
             "reassigned_admin_inbox_id": reassigned_admin_inbox_id,
         }
         complete_step(step, result)
@@ -1524,6 +1870,205 @@ class GoogleInboxLifecycleWorker:
             )
         return users
 
+    def _upload_inboxes_to_sending_tool(
+        self,
+        *,
+        domain_id: str,
+        domain_name: str,
+        provider: str,
+        inboxes: List[Dict[str, Any]],
+        tool_settings: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        tool_bundles = self.client.get_domain_tool_credentials_list(domain_id)
+        if not tool_bundles:
+            raise RuntimeError(
+                f"No sending tool credentials assigned to domain {domain_name}; "
+                "upload_sending_tool cannot complete safely."
+            )
+
+        payloads: List[Dict[str, Any]] = []
+        failed_uploads: List[Dict[str, str]] = []
+        seen_emails = set()
+        for inbox in inboxes:
+            username = str(inbox.get("username") or "").strip().lower()
+            email = str(inbox.get("email") or f"{username}@{domain_name}").strip().lower()
+            password = str(inbox.get("password") or "").strip()
+            if not email or email in seen_emails:
+                continue
+            seen_emails.add(email)
+            if not password:
+                failed_uploads.append({"email": email, "error": "Missing inbox password"})
+                continue
+            payloads.append(
+                {
+                    "email": email,
+                    "first_name": str(inbox.get("first_name") or "").strip(),
+                    "last_name": str(inbox.get("last_name") or "").strip(),
+                    "password": password,
+                    "provider": provider,
+                }
+            )
+
+        if not payloads:
+            return {
+                "tool": None,
+                "tools": [],
+                "strict_validation": True,
+                "total_candidates": len(inboxes) or len(failed_uploads),
+                "total_upload_attempts": 0,
+                "uploaded_emails": [],
+                "failed_uploads": failed_uploads
+                or [
+                    {
+                        "email": str(domain_name or "unknown").strip().lower(),
+                        "error": "No valid inbox payloads were available for sending-tool upload",
+                    }
+                ],
+                "skipped_already_uploaded": 0,
+            }
+
+        provider_name = str(provider or "").strip().lower()
+        uploaded_emails: List[str] = []
+        merged_failures: List[Dict[str, str]] = list(failed_uploads)
+        tool_results: List[Dict[str, Any]] = []
+        processed_tools: List[str] = []
+        skipped_already_uploaded = 0
+
+        for tool_bundle in tool_bundles:
+            tool_slug = self._normalize_sending_tool_slug(str(tool_bundle.get("slug") or ""))
+            credential = tool_bundle.get("credential") or {}
+            if not tool_slug:
+                raise RuntimeError(f"Sending tool slug missing on credential for domain {domain_name}")
+            if tool_slug not in {"instantly.ai", "smartlead.ai"}:
+                raise RuntimeError(f"Automated upload not implemented for {tool_slug} on domain {domain_name}")
+
+            api_key = str(credential.get("api_key") or "").strip()
+            if not api_key:
+                raise RuntimeError(
+                    f"Missing API key for {tool_slug} credential on domain {domain_name}. "
+                    "Provide toolCredentials.api when placing the order."
+                )
+
+            op_client: Optional[OnePasswordCliClient] = None
+            if provider_name == "google" and self.sending_tool_playwright_oauth:
+                try:
+                    op_client = OnePasswordCliClient.from_env()
+                except Exception as op_exc:
+                    if self.sending_tool_require_1password:
+                        raise RuntimeError(
+                            f"1Password is required for {tool_slug} Google OAuth upload but not configured: {op_exc}"
+                        ) from op_exc
+                    logger.warning(
+                        "[upload_sending_tool] Proceeding without 1Password during Google OAuth upload for %s: %s",
+                        domain_name,
+                        op_exc,
+                    )
+
+            result = self._sending_tool_uploader.upload_and_validate(
+                tool=tool_slug,
+                api_key=api_key,
+                inboxes=payloads,
+                provider=provider_name,
+                credential=credential,
+                settings=tool_settings if isinstance(tool_settings, dict) else {},
+                onepassword=op_client,
+                headless=self.playwright_headless,
+                use_playwright_oauth=self.sending_tool_playwright_oauth,
+            )
+
+            processed_tools.append(tool_slug)
+            tool_uploaded = [str(email or "").strip().lower() for email in (result.get("uploaded_emails") or [])]
+            for email in tool_uploaded:
+                if email:
+                    uploaded_emails.append(f"{tool_slug}:{email}")
+
+            tool_failures: List[Dict[str, str]] = []
+            for row in result.get("failed_uploads") or []:
+                if not isinstance(row, dict):
+                    continue
+                failure = {
+                    "tool": tool_slug,
+                    "email": str(row.get("email") or "").strip().lower(),
+                    "error": str(row.get("error") or "Unknown upload error"),
+                }
+                tool_failures.append(failure)
+                merged_failures.append(failure)
+
+            tool_skipped = int(result.get("skipped_already_uploaded") or 0)
+            skipped_already_uploaded += tool_skipped
+            tool_results.append(
+                {
+                    "tool": tool_slug,
+                    "total_candidates": int(result.get("total_candidates") or len(payloads)),
+                    "uploaded": len(tool_uploaded),
+                    "failed": len(tool_failures),
+                    "skipped_already_uploaded": tool_skipped,
+                }
+            )
+
+        total_upload_attempts = len(payloads) * len(processed_tools)
+        total_candidates = total_upload_attempts + len(failed_uploads)
+
+        return {
+            "tool": processed_tools[-1] if processed_tools else None,
+            "tools": processed_tools,
+            "tool_results": tool_results,
+            "strict_validation": True,
+            "total_candidates": total_candidates,
+            "total_upload_attempts": total_upload_attempts,
+            "uploaded_emails": uploaded_emails,
+            "failed_uploads": merged_failures,
+            "skipped_already_uploaded": skipped_already_uploaded,
+        }
+
+    @staticmethod
+    def _upload_result_strictly_valid(step_details: Optional[Dict[str, Any]]) -> Tuple[bool, str]:
+        if not isinstance(step_details, dict) or not step_details:
+            return False, "upload details missing"
+        if bool(step_details.get("skipped")):
+            return False, "upload checkpoint was skipped"
+        if not bool(step_details.get("strict_validation")):
+            return False, "upload checkpoint was not strictly validated"
+
+        failed_uploads = step_details.get("failed_uploads") or []
+        if isinstance(failed_uploads, list) and failed_uploads:
+            return False, f"upload checkpoint has {len(failed_uploads)} failed upload(s)"
+
+        try:
+            total_attempts = int(step_details.get("total_upload_attempts") or step_details.get("total_candidates") or 0)
+        except (TypeError, ValueError):
+            total_attempts = 0
+        uploaded_emails = step_details.get("uploaded_emails") or []
+        uploaded_count = len(uploaded_emails) if isinstance(uploaded_emails, list) else 0
+        try:
+            skipped_count = int(step_details.get("skipped_already_uploaded") or 0)
+        except (TypeError, ValueError):
+            skipped_count = 0
+
+        if total_attempts <= 0:
+            return False, "upload checkpoint has no upload attempts"
+        if uploaded_count + skipped_count < total_attempts:
+            return (
+                False,
+                f"upload checkpoint only proved {uploaded_count + skipped_count}/{total_attempts} upload attempt(s)",
+            )
+        return True, "strict upload checkpoint valid"
+
+    @staticmethod
+    def _normalize_sending_tool_slug(raw: str) -> str:
+        text = str(raw or "").strip().lower()
+        if "instantly" in text:
+            return "instantly.ai"
+        if "smartlead" in text:
+            return "smartlead.ai"
+        if "plusvibe" in text:
+            return "plusvibe"
+        if "bison" in text:
+            return "email-bison"
+        if "master" in text:
+            return "masterinbox.com"
+        return text
+
     @staticmethod
     def _mfa_step_name(email: str) -> str:
         clean = str(email or "").strip().lower()
@@ -1535,6 +2080,33 @@ class GoogleInboxLifecycleWorker:
                 safe.append("_")
         return f"mfa_user_{''.join(safe)}"
 
+    def _resolve_domain_admin_login_row(self, domain_id: str, domain_name: str) -> Dict[str, Any]:
+        all_inboxes = self.client.get_domain_inboxes_all(domain_id)
+        candidates = [
+            row
+            for row in all_inboxes
+            if bool(row.get("is_admin"))
+            and str(row.get("email") or "").strip()
+            and str(row.get("password") or "").strip()
+            and str(row.get("status") or "").strip().lower() in LIVE_STATUSES
+        ]
+        if not candidates:
+            candidates = [
+                row
+                for row in all_inboxes
+                if str(row.get("email") or "").strip()
+                and str(row.get("password") or "").strip()
+                and str(row.get("status") or "").strip().lower() in LIVE_STATUSES
+            ]
+        if not candidates:
+            raise RuntimeError(
+                f"No admin-capable inbox found for {domain_name}. "
+                "At least one live inbox must have email/password to disable Google login challenges."
+            )
+
+        ordered = sorted(candidates, key=lambda r: (not bool(r.get("is_admin")), str(r.get("created_at") or ""), str(r.get("id") or "")))
+        return ordered[0]
+
     def _get_partnerhub(self) -> PartnerHubClient:
         if self._partnerhub is None:
             self._partnerhub = PartnerHubClient(
@@ -1543,6 +2115,57 @@ class GoogleInboxLifecycleWorker:
                 default_plan_id=self.partnerhub_plan_id,
             )
         return self._partnerhub
+
+    @staticmethod
+    def _is_partnerhub_seat_shortage_error(error: Exception) -> bool:
+        text = str(error or "").strip().lower()
+        return (
+            "seat" in text
+            and ("available" in text or "increase your seat count" in text)
+        )
+
+    @staticmethod
+    def _is_partnerhub_non_retryable_error(error_message: str) -> bool:
+        text = str(error_message or "").strip().lower()
+        return (
+            ("seat" in text and ("available" in text or "increase your seat count" in text))
+            or "insufficient balance" in text
+            or "not enough balance" in text
+            or "payment" in text
+            or "plan id" in text
+            or "plan not found" in text
+            or "order not found" in text
+        )
+
+    @staticmethod
+    def _partnerhub_response_summary(response: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(response, dict):
+            return {"response": str(response)[:500]}
+
+        summary: Dict[str, Any] = {}
+        for key in ("success", "status", "statusCode", "message", "orderId", "id"):
+            if key in response:
+                summary[key] = response.get(key)
+
+        data = response.get("data")
+        if isinstance(data, dict):
+            data_summary: Dict[str, Any] = {}
+            for key in ("orderId", "id", "status", "message"):
+                if key in data:
+                    data_summary[key] = data.get(key)
+            if data_summary:
+                summary["data"] = data_summary
+
+        return summary or {"keys": sorted(str(key) for key in response.keys())[:20]}
+
+    @staticmethod
+    def _is_google_signin_challenge_blocked(error_message: str) -> bool:
+        text = str(error_message or "").strip().lower()
+        return (
+            "google sign-in challenge blocked automation" in text
+            or "google_phone_verification_challenge" in text
+            or "phone-number sms verification" in text
+        )
 
     @staticmethod
     def _generate_password(length: int = 14) -> str:

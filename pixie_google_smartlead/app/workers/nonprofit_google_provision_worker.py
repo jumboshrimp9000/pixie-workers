@@ -8,9 +8,11 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+import requests
 from playwright.async_api import async_playwright
 
 from app import get_order_logger
+from app.workers.google_admin_playwright import GoogleAdminPlaywrightClient, GoogleAdminUser
 from app.workers.google_fulfillment_clients import CloudflareClient
 from app.workers.nonprofit_google_admin_playwright import (
     enable_dkim_for_domain,
@@ -30,6 +32,8 @@ INTERIM_STATUSES = {
     "PANEL_ASSIGNED": "Free Google - Panel Assigned",
     "TXT_FETCHED": "Free Google - TXT Token Fetched",
     "TXT_WRITTEN": "Free Google - TXT Written",
+    "DNS_PROPAGATING": "Free Google - Waiting for DNS propagation",
+    "TXT_VISIBLE": "Free Google - DNS TXT Visible",
     "DOMAIN_VERIFIED": "Free Google - Domain Verified",
     "USERS_CREATED": "Free Google - Users Created",
     "DKIM_ENABLED": "Free Google - DKIM Enabled",
@@ -38,6 +42,13 @@ INTERIM_STATUSES = {
     "COMPLETE": "Free Google - Provisioning Complete",
     "FAILED": "Free Google - Failed",
 }
+
+
+class DeferredNonprofitAction(RuntimeError):
+    def __init__(self, message: str, *, delay_seconds: float, consume_attempt: bool = False) -> None:
+        super().__init__(message)
+        self.delay_seconds = delay_seconds
+        self.consume_attempt = consume_attempt
 
 
 class NonprofitGoogleProvisionWorker:
@@ -51,6 +62,10 @@ class NonprofitGoogleProvisionWorker:
         self.require_mfa_enrollment = self._as_bool(
             os.getenv("NONPROFIT_GOOGLE_REQUIRE_MFA_ENROLLMENT", "true"),
             default=True,
+        )
+        self.dns_propagation_retry_seconds = max(
+            60.0,
+            float(os.getenv("NONPROFIT_GOOGLE_DNS_PROPAGATION_RETRY_SECONDS", "300")),
         )
         self.admin_vault = str(os.getenv("NONPROFIT_GOOGLE_ADMIN_OP_VAULT") or "").strip()
         self.user_vault = str(os.getenv("NONPROFIT_GOOGLE_USER_OP_VAULT") or "icje7jpscrdm6xtlcr252zxinq").strip()
@@ -91,13 +106,25 @@ class NonprofitGoogleProvisionWorker:
         action_logger = get_order_logger(action_id)
         prior_result = action.get("result") or {}
         prior_steps_raw = prior_result.get("steps") if isinstance(prior_result, dict) else []
+        if not isinstance(prior_steps_raw, list):
+            prior_steps_raw = []
         steps: List[Dict[str, Any]] = [row for row in prior_steps_raw if isinstance(row, dict)]
-        last_step_status = {str(row.get("step") or ""): str(row.get("status") or "").lower() for row in steps}
-        last_step_details = {
-            str(row.get("step") or ""): row.get("details")
-            for row in steps
-            if isinstance(row.get("details"), dict) and str(row.get("step") or "")
-        }
+        last_step_status: Dict[str, str] = {}
+        last_step_details: Dict[str, Dict[str, Any]] = {}
+        for row in steps:
+            step_name = str(row.get("step") or "")
+            if not step_name:
+                continue
+            status = str(row.get("status") or "").lower()
+            details = row.get("details")
+            if status == "completed":
+                last_step_status[step_name] = "completed"
+                if isinstance(details, dict):
+                    last_step_details[step_name] = details
+            elif step_name not in last_step_status:
+                last_step_status[step_name] = status
+                if isinstance(details, dict):
+                    last_step_details[step_name] = details
 
         domain_id = str(action.get("domain_id") or "").strip()
         payload = action.get("payload") or {}
@@ -135,7 +162,6 @@ class NonprofitGoogleProvisionWorker:
 
         def checkpoint(step_name: str) -> Optional[Dict[str, Any]]:
             if last_step_status.get(step_name) == "completed":
-                skip_step(step_name, "Resumed from previous completed step")
                 details = last_step_details.get(step_name) or {}
                 log_event("step_resumed", "info", f"[{step_name}] Reusing checkpoint", {"details": details})
                 return details
@@ -209,7 +235,7 @@ class NonprofitGoogleProvisionWorker:
                     customer_id=customer_id,
                     user_count=len(inboxes),
                 )
-                complete_step(step, panel_details)
+                complete_step(step, self._panel_step_details(panel_details))
                 persist_progress(INTERIM_STATUSES["PANEL_ASSIGNED"], "in_progress")
 
             panel_id = str(panel_details.get("panel_id") or panel_details.get("id") or "").strip()
@@ -254,16 +280,68 @@ class NonprofitGoogleProvisionWorker:
                     zone_id,
                     [{"type": "TXT", "name": "@", "content": txt_record, "ttl": 3600}],
                 )
+                if int(dns_summary.get("failed") or 0) > 0:
+                    fail_message = f"Cloudflare TXT write failed for {domain_name}: {dns_summary}"
+                    fail_step(step, fail_message)
+                    persist_progress(INTERIM_STATUSES["FAILED"], "in_progress")
+                    raise RuntimeError(fail_message)
                 complete_step(step, dns_summary)
                 persist_progress(INTERIM_STATUSES["TXT_WRITTEN"], "in_progress")
+
+            txt_visible_checkpoint = checkpoint("wait_public_txt")
+            if not txt_visible_checkpoint:
+                step = start_step("wait_public_txt")
+                public_dns = self._check_public_txt_record(domain_name, txt_record)
+                if not bool(public_dns.get("visible")):
+                    message = (
+                        f"Waiting for DNS propagation: Google verification TXT for {domain_name} "
+                        "is not visible in public DNS yet."
+                    )
+                    step["status"] = "waiting"
+                    step["completedAt"] = self._iso_now()
+                    step["error"] = message
+                    step["details"] = {
+                        **public_dns,
+                        "classification": "dns_propagation",
+                        "playwrightAttempted": False,
+                        "nextRetrySeconds": self.dns_propagation_retry_seconds,
+                    }
+                    persist_progress(INTERIM_STATUSES["DNS_PROPAGATING"], "ns_pending")
+                    raise DeferredNonprofitAction(
+                        message,
+                        delay_seconds=self.dns_propagation_retry_seconds,
+                        consume_attempt=False,
+                    )
+                complete_step(step, public_dns)
+                persist_progress(INTERIM_STATUSES["TXT_VISIBLE"], "in_progress")
 
             verify_checkpoint = checkpoint("verify_domain")
             if not verify_checkpoint:
                 step = start_step("verify_domain")
                 verify_result = panel_client.verify_domain_via_api(domain_name)
-                if not bool(verify_result.get("verified")):
+                if not self._domain_verification_succeeded(verify_result):
                     verify_result = asyncio.run(self._verify_domain_ui(domain_name, admin_creds))
-                if not bool(verify_result.get("verified")):
+                if not self._domain_verification_succeeded(verify_result):
+                    if verify_result.get("timedOut") or "verification failed" in str(verify_result.get("error") or "").lower():
+                        message = (
+                            f"Waiting for Google to recognize DNS for {domain_name}. "
+                            f"Public TXT is visible, but Google verification is not complete yet: {verify_result}"
+                        )
+                        step["status"] = "waiting"
+                        step["completedAt"] = self._iso_now()
+                        step["error"] = message
+                        step["details"] = {
+                            "verifyResult": verify_result,
+                            "classification": "google_dns_recognition_pending",
+                            "playwrightAttempted": True,
+                            "nextRetrySeconds": self.dns_propagation_retry_seconds,
+                        }
+                        persist_progress(INTERIM_STATUSES["DNS_PROPAGATING"], "ns_pending")
+                        raise DeferredNonprofitAction(
+                            message,
+                            delay_seconds=self.dns_propagation_retry_seconds,
+                            consume_attempt=False,
+                        )
                     fail_step(step, f"Domain verification failed: {verify_result}")
                     persist_progress(INTERIM_STATUSES["FAILED"], "in_progress")
                     raise RuntimeError(f"Domain verification failed for {domain_name}: {verify_result}")
@@ -281,9 +359,38 @@ class NonprofitGoogleProvisionWorker:
                         if "already exists" not in str(row.get("error") or "").lower()
                     ]
                     if non_duplicate:
-                        fail_step(step, json.dumps(non_duplicate)[:2000])
-                        persist_progress(INTERIM_STATUSES["FAILED"], "in_progress")
-                        raise RuntimeError(f"Apps Script user creation failed: {non_duplicate}")
+                        if self._is_directory_authorization_failure(non_duplicate):
+                            log_event(
+                                "step_warning",
+                                "warn",
+                                "[batch_create_users] Apps Script Directory API is not authorized; falling back to Google Admin Playwright user creation.",
+                                {"error_count": len(non_duplicate)},
+                            )
+                            fallback_result = self._create_users_via_google_admin_ui(
+                                domain_name=domain_name,
+                                user_payloads=user_payloads,
+                                admin_creds=admin_creds,
+                            )
+                            if int(fallback_result.get("failed") or 0) > 0:
+                                details = {
+                                    "primary": "apps_script",
+                                    "fallback": "google_admin_playwright",
+                                    "appsScriptErrors": non_duplicate,
+                                    "playwright": fallback_result,
+                                }
+                                fail_step(step, json.dumps(details)[:2000])
+                                persist_progress(INTERIM_STATUSES["FAILED"], "in_progress")
+                                raise RuntimeError(f"Playwright user creation fallback failed: {details}")
+                            create_result = {
+                                "primary": "apps_script",
+                                "fallback": "google_admin_playwright",
+                                "appsScriptErrors": non_duplicate,
+                                "playwright": fallback_result,
+                            }
+                        else:
+                            fail_step(step, json.dumps(non_duplicate)[:2000])
+                            persist_progress(INTERIM_STATUSES["FAILED"], "in_progress")
+                            raise RuntimeError(f"Apps Script user creation failed: {non_duplicate}")
                 complete_step(step, create_result)
                 persist_progress(INTERIM_STATUSES["USERS_CREATED"], "in_progress")
 
@@ -382,6 +489,24 @@ class NonprofitGoogleProvisionWorker:
             result = {"steps": steps, "panel_id": panel_id, "domain": domain_name}
             self.client.complete_action(action, result)
             log_event("action_completed", "info", f"Nonprofit Google provisioning complete for {domain_name}", result)
+        except DeferredNonprofitAction as exc:
+            message = str(exc)
+            log_event(
+                "action_deferred",
+                "warn",
+                message,
+                {"delay_seconds": exc.delay_seconds, "consume_attempt": exc.consume_attempt},
+            )
+            try:
+                self.client.update_action(action, {"result": {"steps": steps, "lastUpdated": self._iso_now()}})
+            except Exception:
+                pass
+            self.client.defer_action(
+                action,
+                message,
+                delay_seconds=exc.delay_seconds,
+                consume_attempt=exc.consume_attempt,
+            )
         except Exception as exc:
             message = str(exc)
             log_event("action_failed", "error", message)
@@ -515,6 +640,25 @@ class NonprofitGoogleProvisionWorker:
         )
         return rows[0] if rows else None
 
+    @staticmethod
+    def _panel_step_details(panel_details: Dict[str, Any]) -> Dict[str, Any]:
+        allowed_keys = {
+            "assignment_id",
+            "panel_id",
+            "id",
+            "name",
+            "status",
+            "max_users",
+            "max_domains",
+            "current_user_count",
+            "current_domain_count",
+        }
+        return {
+            key: value
+            for key, value in panel_details.items()
+            if key in allowed_keys and value is not None
+        }
+
     def _resolve_panel_credentials(self, panel_record: Dict[str, Any]) -> Dict[str, Any]:
         apps_script_url = str(panel_record.get("apps_script_url") or "").strip()
         if not apps_script_url:
@@ -542,22 +686,150 @@ class NonprofitGoogleProvisionWorker:
         self.client.update_domain(str(domain.get("id")), {"cloudflare_zone_id": zone_id})
         return zone_id, created
 
+    def _check_public_txt_record(self, domain_name: str, expected_txt: str) -> Dict[str, Any]:
+        expected = self._normalize_txt_value(expected_txt)
+        resolvers = [
+            ("google", "https://dns.google/resolve", {}),
+            ("cloudflare", "https://cloudflare-dns.com/dns-query", {"accept": "application/dns-json"}),
+        ]
+        checks: List[Dict[str, Any]] = []
+
+        for resolver_name, url, headers in resolvers:
+            try:
+                response = requests.get(
+                    url,
+                    params={"name": domain_name, "type": "TXT"},
+                    headers=headers,
+                    timeout=15,
+                )
+                payload = response.json() if response.text else {}
+                answers = payload.get("Answer") if isinstance(payload, dict) else []
+                values = [
+                    self._normalize_txt_value(answer.get("data"))
+                    for answer in answers or []
+                    if isinstance(answer, dict) and int(answer.get("type") or 0) == 16
+                ]
+                visible = expected in values
+                checks.append(
+                    {
+                        "resolver": resolver_name,
+                        "visible": visible,
+                        "answerCount": len(values),
+                        "status": payload.get("Status") if isinstance(payload, dict) else None,
+                    }
+                )
+            except Exception as exc:
+                checks.append({"resolver": resolver_name, "visible": False, "error": str(exc)})
+
+        google_check = next((row for row in checks if row.get("resolver") == "google"), {})
+        any_visible = any(bool(row.get("visible")) for row in checks)
+        google_visible = bool(google_check.get("visible"))
+        google_unavailable = bool(google_check.get("error"))
+
+        return {
+            "visible": google_visible or (google_unavailable and any_visible),
+            "requiredRecord": expected,
+            "checks": checks,
+        }
+
+    @staticmethod
+    def _domain_verification_succeeded(result: Dict[str, Any]) -> bool:
+        if bool(result.get("verified")):
+            return True
+        verification = result.get("verification")
+        if isinstance(verification, dict):
+            if bool(verification.get("verified")):
+                return True
+            if bool(verification.get("success")) and "verified successfully" in str(verification.get("message") or "").lower():
+                return True
+        if bool(result.get("success")) and "verified successfully" in str(result.get("message") or "").lower():
+            return True
+        return False
+
+    @staticmethod
+    def _normalize_txt_value(value: Any) -> str:
+        text = str(value or "").strip()
+        if text.startswith('"') and text.endswith('"'):
+            text = text[1:-1]
+        return text.replace('" "', "").strip()
+
     def _build_panel_user_payloads(self, domain_name: str, inboxes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         for inbox in inboxes:
             email = self._resolve_inbox_email(inbox, domain_name)
             local_part = email.split("@")[0]
+            password = str(inbox.get("password") or "").strip()
+            if not password:
+                password = self._generate_password()
+                inbox_id = str(inbox.get("id") or "").strip()
+                if inbox_id:
+                    self.client.update_inbox(inbox_id, {"password": password})
             rows.append(
                 {
                     "firstName": str(inbox.get("first_name") or inbox.get("firstName") or local_part).strip() or local_part,
                     "lastName": str(inbox.get("last_name") or inbox.get("lastName") or "Inbox").strip() or "Inbox",
                     "email": email,
-                    "password": str(inbox.get("password") or "").strip() or self._generate_password(),
+                    "password": password,
                     "orgUnitPath": f"/{domain_name}",
                     "recoveryEmail": str(inbox.get("recovery_email") or "").strip() or None,
                 }
             )
         return rows
+
+    @staticmethod
+    def _is_directory_authorization_failure(errors: List[Dict[str, Any]]) -> bool:
+        if not errors:
+            return False
+        return all(
+            "not authorized to access this resource/api" in str(row.get("error") or "").lower()
+            for row in errors
+            if isinstance(row, dict)
+        )
+
+    def _create_users_via_google_admin_ui(
+        self,
+        *,
+        domain_name: str,
+        user_payloads: List[Dict[str, Any]],
+        admin_creds: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        admin_email = str(admin_creds.get("admin_email") or "").strip().lower()
+        admin_password = str(admin_creds.get("admin_password") or "").strip()
+        if not admin_email or not admin_password:
+            raise RuntimeError("Panel admin credentials are required for Google Admin Playwright user creation fallback")
+
+        users = [
+            GoogleAdminUser(
+                email=str(row.get("email") or "").strip().lower(),
+                first_name=str(row.get("firstName") or "").strip(),
+                last_name=str(row.get("lastName") or "").strip(),
+                password=str(row.get("password") or "").strip(),
+            )
+            for row in user_payloads
+            if str(row.get("email") or "").strip() and str(row.get("password") or "").strip()
+        ]
+        if len(users) != len(user_payloads):
+            raise RuntimeError("Every requested Google user must have an email and password before Playwright fallback")
+
+        op_client = admin_creds.get("_op_client")
+        if not isinstance(op_client, OnePasswordCliClient):
+            op_client = None
+
+        with GoogleAdminPlaywrightClient(headless=self.playwright_headless, timeout_seconds=60) as browser:
+            browser.login(
+                admin_email,
+                admin_password,
+                onepassword=op_client,
+                totp_secret=str(admin_creds.get("totp_secret") or "").strip(),
+            )
+            result = browser.add_users(users, domain_name)
+
+        return {
+            "added": int(result.get("added") or 0),
+            "failed": int(result.get("failed") or 0),
+            "requested": len(users),
+            "method": "google_admin_playwright",
+        }
 
     def _resolve_inbox_email(self, inbox: Dict[str, Any], domain_name: str) -> str:
         explicit = str(inbox.get("email") or inbox.get("google_email") or inbox.get("workspace_email") or "").strip().lower()
@@ -620,11 +892,23 @@ class NonprofitGoogleProvisionWorker:
 
     def _get_cloudflare(self) -> CloudflareClient:
         if self._cloudflare is None:
+            api_token = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
+            global_key = (
+                os.getenv("CLOUDFLARE_GLOBAL_KEY", "").strip()
+                or os.getenv("CLOUDFLARE_GLOBAL_API_KEY", "").strip()
+            )
+            global_email = os.getenv("CLOUDFLARE_EMAIL", "").strip()
             self._cloudflare = CloudflareClient(
-                api_token=os.getenv("CLOUDFLARE_API_TOKEN", ""),
+                api_token=api_token,
                 account_id=os.getenv("CLOUDFLARE_ACCOUNT_ID", ""),
-                global_api_key=os.getenv("CLOUDFLARE_GLOBAL_KEY", ""),
-                global_email=os.getenv("CLOUDFLARE_EMAIL", ""),
+                global_api_key=global_key,
+                global_email=global_email,
+            )
+            logger.info(
+                "Cloudflare auth configured for nonprofit worker (mode=%s, global_fallback=%s, account_id_set=%s)",
+                "token" if api_token else "global",
+                bool(api_token and global_key and global_email),
+                bool(os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()),
             )
         return self._cloudflare
 

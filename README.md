@@ -2,6 +2,27 @@
 
 This folder contains external/background workers that consume Supabase actions.
 
+## GitHub source of truth and live deploy
+
+The production worker source of truth is:
+
+- GitHub repo: `https://github.com/jumboshrimp9000/pixie-workers`
+- Production branch: `main`
+- Local repo path: `/Users/omermullick/Downloads/Projects/job-workers`
+
+This repo deploys to live worker servers through `.github/workflows/deploy.yml`. A push to `main` runs the `Deploy pixie-workers` GitHub Actions workflow, which SSHes into the servers with `DEPLOY_SSH_KEY`, pulls the latest code, and rebuilds/restarts Docker services:
+
+- Microsoft worker server: `143.198.126.147`, path `/opt/pixie/microsoft-worker`, service `pixie-microsoft`
+- Google worker server: `157.245.129.244`, path `/opt/pixie-google`, services `pixie-google-paid-worker` and `pixie-google-free-nonprofit-worker`
+
+Do not rely on the outer `/Users/omermullick/Downloads/Projects` Git repo for worker deployment. The nested `job-workers` repo is the deployable repo; commit and push from there.
+
+To verify a live deploy after pushing:
+
+1. Check the GitHub Actions run for `Deploy pixie-workers` on `main`.
+2. Confirm the run completed both `deploy-microsoft` and `deploy-google`.
+3. If server access is available, confirm the relevant server path has the pushed commit with `git rev-parse HEAD` and confirm containers are running with `docker compose ps`.
+
 ## Canonical folders
 
 - Root-level legacy scripts such as `MS-ResourceMailbox.ps1` are archived references only. Do not run them for production launch; use the canonical folders below.
@@ -27,7 +48,10 @@ Shared queue flow:
 1. `prepare_domain`
 2. provider-specific action:
    - `provision_inbox` for Microsoft
-   - `google_provision` for Google
+   - `google_provision` for paid Google
+   - `free_google_provision` for free/nonprofit Google promo domains
+
+Free Google promo routing is explicit. `AP` marks exactly one selected Google domain with `free_google_promo=true`, `fulfillment_process=free_google_nonprofit`, and `promo_inbox_count`. `prepare_domain` must skip PartnerHub/PartnerStage for that domain and enqueue `free_google_provision`; if the expected `free_inboxes_promo` inbox rows are missing, it fails instead of falling back to paid Google fulfillment.
 
 Google lifecycle changes also flow through Supabase actions:
 - `google_add_inboxes`

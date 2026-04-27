@@ -7,7 +7,7 @@ from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 import requests
 from playwright.sync_api import (
@@ -22,6 +22,10 @@ from app.workers.onepassword_client import OnePasswordCliClient
 
 
 logger = logging.getLogger(__name__)
+
+
+class GoogleSignInChallengeBlocked(RuntimeError):
+    """Raised when Google requires a manual sign-in challenge automation cannot satisfy."""
 
 
 @dataclass
@@ -85,12 +89,19 @@ class GoogleAdminPlaywrightClient:
         self.mfa_retry_attempts = max(1, int(os.getenv("GOOGLE_MFA_ENROLL_RETRY_ATTEMPTS", "3")))
         self.mfa_retry_delay_seconds = max(0.5, float(os.getenv("GOOGLE_MFA_ENROLL_RETRY_DELAY_SECONDS", "2")))
         self.mfa_reset_session_per_user = (
-            str(os.getenv("GOOGLE_MFA_RESET_SESSION_PER_USER", "false")).strip().lower()
+            str(os.getenv("GOOGLE_MFA_RESET_SESSION_PER_USER", "true")).strip().lower()
             in {"1", "true", "yes", "on"}
         )
+        self.profile_verify_enabled = (
+            str(os.getenv("GOOGLE_PROFILE_VERIFY_ENABLED", "true")).strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self.profile_verify_attempts = max(1, int(os.getenv("GOOGLE_PROFILE_VERIFY_ATTEMPTS", "2")))
         self._admin_email: str = ""
         self._admin_password: str = ""
         self._admin_onepassword: Optional[OnePasswordCliClient] = None
+        self._totp_item_ids_by_email: Dict[str, str] = {}
+        self._totp_secrets_by_email: Dict[str, str] = {}
 
         self._playwright: Optional[Playwright] = None
         self.browser: Optional[Browser] = None
@@ -169,10 +180,13 @@ class GoogleAdminPlaywrightClient:
         admin_password: str,
         *,
         onepassword: Optional[OnePasswordCliClient] = None,
+        totp_secret: str = "",
     ) -> None:
         self._admin_email = str(admin_email or "").strip().lower()
         self._admin_password = str(admin_password or "").strip()
         self._admin_onepassword = onepassword
+        if self._admin_email and str(totp_secret or "").strip():
+            self._totp_secrets_by_email[self._admin_email] = str(totp_secret or "").strip()
         last_error: Optional[Exception] = None
         for attempt in range(1, self.admin_login_attempts + 1):
             try:
@@ -189,6 +203,14 @@ class GoogleAdminPlaywrightClient:
                 self._login_google_account(admin_email, admin_password, onepassword=onepassword)
                 self._open_admin_home_page()
                 return
+            except GoogleSignInChallengeBlocked as exc:
+                message = str(exc)
+                debug_note = self._capture_debug_state(
+                    f"google_admin_login_blocked_{attempt}_{self._slug(admin_email)}"
+                )
+                if debug_note:
+                    message = f"{message} | {debug_note}"
+                raise GoogleSignInChallengeBlocked(message) from exc
             except Exception as exc:
                 message = str(exc)
                 debug_note = self._capture_debug_state(
@@ -233,7 +255,7 @@ class GoogleAdminPlaywrightClient:
                 failed += 1
                 continue
             try:
-                if self.mfa_reset_session_per_user and index > 0:
+                if self.mfa_reset_session_per_user:
                     logger.info("Resetting Playwright session before MFA enrollment for %s", email)
                     self._reset_session()
 
@@ -246,6 +268,8 @@ class GoogleAdminPlaywrightClient:
                 completed += 1
                 if progress_hook:
                     progress_hook("completed", email, details)
+            except GoogleSignInChallengeBlocked:
+                raise
             except Exception as exc:
                 failed += 1
                 message = str(exc)
@@ -275,6 +299,8 @@ class GoogleAdminPlaywrightClient:
                 details["attempt"] = attempt
                 details["max_attempts"] = max_attempts
                 return details
+            except GoogleSignInChallengeBlocked:
+                raise
             except Exception as exc:
                 debug_note = self._capture_debug_state(f"mfa_attempt_{attempt}_{self._slug(email)}")
                 last_error = str(exc)
@@ -325,7 +351,7 @@ class GoogleAdminPlaywrightClient:
             raise RuntimeError("email/password required for MFA enrollment")
 
         self._login_google_account(email, password, onepassword=onepassword)
-        self._open_2sv_page(email, password)
+        self._open_2sv_page(email, password, onepassword=onepassword)
 
         if self._is_2sv_already_enabled():
             return {"status": "already_enabled", "email": email}
@@ -386,6 +412,317 @@ class GoogleAdminPlaywrightClient:
             "enroll_mode": enroll_mode,
         }
 
+    def disable_login_challenges_for_users(
+        self,
+        admin_email: str,
+        admin_password: str,
+        target_emails: List[str],
+        *,
+        onepassword: Optional[OnePasswordCliClient] = None,
+        totp_item_ids_by_email: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        targets = [str(email or "").strip().lower() for email in target_emails if str(email or "").strip()]
+        results: Dict[str, Dict[str, Any]] = {}
+        disabled = 0
+        already_off = 0
+        failed = 0
+        if not targets:
+            return {"disabled": 0, "already_off": 0, "failed": 0, "results": results}
+
+        previous_totp_items = dict(self._totp_item_ids_by_email)
+        try:
+            mapped_items = {
+                str(email or "").strip().lower(): str(item_id or "").strip()
+                for email, item_id in (totp_item_ids_by_email or {}).items()
+                if str(email or "").strip() and str(item_id or "").strip()
+            }
+            self._totp_item_ids_by_email.update(mapped_items)
+
+            self._login_google_account(admin_email, admin_password, onepassword=onepassword)
+            self._open_admin_home_page()
+            for email in targets:
+                try:
+                    details = self._disable_login_challenge_for_user(email)
+                    status = str(details.get("status") or "").lower()
+                    if status in {"disabled", "disabled_unverified"}:
+                        disabled += 1
+                    elif status == "already_off":
+                        already_off += 1
+                    results[email] = details
+                except GoogleSignInChallengeBlocked:
+                    raise
+                except Exception as exc:
+                    failed += 1
+                    debug_note = self._capture_debug_state(f"disable_login_challenge_failed_{self._slug(email)}")
+                    message = str(exc)
+                    if debug_note:
+                        message = f"{message} | debug={debug_note}"
+                    results[email] = {"status": "failed", "error": message}
+        finally:
+            self._totp_item_ids_by_email = previous_totp_items
+
+        return {
+            "disabled": disabled,
+            "already_off": already_off,
+            "failed": failed,
+            "results": results,
+        }
+
+    def _disable_login_challenge_for_user(self, email: str) -> Dict[str, Any]:
+        clean_email = str(email or "").strip().lower()
+        if not clean_email:
+            raise RuntimeError("target email is required for login-challenge disable")
+
+        self._open_user_security_settings(clean_email)
+        if self._login_challenge_already_off():
+            return {"status": "already_off", "email": clean_email, "url": self._safe_url()}
+
+        self._expand_login_challenge_control()
+        if self._login_challenge_already_off():
+            return {"status": "already_off", "email": clean_email, "url": self._safe_url()}
+
+        clicked = self._click_google_action(
+            [
+                "//*[@role='button' and .//span[contains(normalize-space(),'Turn off for 10 mins')]]",
+                "//*[@role='button' and .//span[contains(normalize-space(),'Turn off')]]",
+                "//button[.//span[contains(normalize-space(),'Turn off')]]",
+                "//button[contains(normalize-space(),'Turn off')]",
+                "//button[contains(normalize-space(),'Disable')]",
+                "//span[contains(normalize-space(),'Turn off for 10 mins')]",
+                "//span[contains(normalize-space(),'Turn off for 10 minutes')]",
+                "//span[contains(normalize-space(),'Turn off')]",
+                "//span[contains(normalize-space(),'Disable login challenge')]",
+            ],
+            [
+                "Turn off for 10 mins",
+                "Turn off for 10 minutes",
+                "Turn off login challenge",
+                "Disable login challenge",
+                "Turn off",
+                "Disable",
+            ],
+            timeout_ms=12_000,
+            optional=True,
+        )
+        if not clicked:
+            raise RuntimeError(
+                f"Login challenge control was not clickable for {clean_email}. url={self._safe_url()} "
+                f"text={self._visible_text_excerpt(limit=700)}"
+            )
+
+        time.sleep(0.8)
+        self._click_google_action(
+            [
+                "//div[@role='dialog']//button[.//span[contains(normalize-space(),'Turn off')]]",
+                "//div[@role='dialog']//button[contains(normalize-space(),'Turn off')]",
+                "//div[@role='dialog']//button[contains(normalize-space(),'Disable')]",
+                "//div[@role='dialog']//button[contains(normalize-space(),'Confirm')]",
+                "//button[.//span[normalize-space()='OK']]",
+                "//button[.//span[normalize-space()='Done']]",
+            ],
+            ["Turn off", "Disable", "Confirm", "OK", "Done"],
+            timeout_ms=8_000,
+            optional=True,
+        )
+        time.sleep(1.5)
+
+        if not self._login_challenge_already_off():
+            text = self._visible_text_excerpt(limit=3500).lower()
+            if not (
+                "turned off" in text
+                or "off for 10" in text
+                or "disabled for 10" in text
+                or "login challenge is off" in text
+            ):
+                if "turn off for 10 min" in text or "turn off identity" in text:
+                    return {
+                        "status": "disabled_unverified",
+                        "email": clean_email,
+                        "url": self._safe_url(),
+                        "warning": (
+                            "Clicked Google Admin login-challenge disable control, but the page did not "
+                            "leave persistent success text to verify."
+                        ),
+                    }
+                raise RuntimeError(
+                    f"Login challenge disable did not produce success evidence for {clean_email}. "
+                    f"url={self._safe_url()} text={self._visible_text_excerpt(limit=1200)}"
+                )
+
+        return {"status": "disabled", "email": clean_email, "url": self._safe_url()}
+
+    def _open_user_security_settings(self, email: str) -> None:
+        clean_email = str(email or "").strip().lower()
+        urls = [
+            f"https://admin.google.com/ac/users?query={quote(clean_email)}",
+            f"https://admin.google.com/ac/users?search={quote(clean_email)}",
+            "https://admin.google.com/ac/users",
+        ]
+        opened_user = False
+        for url in urls:
+            self._goto(url)
+            self._reauthenticate_admin_console_if_needed()
+            time.sleep(1.8)
+            if clean_email in self._visible_text_excerpt(limit=1800).lower() and self._page_mentions_user_security():
+                opened_user = True
+                break
+            if self._click_admin_user_result(clean_email):
+                time.sleep(2.0)
+                opened_user = True
+                break
+
+        if not opened_user:
+            self._search_admin_console_for_user(clean_email)
+            if self._click_admin_user_result(clean_email):
+                time.sleep(2.0)
+                opened_user = True
+
+        if not opened_user:
+            raise RuntimeError(f"Could not open Google Admin user page for {clean_email}")
+
+        if self._page_mentions_user_security():
+            return
+
+        self._click_google_action(
+            [
+                "//a[.//*[normalize-space()='Security']]",
+                "//a[contains(normalize-space(),'Security')]",
+                "//button[.//*[normalize-space()='Security']]",
+                "//button[contains(normalize-space(),'Security')]",
+                "//*[normalize-space()='Security']",
+            ],
+            ["Security"],
+            timeout_ms=10_000,
+            optional=True,
+        )
+        time.sleep(1.5)
+        if not self._page_mentions_user_security():
+            self._click_semantic_text(["Security"], timeout_ms=6_000, optional=True)
+            time.sleep(1.0)
+
+    def _search_admin_console_for_user(self, email: str) -> None:
+        page = self._require_page()
+        self._goto("https://admin.google.com/ac/users")
+        self._reauthenticate_admin_console_if_needed()
+        time.sleep(1.0)
+        filled = self._fill_any(
+            [
+                "input[aria-label*='Search']",
+                "input[placeholder*='Search']",
+                "input[type='search']",
+                "input[type='text']",
+            ],
+            email,
+            timeout_ms=8_000,
+            optional=True,
+        )
+        if filled:
+            try:
+                page.keyboard.press("Enter")
+            except Exception:
+                pass
+            time.sleep(2.0)
+
+    def _click_admin_user_result(self, email: str) -> bool:
+        clean_email = str(email or "").strip().lower()
+        if not clean_email:
+            return False
+        try:
+            return bool(
+                self._require_page().evaluate(
+                    """
+                    (email) => {
+                      const target = String(email || '').trim().toLowerCase();
+                      const clickableSelector = 'a,button,[role="button"],tr,[role="row"],li';
+                      const isVisible = (el) => {
+                        if (!el) return false;
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style.visibility !== 'hidden'
+                          && style.display !== 'none'
+                          && rect.width > 0
+                          && rect.height > 0;
+                      };
+
+                      const textFor = (el) => [
+                        el.getAttribute('aria-label'),
+                        el.getAttribute('title'),
+                        el.innerText,
+                        el.textContent
+                      ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                      const emailNodes = Array.from(document.querySelectorAll('[title],td,div,span'))
+                        .filter((el) => {
+                          if (!isVisible(el)) return false;
+                          const title = String(el.getAttribute('title') || '').trim().toLowerCase();
+                          const label = textFor(el).toLowerCase();
+                          return title === target || label === target;
+                        });
+                      for (const node of emailNodes) {
+                        const row = node.closest('tr,[role="row"]') || node;
+                        const link = Array.from(row.querySelectorAll('a[href*="/ac/users/"],a[href*="./ac/users/"]'))
+                          .find(isVisible);
+                        if (link) {
+                          link.scrollIntoView({block: 'center', inline: 'center'});
+                          link.click();
+                          return true;
+                        }
+                      }
+
+                      const candidates = Array.from(document.querySelectorAll(clickableSelector + ',div,span'));
+                      for (const el of candidates) {
+                        if (!isVisible(el)) continue;
+                        const label = textFor(el).toLowerCase();
+                        if (!label.includes(target)) continue;
+                        const clickable = el.closest(clickableSelector) || el;
+                        if (!isVisible(clickable)) continue;
+                        clickable.scrollIntoView({block: 'center', inline: 'center'});
+                        clickable.click();
+                        return true;
+                      }
+                      return false;
+                    }
+                    """,
+                    clean_email,
+                )
+            )
+        except Exception:
+            return False
+
+    def _page_mentions_user_security(self) -> bool:
+        text = self._visible_text_excerpt(limit=1800).lower()
+        return (
+            "login challenge" in text
+            or "2-step verification" in text
+            or "security keys" in text
+            or "recovery information" in text
+            or "reset sign-in cookies" in text
+        )
+
+    def _expand_login_challenge_control(self) -> None:
+        self._click_google_action(
+            [
+                "//*[contains(normalize-space(),'Login challenge')]",
+                "//*[contains(normalize-space(),\"Verify-it's-you challenge\")]",
+                "//*[contains(normalize-space(),'Verify it')]",
+            ],
+            ["Login challenge", "Verify-it's-you challenge", "Verify it"],
+            timeout_ms=8_000,
+            optional=True,
+        )
+        time.sleep(1.0)
+
+    def _login_challenge_already_off(self) -> bool:
+        text = self._visible_text_excerpt(limit=1200).lower()
+        return (
+            "login challenge" in text
+            and (
+                "off for 10" in text
+                or "turned off" in text
+                or "temporarily off" in text
+                or "disabled for 10" in text
+            )
+        )
+
     def validate_inbox_login_with_2fa(
         self,
         user: GoogleMfaUser,
@@ -402,37 +739,26 @@ class GoogleAdminPlaywrightClient:
             pass
         self._goto("https://accounts.google.com/signin/v2/identifier?service=mail")
 
-        self._fill_any(["input#identifierId", "input[type='email']"], email)
-        self._click_any(["#identifierNext", "//*[@id='identifierNext']", "//span[text()='Next']"])
-
-        if not self._exists(["input[name='Passwd']", "input[type='password']"], timeout_ms=8_000):
-            self._click_any(
-                [
-                    "//span[text()='Try another way']",
-                    "//button//span[text()='Try another way']",
-                    "//span[contains(text(),'Enter your password')]",
-                    "//span[contains(text(),'Use your password')]",
-                ],
-                timeout_ms=10_000,
-                optional=True,
-            )
-        self._fill_any(["input[name='Passwd']", "input[type='password']"], password, timeout_ms=20_000)
-        self._click_any(["#passwordNext", "//*[@id='passwordNext']", "//span[text()='Next']"])
-
-        if not self._exists(["input[name='totpPin']", "input[type='tel']"], timeout_ms=20_000):
-            debug = self._capture_debug_state(f"validate_no_totp_{self._slug(email)}")
-            raise RuntimeError(f"2FA prompt not shown for {email}. {debug}")
+        self._complete_google_signin_flow(
+            email=email,
+            password=password,
+            onepassword=onepassword,
+            context="validate_inbox",
+        )
+        self._ensure_expected_google_profile(
+            email,
+            password,
+            onepassword=onepassword,
+            context="validate_inbox",
+        )
 
         item = onepassword.find_google_login_item(email)
-        if not item:
-            raise RuntimeError(f"No 1Password item found for {email}")
-        item_id = str(item.get("id") or "").strip()
+        item_id = str((item or {}).get("id") or "").strip()
         if not item_id:
             raise RuntimeError(f"1Password item id missing for {email}")
-        code = onepassword.get_totp(item_id)
-        self._submit_totp_code(code)
 
         self._goto("https://mail.google.com/mail/u/0/#inbox")
+        self._maybe_complete_reauth(email, password, onepassword=onepassword)
         if not self._exists(["text=Inbox", "//a[contains(@href,'#inbox')]"], timeout_ms=25_000):
             debug = self._capture_debug_state(f"validate_inbox_failed_{self._slug(email)}")
             raise RuntimeError(f"Inbox did not load for {email}. {debug}")
@@ -881,7 +1207,19 @@ class GoogleAdminPlaywrightClient:
             raise RuntimeError("domain is required for verification")
 
         self._open_domain_management_page(domain_name)
+        if self._is_domain_verified(domain_name):
+            return {
+                "domain": domain_name,
+                "already_verified": True,
+            }
+
         self._open_domain_verification_flow(domain_name)
+        if self._is_domain_verified(domain_name):
+            return {
+                "domain": domain_name,
+                "already_verified": True,
+            }
+
         self._prepare_manual_domain_verification(domain_name)
         if self._is_domain_verified(domain_name):
             return {
@@ -891,7 +1229,14 @@ class GoogleAdminPlaywrightClient:
 
         verification_value = self._read_domain_verification_value()
         if not verification_value:
-            raise RuntimeError(f"Failed to read google-site-verification TXT value for {domain_name}")
+            status_text = self._read_domain_verification_status_text()
+            debug = self._capture_debug_state(f"domain_verification_missing_txt_{self._slug(domain_name)}")
+            message = f"Failed to read google-site-verification TXT value for {domain_name}"
+            if status_text:
+                message = f"{message}; status_text={status_text!r}"
+            if debug:
+                message = f"{message} | {debug}"
+            raise RuntimeError(message)
 
         return {
             "domain": domain_name,
@@ -1100,9 +1445,11 @@ class GoogleAdminPlaywrightClient:
 
     def _is_domain_verified(self, domain: str) -> bool:
         domain_name = str(domain or "").strip().lower()
-        return self._exists(
+        if self._exists(
             [
                 f"//h3[contains(normalize-space(), 'You verified') and contains(normalize-space(), '{domain_name}')]",
+                f"//tr[.//*[contains(normalize-space(), '{domain_name}')]]//*[normalize-space()='Verified']",
+                f"//*[@role='row'][.//*[contains(normalize-space(), '{domain_name}')]]//*[normalize-space()='Verified']",
                 "//h2[contains(normalize-space(), 'all set')]",
                 "//h2[contains(normalize-space(), 'You’re all set')]",
                 "//h2[contains(normalize-space(), \"You're all set\")]",
@@ -1110,6 +1457,24 @@ class GoogleAdminPlaywrightClient:
                 "//span[contains(normalize-space(), 'Set up DKIM')]",
             ],
             timeout_ms=6_000,
+        ):
+            return True
+
+        try:
+            body_text = self._require_page().locator("body").inner_text(timeout=5_000)
+        except Exception:
+            return False
+
+        normalized = " ".join(str(body_text or "").split()).lower()
+        return (
+            domain_name in normalized
+            and "verified" in normalized
+            and (
+                "gmail activated" in normalized
+                or "you verified" in normalized
+                or "you're all set" in normalized
+                or "you’re all set" in normalized
+            )
         )
 
     def _read_domain_verification_value(self) -> str:
@@ -1415,19 +1780,37 @@ class GoogleAdminPlaywrightClient:
         password: str,
         *,
         onepassword: Optional[OnePasswordCliClient] = None,
+        verify_profile: bool = True,
     ) -> None:
-        self._goto("https://accounts.google.com/signin/v2/identifier")
+        clean_email = str(email or "").strip().lower()
+        signin_url = "https://accounts.google.com/signin/v2/identifier"
+        if clean_email:
+            signin_url = f"{signin_url}?Email={quote(clean_email)}"
+        self._goto(signin_url)
         time.sleep(1)
         self._complete_google_signin_flow(
-            email=email,
+            email=clean_email or email,
             password=password,
             onepassword=onepassword,
             context="login",
         )
         self._dismiss_sign_in_to_chrome_prompt_if_present()
+        self._drain_google_login_interstitials(clean_email or email, onepassword)
+        if verify_profile:
+            self._ensure_expected_google_profile(
+                clean_email or email,
+                password,
+                onepassword=onepassword,
+                context="login",
+            )
 
-        # New Google accounts can bounce through multiple interstitial pages (speedbump,
-        # terms, promo pages). Handle them in a short loop before continuing.
+    def _drain_google_login_interstitials(
+        self,
+        email: str,
+        onepassword: Optional[OnePasswordCliClient],
+    ) -> None:
+        # New Google accounts can bounce through multiple interstitial pages
+        # (speedbump, terms, promo pages). Handle known safe prompts only.
         for _ in range(6):
             handled = False
             if self._dismiss_sign_in_to_chrome_prompt_if_present():
@@ -1443,10 +1826,18 @@ class GoogleAdminPlaywrightClient:
                 break
             time.sleep(0.8)
 
-    def _open_2sv_page(self, email: str, password: str) -> None:
+    def _open_2sv_page(
+        self,
+        email: str,
+        password: str,
+        *,
+        onepassword: Optional[OnePasswordCliClient] = None,
+    ) -> None:
         self._goto("https://myaccount.google.com/signinoptions/two-step-verification")
         self._accept_pending_terms_of_service_if_present()
-        self._maybe_complete_reauth(email, password)
+        self._maybe_complete_reauth(email, password, onepassword=onepassword)
+        self._ensure_expected_google_profile(email, password, onepassword=onepassword, context="2sv")
+        self._goto("https://myaccount.google.com/signinoptions/two-step-verification")
         self._accept_pending_terms_of_service_if_present()
         self._dismiss_sign_in_to_chrome_prompt_if_present()
 
@@ -1469,16 +1860,23 @@ class GoogleAdminPlaywrightClient:
         self._dismiss_sign_in_to_chrome_prompt_if_present()
         self._dismiss_phone_prompt_if_present()
 
-    def _maybe_complete_reauth(self, email: str, password: str) -> None:
+    def _maybe_complete_reauth(
+        self,
+        email: str,
+        password: str,
+        *,
+        onepassword: Optional[OnePasswordCliClient] = None,
+    ) -> None:
         current_url = self._safe_url().lower()
         if "accounts.google.com" not in current_url and "challenge" not in current_url and not self._has_google_sign_in_prompt():
             return
         self._complete_google_signin_flow(
             email=email,
             password=password,
-            onepassword=self._admin_onepassword,
+            onepassword=onepassword or self._admin_onepassword,
             context="reauth",
         )
+        self._drain_google_login_interstitials(email, onepassword or self._admin_onepassword)
 
     def _complete_google_signin_flow(
         self,
@@ -1488,47 +1886,64 @@ class GoogleAdminPlaywrightClient:
         onepassword: Optional[OnePasswordCliClient],
         context: str,
     ) -> None:
+        clean_email = str(email or "").strip().lower()
         email_selectors = ["input#identifierId", "input[type='email']"]
         password_selectors = [
             "input[name='Passwd']",
             "input[type='password']:not([name='hiddenPassword'])",
         ]
+        totp_selectors = [
+            "input[name='totpPin']",
+            "input[name='Pin']",
+            "input#totpPin",
+            "input[aria-label*='code']",
+            "//input[contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'code')]",
+            "input[inputmode='numeric']",
+            "input[type='tel'][autocomplete='one-time-code']",
+            "input[type='tel']",
+        ]
 
         for _ in range(10):
             self._raise_if_google_signin_rejected(email=email)
+            self._raise_if_google_signin_challenge_blocked(email=email, context=context)
             if not self._has_google_sign_in_prompt():
                 return
 
-            self._click_any(
-                [
-                    "//div[text()='Use another account']",
-                    "//button//span[text()='Use another account']",
-                ],
-                timeout_ms=3_000,
-                optional=True,
-            )
-
-            if self._exists(email_selectors, timeout_ms=2_500):
-                self._fill_any(email_selectors, email, timeout_ms=16_000)
-                self._click_any(["#identifierNext", "//*[@id='identifierNext']", "//span[text()='Next']"], timeout_ms=10_000)
-                time.sleep(1.0)
+            # Google changes routing frequently; classify by visible controls, not URL.
+            # Keep this order aligned with the worker policy so an account chooser can
+            # never steal focus before a password or TOTP challenge is handled.
+            if self._exists(totp_selectors, timeout_ms=1_500):
+                self._maybe_complete_totp_challenge(email, onepassword)
+                time.sleep(0.8)
                 continue
 
-            if self._exists(password_selectors, timeout_ms=6_000):
+            if self._exists(password_selectors, timeout_ms=2_500):
                 self._fill_any(password_selectors, password, timeout_ms=22_000)
-                self._click_any(
+                self._click_google_action(
                     ["#passwordNext", "//*[@id='passwordNext']", "//span[text()='Next']"],
+                    ["Next", "Continue"],
                     timeout_ms=10_000,
                 )
                 time.sleep(1.0)
                 continue
 
-            try_password = self._click_any(
+            if self._exists(email_selectors, timeout_ms=2_500):
+                self._fill_any(email_selectors, clean_email or email, timeout_ms=16_000)
+                self._click_google_action(
+                    ["#identifierNext", "//*[@id='identifierNext']", "//span[text()='Next']"],
+                    ["Next", "Continue"],
+                    timeout_ms=10_000,
+                )
+                time.sleep(1.0)
+                continue
+
+            try_password = self._click_google_action(
                 [
                     "//span[text()='Try another way']",
                     "//button//span[text()='Try another way']",
                     "//span[contains(text(),'Try another')]",
                 ],
+                ["Try another way", "Try another", "More ways"],
                 timeout_ms=3_500,
                 optional=True,
             )
@@ -1536,12 +1951,13 @@ class GoogleAdminPlaywrightClient:
                 time.sleep(0.8)
                 continue
 
-            use_password = self._click_any(
+            use_password = self._click_google_action(
                 [
                     "//span[contains(text(),'Enter your password')]",
                     "//span[contains(text(),'Use your password')]",
                     "//div[contains(text(),'Enter your password')]",
                 ],
+                ["Enter your password", "Use your password", "Password"],
                 timeout_ms=4_000,
                 optional=True,
             )
@@ -1549,30 +1965,149 @@ class GoogleAdminPlaywrightClient:
                 time.sleep(0.8)
                 continue
 
-            if self._exists(["input[name='totpPin']", "input[type='tel']"], timeout_ms=1_200):
-                self._maybe_complete_totp_challenge(email, onepassword)
+            if self._handle_google_account_chooser(clean_email):
                 time.sleep(0.8)
                 continue
 
             time.sleep(0.8)
 
         if self._has_google_sign_in_prompt():
+            self._raise_if_google_signin_challenge_blocked(email=email, context=context)
             debug = self._capture_debug_state(f"google_signin_not_completed_{context}_{self._slug(email)}")
             message = f"Google sign-in did not complete for {email} during {context}. url={self._safe_url()}"
             if debug:
                 message = f"{message} {debug}"
             raise RuntimeError(message)
 
+    def _handle_google_account_chooser(self, email: str) -> bool:
+        clean_email = str(email or "").strip().lower()
+        chooser_visible = self._exists(
+            [
+                "//*[contains(normalize-space(),'Choose an account')]",
+                "//*[contains(normalize-space(),'Use another account')]",
+                "[data-identifier]",
+            ],
+            timeout_ms=1_500,
+        )
+        if not chooser_visible:
+            return False
+
+        if clean_email:
+            clicked_expected = self._click_expected_google_account(clean_email, timeout_ms=3_000)
+            if clicked_expected:
+                logger.info("Selected expected Google account %s from account chooser", clean_email)
+                return True
+
+        clicked_other = self._click_google_action(
+            [
+                "//div[text()='Use another account']",
+                "//button//span[text()='Use another account']",
+                "//span[text()='Use another account']",
+            ],
+            ["Use another account", "Add account", "Sign in with another account"],
+            timeout_ms=3_000,
+            optional=True,
+        )
+        if clicked_other:
+            logger.info("Account chooser did not expose expected Google account %s; choosing alternate sign-in", clean_email)
+            return True
+
+        debug = self._capture_debug_state(f"google_account_chooser_unhandled_{self._slug(clean_email)}")
+        message = (
+            f"Google account chooser was shown but expected account {clean_email or 'unknown'} "
+            "was not selectable and 'Use another account' was unavailable."
+        )
+        if debug:
+            message = f"{message} {debug}"
+        raise RuntimeError(message)
+
+    def _raise_if_google_signin_challenge_blocked(
+        self,
+        *,
+        email: Optional[str] = None,
+        context: str = "login",
+    ) -> None:
+        current_url = self._safe_url()
+        current_path = current_url.split("?", 1)[0].lower()
+        clean_email = str(email or "").strip().lower() or "admin account"
+        excerpt = self._visible_text_excerpt(limit=700)
+        normalized_excerpt = excerpt.lower()
+        phone_challenge = (
+            "enter a phone number to get a text message with a verification code" in normalized_excerpt
+            or (
+                "verify it" in normalized_excerpt
+                and "phone number" in normalized_excerpt
+                and "text message" in normalized_excerpt
+            )
+        )
+        if phone_challenge:
+            text_suffix = f" page_text={excerpt}" if excerpt else ""
+            raise GoogleSignInChallengeBlocked(
+                "Google sign-in challenge blocked automation. "
+                f"failing_step={context}; "
+                "why=Google requires phone-number SMS verification for this account, "
+                "which the worker cannot complete safely; "
+                f"current_state=google_phone_verification_challenge for {clean_email}; "
+                "next_action=Complete the Google phone verification manually in a trusted browser "
+                "or use a different Google account/domain that does not trigger SMS verification, then retry. "
+                f"url={current_url}{text_suffix}"
+            )
+
+        if "/speedbump/gaplustos" not in current_path:
+            return
+
+        if (
+            "welcome to your new account" in normalized_excerpt
+            and "organization administrator manages this account" in normalized_excerpt
+        ):
+            clicked = self._click_google_action(
+                [
+                    "input[value='I understand']",
+                    "//input[@value='I understand']",
+                    "//button[normalize-space()='I understand']",
+                    "//button[.//span[normalize-space()='I understand']]",
+                    "//span[normalize-space()='I understand']",
+                ],
+                ["I understand", "Understand", "Continue"],
+                timeout_ms=8_000,
+                optional=True,
+            )
+            if clicked:
+                logger.info("Accepted Google new-account welcome speedbump for %s during %s", clean_email, context)
+                time.sleep(2.0)
+                return
+
+        text_suffix = f" page_text={excerpt}" if excerpt else ""
+        raise GoogleSignInChallengeBlocked(
+            "Google sign-in challenge blocked automation. "
+            "failing_step=login_admin_console; "
+            "why=Google redirected the admin account to accounts.google.com/speedbump/gaplustos, "
+            "a manual sign-in challenge that the worker cannot complete safely; "
+            f"current_state=admin_login_challenge_blocked during {context} for {clean_email}; "
+            "next_action=Open the Google Admin account in a trusted manual browser session, clear the "
+            "Google sign-in challenge or replace the admin credentials/account, then retry Google provisioning. "
+            f"url={current_url}{text_suffix}"
+        )
+
     def _raise_if_google_signin_rejected(self, *, email: Optional[str] = None) -> None:
         current_url = self._safe_url().lower()
         excerpt = self._visible_text_excerpt(limit=1400)
         normalized_excerpt = excerpt.lower()
+        detail = excerpt or current_url
+        clean_email = str(email or "").strip().lower()
+
+        if "wrong password" in normalized_excerpt or "couldn’t find your google account" in normalized_excerpt or "couldn't find your google account" in normalized_excerpt:
+            raise RuntimeError(
+                f"Google rejected sign-in for {clean_email or 'account'}: wrong email or password. {detail}"
+            )
+        if "too many failed attempts" in normalized_excerpt or "try again later" in normalized_excerpt:
+            raise RuntimeError(
+                f"Google rejected sign-in for {clean_email or 'account'}: too many failed attempts. {detail}"
+            )
 
         if "accounts.google.com/v3/signin/rejected" not in current_url and "couldn’t sign you in" not in normalized_excerpt and "couldn't sign you in" not in normalized_excerpt:
             return
 
-        detail = excerpt or current_url
-        clean_email = str(email or "").strip().lower()
         if "your account has not been verified" in normalized_excerpt:
             raise RuntimeError(
                 f"Google rejected sign-in for {clean_email or 'account'}: account is not verified yet. {detail}"
@@ -1855,6 +2390,12 @@ class GoogleAdminPlaywrightClient:
         field = self._find_any(
             [
                 "input[name='totpPin']",
+                "input[name='Pin']",
+                "input#totpPin",
+                "input[aria-label*='code']",
+                "//input[contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'code')]",
+                "input[inputmode='numeric']",
+                "input[type='tel'][autocomplete='one-time-code']",
                 "input[type='tel']",
                 "input[type='text']",
             ],
@@ -1863,7 +2404,7 @@ class GoogleAdminPlaywrightClient:
         field.fill("")
         field.type(clean)
 
-        clicked = self._click_any(
+        clicked = self._click_google_action(
             [
                 "#totpNext",
                 "//button[@type='submit']",
@@ -1877,6 +2418,7 @@ class GoogleAdminPlaywrightClient:
                 "//button[contains(.,'Done')]",
                 "//span[contains(text(),'Done')]",
             ],
+            ["Verify", "Next", "Continue", "Done"],
             timeout_ms=12_000,
             optional=True,
         )
@@ -2016,6 +2558,269 @@ class GoogleAdminPlaywrightClient:
         except Exception:
             return ""
 
+    def _ensure_expected_google_profile(
+        self,
+        email: str,
+        password: str,
+        *,
+        onepassword: Optional[OnePasswordCliClient],
+        context: str,
+    ) -> None:
+        if not self.profile_verify_enabled:
+            return
+
+        expected = str(email or "").strip().lower()
+        if not expected:
+            return
+
+        observed_emails: List[str] = []
+        last_state = ""
+        for attempt in range(1, self.profile_verify_attempts + 1):
+            if attempt > 1:
+                logger.warning(
+                    "Resetting Google browser context after profile mismatch for %s during %s",
+                    expected,
+                    context,
+                )
+                self._reset_session()
+
+            self._goto(f"https://myaccount.google.com/?authuser={quote(expected)}")
+            time.sleep(1.0)
+
+            if self._has_google_sign_in_prompt():
+                self._complete_google_signin_flow(
+                    email=expected,
+                    password=password,
+                    onepassword=onepassword,
+                    context=f"profile_check_{context}",
+                )
+                self._drain_google_login_interstitials(expected, onepassword)
+                self._goto(f"https://myaccount.google.com/?authuser={quote(expected)}")
+                time.sleep(1.0)
+
+            self._dismiss_sign_in_to_chrome_prompt_if_present()
+            observed_emails = self._read_visible_google_profile_emails()
+            if expected in observed_emails:
+                logger.info("Verified Google browser profile %s during %s", expected, context)
+                return
+
+            self._open_google_account_menu()
+            observed_emails = self._read_visible_google_profile_emails()
+            if expected in observed_emails and len(observed_emails) == 1:
+                logger.info("Verified Google browser profile %s from account menu during %s", expected, context)
+                return
+
+            last_state = ", ".join(observed_emails) if observed_emails else "no visible Google account email"
+
+        debug = self._capture_debug_state(f"google_profile_check_failed_{context}_{self._slug(expected)}")
+        raise RuntimeError(
+            "Google profile check failed. "
+            f"failing_step=profile_check; why=browser session is not visibly signed in as expected account; "
+            f"current_state=expected {expected}, observed {last_state}; "
+            "next_action=retry with a fresh browser session or manually inspect Google account chooser state. "
+            f"{debug}"
+        )
+
+    def _open_google_account_menu(self) -> bool:
+        return bool(
+            self._click_any(
+                [
+                    "a[aria-label*='Google Account']",
+                    "button[aria-label*='Google Account']",
+                    "[aria-label*='Google Account']",
+                    "a[href*='SignOutOptions']",
+                    "a[href*='ManageAccount']",
+                ],
+                timeout_ms=3_000,
+                optional=True,
+            )
+        )
+
+    def _read_visible_google_profile_emails(self) -> List[str]:
+        try:
+            emails = self._require_page().evaluate(
+                """
+                () => {
+                  const emailRegex = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/ig;
+                  const values = [];
+                  const add = (value) => {
+                    const text = String(value || '');
+                    const matches = text.match(emailRegex) || [];
+                    for (const match of matches) values.push(match.toLowerCase());
+                  };
+                  add(document.body ? document.body.innerText : '');
+                  for (const el of Array.from(document.querySelectorAll('*'))) {
+                    add(el.getAttribute('aria-label'));
+                    add(el.getAttribute('title'));
+                    add(el.getAttribute('data-email'));
+                    add(el.getAttribute('data-identifier'));
+                  }
+                  return Array.from(new Set(values));
+                }
+                """
+            )
+            if not isinstance(emails, list):
+                return []
+            return sorted({str(email or "").strip().lower() for email in emails if str(email or "").strip()})
+        except Exception:
+            return []
+
+    def _click_google_action(
+        self,
+        selectors: Iterable[str],
+        text_variants: Iterable[str],
+        *,
+        timeout_ms: int = 20_000,
+        optional: bool = False,
+    ):
+        try:
+            return self._click_any(selectors, timeout_ms=timeout_ms, optional=False)
+        except Exception as selector_exc:
+            clicked = self._click_semantic_text(text_variants, timeout_ms=timeout_ms, optional=True)
+            if clicked:
+                return clicked
+            if optional:
+                return None
+            raise selector_exc
+
+    def _click_expected_google_account(self, email: str, *, timeout_ms: int = 3_000) -> bool:
+        clean_email = str(email or "").strip().lower()
+        if not clean_email:
+            return False
+
+        deadline = time.time() + max(0.5, float(timeout_ms) / 1000.0)
+        while time.time() < deadline:
+            try:
+                clicked = self._require_page().evaluate(
+                    """
+                    (email) => {
+                      const target = String(email || '').trim().toLowerCase();
+                      if (!target) return false;
+                      const clickableSelector = [
+                        '[data-identifier]',
+                        '[data-email]',
+                        '[role="button"]',
+                        'button',
+                        'a'
+                      ].join(',');
+                      const isVisible = (el) => {
+                        if (!el) return false;
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style.visibility !== 'hidden'
+                          && style.display !== 'none'
+                          && rect.width > 0
+                          && rect.height > 0;
+                      };
+                      const labelFor = (el) => [
+                        el.getAttribute('data-identifier'),
+                        el.getAttribute('data-email'),
+                        el.getAttribute('aria-label'),
+                        el.getAttribute('title'),
+                        el.innerText,
+                        el.textContent
+                      ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim().toLowerCase();
+                      const candidates = Array.from(document.querySelectorAll(clickableSelector));
+                      for (const el of candidates) {
+                        if (!isVisible(el)) continue;
+                        if (!labelFor(el).includes(target)) continue;
+                        el.scrollIntoView({block: 'center', inline: 'center'});
+                        el.click();
+                        return true;
+                      }
+                      return false;
+                    }
+                    """,
+                    clean_email,
+                )
+                if bool(clicked):
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.2)
+        return False
+
+    def _click_semantic_text(
+        self,
+        text_variants: Iterable[str],
+        *,
+        timeout_ms: int = 20_000,
+        optional: bool = False,
+    ):
+        variants = [str(text or "").strip().lower() for text in text_variants if str(text or "").strip()]
+        if not variants:
+            if optional:
+                return None
+            raise RuntimeError("No semantic text variants provided")
+
+        deadline = time.time() + max(0.5, float(timeout_ms) / 1000.0)
+        while time.time() < deadline:
+            try:
+                clicked = self._require_page().evaluate(
+                    """
+                    (variants) => {
+                      const needles = (variants || [])
+                        .map((value) => String(value || '').trim().toLowerCase())
+                        .filter(Boolean);
+                      if (!needles.length) return null;
+
+                      const clickableSelector = [
+                        'button',
+                        '[role="button"]',
+                        'a',
+                        'input[type="button"]',
+                        'input[type="submit"]',
+                        '[data-identifier]',
+                        '[aria-label]'
+                      ].join(',');
+                      const broadSelector = clickableSelector + ',span,div';
+                      const isVisible = (el) => {
+                        if (!el || el === document.body || el === document.documentElement) return false;
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style.visibility !== 'hidden'
+                          && style.display !== 'none'
+                          && style.pointerEvents !== 'none'
+                          && rect.width > 0
+                          && rect.height > 0;
+                      };
+                      const textFor = (el) => [
+                        el.getAttribute('aria-label'),
+                        el.getAttribute('title'),
+                        el.getAttribute('value'),
+                        el.innerText,
+                        el.textContent
+                      ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                      const clickableFor = (el) => el.closest(clickableSelector) || el;
+                      const candidates = Array.from(document.querySelectorAll(broadSelector));
+                      for (const el of candidates) {
+                        if (!isVisible(el)) continue;
+                        const label = textFor(el);
+                        if (!label || label.length > 180) continue;
+                        const normalized = label.toLowerCase();
+                        const matched = needles.some((needle) => normalized === needle || normalized.includes(needle));
+                        if (!matched) continue;
+                        const clickable = clickableFor(el);
+                        if (!isVisible(clickable)) continue;
+                        clickable.scrollIntoView({block: 'center', inline: 'center'});
+                        clickable.click();
+                        return label;
+                      }
+                      return null;
+                    }
+                    """,
+                    variants,
+                )
+                if clicked:
+                    return f"semantic_text={clicked}"
+            except Exception:
+                pass
+            time.sleep(0.2)
+
+        if optional:
+            return None
+        raise RuntimeError(f"Unable to click semantic action with text variants: {variants}")
+
     @staticmethod
     def _slug(value: str) -> str:
         text = str(value or "").strip().lower()
@@ -2032,21 +2837,51 @@ class GoogleAdminPlaywrightClient:
         email: str,
         onepassword: Optional[OnePasswordCliClient],
     ) -> None:
-        if onepassword is None:
-            return
-        if not self._exists(["input[name='totpPin']", "input[type='tel']"], timeout_ms=4_000):
+        if not self._exists(
+            [
+                "input[name='totpPin']",
+                "input#totpPin",
+                "input[aria-label*='code']",
+                "//input[contains(translate(@aria-label, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'code')]",
+                "input[inputmode='numeric']",
+                "input[type='tel'][autocomplete='one-time-code']",
+                "input[type='tel']",
+            ],
+            timeout_ms=4_000,
+        ):
             return
         try:
-            item = onepassword.find_google_login_item(email)
-            if not item:
+            clean_email = str(email or "").strip().lower()
+            raw_secret = str(self._totp_secrets_by_email.get(clean_email) or "").strip()
+            if raw_secret:
+                code = self._generate_totp_from_secret(raw_secret)
+                self._submit_totp_code(code)
                 return
-            item_id = str(item.get("id") or "").strip()
+            if onepassword is None:
+                return
+            item_id = str(self._totp_item_ids_by_email.get(clean_email) or "").strip()
+            if not item_id:
+                item = onepassword.find_google_login_item(email)
+                if not item:
+                    return
+                item_id = str(item.get("id") or "").strip()
             if not item_id:
                 return
             code = onepassword.get_totp(item_id)
             self._submit_totp_code(code)
         except Exception as exc:
             logger.warning("Failed to complete existing TOTP challenge for %s: %s", email, exc)
+
+    @staticmethod
+    def _generate_totp_from_secret(raw_secret: str) -> str:
+        try:
+            import pyotp  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError("pyotp is required to generate Google TOTP codes") from exc
+        normalized = str(raw_secret or "").replace(" ", "").strip()
+        if not normalized:
+            raise RuntimeError("TOTP secret is empty")
+        return pyotp.TOTP(normalized).now()
 
     def _goto(self, url: str) -> None:
         page = self._require_page()

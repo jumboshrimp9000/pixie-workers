@@ -621,6 +621,28 @@ class SendingToolUploader:
                 .replace("\\r", "\n")
             )
 
+        def as_tags(raw_tags: Any, raw_tag: Any) -> List[str]:
+            values: List[Any] = []
+            if isinstance(raw_tags, list):
+                values = raw_tags
+            elif isinstance(raw_tags, str):
+                values = raw_tags.replace("\n", ",").split(",")
+            elif isinstance(raw_tag, str):
+                values = raw_tag.replace("\n", ",").split(",")
+
+            seen: Set[str] = set()
+            parsed: List[str] = []
+            for value in values:
+                tag = str(value or "").strip()
+                normalized = tag.lower()
+                if not tag or normalized in seen:
+                    continue
+                seen.add(normalized)
+                parsed.append(tag)
+            return parsed
+
+        tags = as_tags(source.get("tags"), source.get("tag"))
+
         return {
             "applyRequested": apply_requested,
             "enableWarmup": (source.get("enableWarmup", True) is not False) if apply_requested else None,
@@ -630,11 +652,58 @@ class SendingToolUploader:
             "enableSlowRamp": source.get("enableSlowRamp", True) is not False,
             "sendingGap": as_number(source.get("sendingGap")),
             "signature": as_signature(source.get("signature")),
-            "tag": str(source.get("tag") or "").strip(),
+            "tag": tags[0] if tags else str(source.get("tag") or "").strip(),
+            "tags": tags,
             "instantlyWarmup": as_dict(source.get("instantlyWarmup")),
             "smartleadWarmup": as_dict(source.get("smartleadWarmup")),
             "smartleadAccount": as_dict(source.get("smartleadAccount")),
         }
+
+    @staticmethod
+    def _unique_tags(settings: Dict[str, Any]) -> List[str]:
+        values: List[Any] = []
+        raw_tags = settings.get("tags")
+        raw_tag = settings.get("tag")
+        if isinstance(raw_tags, list):
+            values.extend(raw_tags)
+        elif isinstance(raw_tags, str):
+            values.extend(raw_tags.replace("\n", ",").split(","))
+        if isinstance(raw_tag, str):
+            values.extend(raw_tag.replace("\n", ",").split(","))
+
+        seen: Set[str] = set()
+        tags: List[str] = []
+        for value in values:
+            tag = str(value or "").strip()
+            normalized = tag.lower()
+            if not tag or normalized in seen:
+                continue
+            seen.add(normalized)
+            tags.append(tag)
+        return tags
+
+    @staticmethod
+    def _normalize_smartlead_warmup_payload(settings: Dict[str, Any]) -> Dict[str, Any]:
+        payload = dict(settings.get("smartleadWarmup") or {})
+        if "enabled" in payload and "warmup_enabled" not in payload:
+            payload["warmup_enabled"] = bool(payload.get("enabled"))
+        payload.pop("enabled", None)
+        if settings.get("enableWarmup") is not None:
+            payload["warmup_enabled"] = bool(settings.get("enableWarmup"))
+
+        if "total_warmup_per_day" not in payload:
+            if "warmup_daily_limit" in payload:
+                payload["total_warmup_per_day"] = payload.pop("warmup_daily_limit")
+            elif "limit" in payload:
+                payload["total_warmup_per_day"] = payload.pop("limit")
+
+        if "daily_rampup" not in payload:
+            if "warmup_rampup_increment" in payload:
+                payload["daily_rampup"] = payload.pop("warmup_rampup_increment")
+            elif "rampup_increment" in payload:
+                payload["daily_rampup"] = payload.pop("rampup_increment")
+
+        return payload
 
     def _apply_instantly_settings(
         self,
@@ -662,6 +731,7 @@ class SendingToolUploader:
                 settings.get("sendingGap") is not None,
                 bool(settings.get("signature")),
                 bool(settings.get("tag")),
+                bool(settings.get("tags")),
                 isinstance(settings.get("instantlyWarmup"), dict) and bool(settings.get("instantlyWarmup")),
                 settings.get("enableWarmup") is not None,
             ]
@@ -675,8 +745,8 @@ class SendingToolUploader:
                 self._instantly_patch_account(api_key=api_key, email=email, settings=settings)
                 if settings.get("enableWarmup", True):
                     self._instantly_enable_warmup(api_key=api_key, email=email)
-                tag = str(settings.get("tag") or "").strip()
-                if tag:
+                tags = self._unique_tags(settings)
+                for tag in tags:
                     tag_id = self._instantly_find_or_create_tag_id(api_key=api_key, tag_name=tag)
                     self._instantly_assign_tag(api_key=api_key, email=email, tag_id=tag_id)
             except Exception as exc:
@@ -705,6 +775,10 @@ class SendingToolUploader:
             payload["signature"] = settings.get("signature")
 
         warmup_payload = dict(settings.get("instantlyWarmup") or {})
+        if "limit" not in warmup_payload and "warmup_daily_limit" in warmup_payload:
+            warmup_payload["limit"] = warmup_payload.pop("warmup_daily_limit")
+        if "increment" not in warmup_payload and "warmup_rampup_increment" in warmup_payload:
+            warmup_payload["increment"] = warmup_payload.pop("warmup_rampup_increment")
         if settings.get("enableWarmup") is not None:
             warmup_payload["enabled"] = bool(settings.get("enableWarmup"))
         if warmup_payload:
@@ -891,6 +965,7 @@ class SendingToolUploader:
                 settings.get("dailyLimit") is not None,
                 bool(settings.get("signature")),
                 bool(settings.get("tag")),
+                bool(settings.get("tags")),
                 isinstance(settings.get("smartleadWarmup"), dict) and bool(settings.get("smartleadWarmup")),
                 isinstance(settings.get("smartleadAccount"), dict) and bool(settings.get("smartleadAccount")),
                 settings.get("enableWarmup") is not None,
@@ -899,15 +974,18 @@ class SendingToolUploader:
         if not should_apply:
             return result
 
-        tag_name = str(settings.get("tag") or "").strip()
-        tag_context = None
-        if tag_name:
+        tag_contexts: List[Dict[str, Any]] = []
+        tags = self._unique_tags(settings)
+        if tags:
             try:
-                tag_context = self._resolve_smartlead_tag_context(
-                    fallback_api_key=api_key,
-                    credential=credential or {},
-                    tag_name=tag_name,
-                )
+                for tag_name in tags:
+                    tag_contexts.append(
+                        self._resolve_smartlead_tag_context(
+                            fallback_api_key=api_key,
+                            credential=credential or {},
+                            tag_name=tag_name,
+                        )
+                    )
             except Exception as exc:
                 failed = list(result.get("failed_uploads") or [])
                 for email in uploaded:
@@ -945,7 +1023,7 @@ class SendingToolUploader:
                     if not response.ok:
                         raise RuntimeError(self._response_error(response))
 
-                if tag_context:
+                for tag_context in tag_contexts:
                     self._smartlead_assign_tag_mapping(
                         api_key=tag_context["api_key"],
                         account_id=int(account_id),
@@ -959,12 +1037,7 @@ class SendingToolUploader:
                     if not mapped:
                         raise RuntimeError(f"Smartlead tag mapping not visible after assignment ({tag_context['tag_name']})")
 
-                warmup_payload = dict(settings.get("smartleadWarmup") or {})
-                if "enabled" in warmup_payload and "warmup_enabled" not in warmup_payload:
-                    warmup_payload["warmup_enabled"] = bool(warmup_payload.get("enabled"))
-                warmup_payload.pop("enabled", None)
-                if settings.get("enableWarmup") is not None:
-                    warmup_payload["warmup_enabled"] = bool(settings.get("enableWarmup"))
+                warmup_payload = self._normalize_smartlead_warmup_payload(settings)
                 if warmup_payload:
                     response = requests.post(
                         f"https://server.smartlead.ai/api/v1/email-accounts/{requests.utils.quote(account_id)}/warmup",
@@ -1194,6 +1267,7 @@ class SendingToolUploader:
         response = requests.post(
             "https://api.instantly.ai/api/v2/oauth/google/init",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={},
             timeout=self.timeout_seconds,
         )
         if not response.ok:

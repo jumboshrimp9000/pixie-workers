@@ -175,7 +175,14 @@ For Google lifecycle actions:
    - Resolve existing PartnerHub order ID for domain.
    - Increase licenses + add license users using PartnerHub endpoints:
      - `POST /integration/orders/increase-license`
-     - `POST /integration/orders/amendment-order-licence-users`
+     - `POST /integration/order/amendment-order-licence-users`, falling back to
+       `POST /integration/orders/amendment-order-licence-users` for PartnerHub tenants where only
+       the plural route is live.
+   - PartnerHub order IDs are stored on `domains.partnerhub_order_id` and validated against the
+     exact domain before reuse. The license-increase step is checkpointed separately from the user
+     amendment step so retries do not intentionally buy seats twice after a successful increase.
+   - If PartnerHub reports a business-state blocker such as no seats, bad plan/order, or insufficient
+     balance, the action hard-stops with an ops-readable error instead of burning retries.
    - Enroll newly added users into 1Password + Google 2FA using Playwright.
    - Mark target inboxes `active`.
 2. `google_remove_inboxes`

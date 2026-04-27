@@ -7,13 +7,19 @@ import json
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+import dns.resolver
+
 from app import get_order_logger
 from app.workers.google_fulfillment_clients import (
     CloudflareClient,
     DynadotClient,
     PartnerHubClient,
 )
-from app.workers.google_admin_playwright import GoogleAdminPlaywrightClient, GoogleMfaUser
+from app.workers.google_admin_playwright import (
+    GoogleAdminPlaywrightClient,
+    GoogleMfaUser,
+    GoogleSignInChallengeBlocked,
+)
 from app.workers.onepassword_client import OnePasswordCliClient
 from app.workers.sending_tool_uploader import SendingToolUploader
 from app.workers.supabase_client import SupabaseRestClient
@@ -342,10 +348,22 @@ class GoogleSupabaseWorker:
 
             inboxes = self.client.get_domain_inboxes(domain_id)
             if not inboxes:
-                result = {"skipped": True, "reason": "No inboxes found"}
-                self.client.complete_action(action, result)
-                self.client.insert_action_log(action, "action_completed", "info", "No inboxes to process", result)
-                return
+                details = {
+                    "failing_step": "load_inboxes",
+                    "why": "No inbox rows exist for this domain, so delivery cannot be verified.",
+                    "current_state": "domain_loaded_no_inbox_rows",
+                    "next_action": "Create or repair inbox rows for this domain, then retry provisioning.",
+                }
+                self.client.insert_action_log(
+                    action,
+                    "final_delivery_check_failed",
+                    "error",
+                    "Final delivery check failed: no inboxes found",
+                    details,
+                )
+                raise RuntimeError(
+                    "Final delivery check failed: no inbox rows exist for this domain, so delivery cannot be verified."
+                )
 
             # Domain enters in-progress while fulfillment runs.
             # Conditional update: only set in_progress if status is still in an
@@ -515,8 +533,7 @@ class GoogleSupabaseWorker:
             if order_checkpoint:
                 order_id = str(order_checkpoint.get("order_id") or "").strip()
                 if not order_id and not self.dry_run:
-                    order_payload = self._get_partnerhub().get_order_details(domain_name)
-                    order_id = str(self._get_partnerhub().extract_order_id(order_payload) or "").strip()
+                    order_id = str(self._get_partnerhub().resolve_order_id_by_domain(domain_name) or "").strip()
                     if not order_id:
                         raise RuntimeError(
                             f"[create_google_order] Checkpoint found but order_id missing for {domain_name}"
@@ -566,7 +583,9 @@ class GoogleSupabaseWorker:
                                 users=partnerhub_users,
                                 plan_id=str(payload.get("plan_id") or self.partnerhub_plan_id),
                             )
-                            order_id = self._get_partnerhub().extract_order_id(order_payload)
+                            order_id = self._get_partnerhub().extract_order_id(order_payload, domain_name)
+                            if not order_id:
+                                order_id = self._get_partnerhub().resolve_order_id_by_domain(domain_name)
                         except Exception as create_exc:
                             if "domain already exists" in str(create_exc).lower():
                                 existing_order = True
@@ -575,8 +594,7 @@ class GoogleSupabaseWorker:
                                     "warn",
                                     f"[create_google_order] Domain already exists in PartnerHub for {domain_name}; reusing existing order.",
                                 )
-                                order_payload = self._get_partnerhub().get_order_details(domain_name)
-                                order_id = self._get_partnerhub().extract_order_id(order_payload)
+                                order_id = self._get_partnerhub().resolve_order_id_by_domain(domain_name)
                                 if not order_id:
                                     raise RuntimeError(
                                         f"PartnerHub returned 'domain already exists' but no order id was found for {domain_name}"
@@ -847,6 +865,23 @@ class GoogleSupabaseWorker:
 
                                 if self.domain_verify_dns_wait_seconds > 0:
                                     time.sleep(self.domain_verify_dns_wait_seconds)
+
+                                txt_visible, txt_status = self._public_txt_contains(
+                                    domain_name,
+                                    verification_value,
+                                )
+                                step_details["dns_visibility"] = {
+                                    "public_txt_visible": txt_visible,
+                                    "status": txt_status,
+                                }
+                                if not txt_visible:
+                                    fail_message = (
+                                        f"Google domain verification TXT is not publicly resolvable yet for {domain_name}: "
+                                        f"{txt_status}"
+                                    )
+                                    fail_step(step, fail_message)
+                                    persist_progress(INTERIM_STATUSES["FAILED"], "in_progress")
+                                    raise RuntimeError(fail_message)
 
                                 confirmation = browser.confirm_domain_verification(
                                     domain_name,
@@ -1331,6 +1366,7 @@ class GoogleSupabaseWorker:
                 )
                 raise RuntimeError(fail_message)
 
+            delivery_upload_details: Optional[Dict[str, Any]] = None
             sending_tool_checkpoint = checkpoint("upload_sending_tool")
             if sending_tool_checkpoint:
                 upload_checkpoint_ok, upload_checkpoint_reason = upload_checkpoint_strictly_valid(sending_tool_checkpoint)
@@ -1359,6 +1395,7 @@ class GoogleSupabaseWorker:
                         step["details"],
                     )
                     raise RuntimeError(fail_message)
+                delivery_upload_details = sending_tool_checkpoint
                 persist_progress(INTERIM_STATUSES["SENDING_TOOL_UPLOAD"], "in_progress")
             else:
                 step = start_step("upload_sending_tool")
@@ -1369,7 +1406,7 @@ class GoogleSupabaseWorker:
                         provider=provider,
                         inboxes=inboxes,
                         user_updates=user_updates,
-                        tool_settings=domain.get("fulfillment_settings"),
+                        tool_settings=self._resolve_sending_tool_settings(domain, payload),
                     )
                 except Exception as upload_exc:
                     fail_message = str(upload_exc)
@@ -1377,17 +1414,27 @@ class GoogleSupabaseWorker:
                     persist_progress(INTERIM_STATUSES["FAILED"], "in_progress")
                     raise RuntimeError(fail_message) from upload_exc
 
-                strict_validation = bool(upload_result.get("strict_validation"))
-                failed_uploads = upload_result.get("failed_uploads") or []
-                if strict_validation and failed_uploads:
-                    fail_message = (
-                        f"{upload_result.get('tool') or 'sending tool'} upload validation failed for "
-                        f"{len(failed_uploads)}/{upload_result.get('total_candidates') or 0} inbox(es): {failed_uploads}"
-                    )
+                upload_ok, upload_reason = upload_checkpoint_strictly_valid(upload_result)
+                if not upload_ok:
+                    fail_message = f"Sending-tool final upload validation failed for {domain_name}: {upload_reason}"
+                    step["details"] = {
+                        **upload_result,
+                        "failing_step": "upload_sending_tool",
+                        "why": upload_reason,
+                        "current_state": "upload finished but did not produce strict validation evidence",
+                        "next_action": "Assign a supported validated sending-tool credential and retry fulfillment.",
+                        "ops_next_steps": [
+                            "Confirm a supported sending-tool credential is assigned to this domain.",
+                            "Confirm provider-side upload validation can find every expected inbox.",
+                            "Retry fulfillment only after upload validation passes.",
+                        ],
+                    }
                     fail_step(step, fail_message)
                     persist_progress(INTERIM_STATUSES["FAILED"], "in_progress")
+                    log_event("step_failed", "error", f"[upload_sending_tool] {fail_message}", step["details"])
                     raise RuntimeError(fail_message)
 
+                delivery_upload_details = upload_result
                 complete_step(step, upload_result)
                 persist_progress(INTERIM_STATUSES["SENDING_TOOL_UPLOAD"], "in_progress")
                 log_event(
@@ -1422,6 +1469,35 @@ class GoogleSupabaseWorker:
                 )
                 return
 
+            final_upload_ok, final_upload_reason = upload_checkpoint_strictly_valid(delivery_upload_details)
+            if not final_upload_ok:
+                fail_message = f"Final delivery check failed for {domain_name}: {final_upload_reason}"
+                step["details"] = {
+                    "failing_step": "final_delivery_check",
+                    "why": final_upload_reason,
+                    "current_state": "ready_to_finalize_without_validated_upload",
+                    "next_action": "Retry sending-tool upload and only finalize after every expected inbox is provider-validated.",
+                    "upload_details": delivery_upload_details,
+                }
+                fail_step(step, fail_message)
+                persist_progress(INTERIM_STATUSES["FAILED"], "in_progress")
+                log_event("step_failed", "error", f"[finalize] {fail_message}", step["details"])
+                raise RuntimeError(fail_message)
+
+            safe_upload_details = delivery_upload_details if isinstance(delivery_upload_details, dict) else {}
+            uploaded_emails = safe_upload_details.get("uploaded_emails") or []
+            uploaded_count = len(uploaded_emails) if isinstance(uploaded_emails, list) else 0
+            delivery_validation = {
+                "passed": True,
+                "domain": domain_name,
+                "expected_inboxes": len(inboxes),
+                "uploaded_count": uploaded_count,
+                "total_candidates": int(safe_upload_details.get("total_candidates") or 0),
+                "settings_validated": True,
+                "provider_check": "domain_verified_before_upload",
+                "validated_at": self._iso_now(),
+            }
+
             # Conditional update: never flip to active if status changed under us.
             self.client.update_domain_if_active(
                 domain_id,
@@ -1430,7 +1506,7 @@ class GoogleSupabaseWorker:
                     "interim_status": INTERIM_STATUSES["COMPLETE"],
                 },
             )
-            complete_step(step, {"status": "active"})
+            complete_step(step, {"status": "active", "delivery_validation": delivery_validation})
             persist_progress(INTERIM_STATUSES["COMPLETE"], "active")
 
             result = {
@@ -1440,6 +1516,7 @@ class GoogleSupabaseWorker:
                 "dns": dns_summary,
                 "dry_run": self.dry_run,
                 "steps": steps,
+                "delivery_validation": delivery_validation,
             }
             self.client.complete_action(action, result)
             log_event("action_completed", "info", "Google provisioning completed", result)
@@ -1448,7 +1525,10 @@ class GoogleSupabaseWorker:
             error_message = str(exc)
             action_logger.exception("Google worker action failed")
             hint = self._failure_hint(error_message)
-            deferred_retry_seconds = self._deferred_retry_seconds(error_message)
+            hard_stop_google_signin = isinstance(exc, GoogleSignInChallengeBlocked) or self._is_google_signin_challenge_blocked(
+                error_message
+            )
+            deferred_retry_seconds = None if hard_stop_google_signin else self._deferred_retry_seconds(error_message)
 
             # Reset non-active inboxes so retry has clean ownership.
             try:
@@ -1457,6 +1537,43 @@ class GoogleSupabaseWorker:
                         self.client.update_inbox(inbox["id"], {"status": "pending"})
             except Exception:
                 pass
+
+            if hard_stop_google_signin:
+                hard_stop_details = {
+                    "failing_step": "login_admin_console",
+                    "why": (
+                        "Google redirected the admin account to accounts.google.com/speedbump/gaplustos, "
+                        "which requires manual browser/account verification and cannot be completed safely by automation."
+                    ),
+                    "current_state": "google_admin_login_challenge_blocked",
+                    "next_action": (
+                        "Open the Google Admin account in a trusted manual browser session, clear the Google sign-in "
+                        "challenge or replace the admin credentials/account, then retry Google provisioning."
+                    ),
+                    "error": error_message,
+                    "hint": hint,
+                    "steps": steps,
+                }
+                try:
+                    if domain_id:
+                        self.client.update_domain(
+                            domain_id,
+                            {
+                                "interim_status": INTERIM_STATUSES["FAILED"],
+                                "status": "in_progress",
+                            },
+                        )
+                except Exception:
+                    pass
+
+                self.client.fail_action(action, error_message, max_retries=1)
+                log_event(
+                    "google_admin_login_blocked",
+                    "error",
+                    "Google sign-in challenge blocked automation; provisioning stopped for manual ops intervention.",
+                    hard_stop_details,
+                )
+                return
 
             if deferred_retry_seconds is not None:
                 try:
@@ -1516,6 +1633,8 @@ class GoogleSupabaseWorker:
 
     def _deferred_retry_seconds(self, error_message: str) -> Optional[float]:
         message = str(error_message or "").strip().lower()
+        if self._is_google_signin_challenge_blocked(message):
+            return None
         if "google admin login was not completed" in message:
             return self.admin_console_defer_seconds
         if "google admin page did not load" in message:
@@ -1526,7 +1645,22 @@ class GoogleSupabaseWorker:
             "accounts.google.com" in message or "use your google account" in message
         ):
             return self.admin_console_defer_seconds
+        if "cloudflare zone" in message and "not active yet" in message:
+            return max(60.0, float(os.getenv("GOOGLE_CF_ACTIVE_DEFER_SECONDS", "300")))
+        if "google domain verification txt is not publicly resolvable yet" in message:
+            return max(60.0, float(os.getenv("GOOGLE_DOMAIN_TXT_DEFER_SECONDS", "300")))
+        if "google admin domain verification did not complete" in message:
+            return max(60.0, float(os.getenv("GOOGLE_DOMAIN_VERIFY_DEFER_SECONDS", "300")))
         return None
+
+    @staticmethod
+    def _is_google_signin_challenge_blocked(error_message: str) -> bool:
+        text = str(error_message or "").strip().lower()
+        return (
+            "google sign-in challenge blocked automation" in text
+            or "accounts.google.com/speedbump/gaplustos" in text
+            or "/speedbump/gaplustos" in text
+        )
 
     def _build_partnerhub_users(
         self,
@@ -1822,6 +1956,46 @@ class GoogleSupabaseWorker:
             valid.append(normalized)
         return valid
 
+    def _public_txt_contains(self, domain_name: str, expected_value: str) -> Tuple[bool, str]:
+        expected = str(expected_value or "").strip()
+        if not expected:
+            return False, "expected TXT value is empty"
+
+        resolver_sets = [
+            ("cloudflare", ["1.1.1.1", "1.0.0.1"]),
+            ("google", ["8.8.8.8", "8.8.4.4"]),
+        ]
+        statuses: List[str] = []
+        for label, nameservers in resolver_sets:
+            resolver = dns.resolver.Resolver(configure=False)
+            resolver.nameservers = nameservers
+            resolver.timeout = 3.0
+            resolver.lifetime = 8.0
+            try:
+                answers = resolver.resolve(domain_name, "TXT")
+            except Exception as exc:
+                statuses.append(f"{label}: {exc}")
+                continue
+
+            values: List[str] = []
+            for answer in answers:
+                chunks = getattr(answer, "strings", [])
+                if chunks:
+                    values.append(
+                        "".join(
+                            part.decode("utf-8", errors="ignore") if isinstance(part, bytes) else str(part)
+                            for part in chunks
+                        )
+                    )
+                else:
+                    values.append(str(answer).strip('"'))
+
+            if expected in values:
+                return True, f"{label}: TXT visible"
+            statuses.append(f"{label}: TXT answers did not include expected value")
+
+        return False, "; ".join(statuses[-2:]) or "TXT not visible"
+
     def _default_google_dns_records(self, _domain_name: str) -> List[Dict[str, Any]]:
         return [
             {"type": "MX", "name": "@", "content": "ASPMX.L.GOOGLE.COM", "priority": 1, "ttl": 3600},
@@ -1905,6 +2079,11 @@ class GoogleSupabaseWorker:
             return "Cloudflare zone is not active yet. Wait for nameserver propagation and retry."
         if "domain already exists" in text:
             return "Domain already exists in PartnerHub; worker can reuse existing order details."
+        if GoogleSupabaseWorker._is_google_signin_challenge_blocked(text):
+            return (
+                "Google sign-in challenge blocked automation. Manually clear the Google Admin sign-in "
+                "challenge in a trusted browser or replace the admin account, then retry provisioning."
+            )
         return "Check action_logs metadata for the exact failing step and API response."
 
     def _upload_domain_inboxes_to_sending_tool(
@@ -2067,17 +2246,47 @@ class GoogleSupabaseWorker:
                 }
             )
 
+        total_upload_attempts = len(payloads) * len(processed_tools)
+        total_candidates = total_upload_attempts + len(failed_uploads)
+
         return {
             "tool": processed_tools[-1] if processed_tools else None,
             "tools": processed_tools,
             "tool_results": tool_results,
             "strict_validation": True,
-            "total_candidates": len(payloads) + len(failed_uploads),
-            "total_upload_attempts": len(payloads) * len(processed_tools),
+            "total_candidates": total_candidates,
+            "total_upload_attempts": total_upload_attempts,
             "uploaded_emails": uploaded_emails,
             "failed_uploads": merged_failures,
             "skipped_already_uploaded": skipped_already_uploaded,
         }
+
+    @staticmethod
+    def _resolve_sending_tool_settings(domain: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+        settings: Dict[str, Any] = {}
+
+        candidates: List[Any] = [
+            payload.get("fulfillment_settings"),
+            payload.get("sending_tool_settings"),
+            payload.get("sendingToolSettings"),
+            payload.get("tool_settings"),
+        ]
+        sending_tool = payload.get("sending_tool")
+        if isinstance(sending_tool, dict):
+            candidates.extend(
+                [
+                    sending_tool.get("settings"),
+                    sending_tool.get("fulfillment_settings"),
+                    sending_tool.get("sending_tool_settings"),
+                ]
+            )
+        candidates.append(domain.get("fulfillment_settings"))
+
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                settings.update(candidate)
+
+        return settings
 
     @staticmethod
     def _normalize_sending_tool_slug(raw: str) -> str:
