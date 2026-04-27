@@ -15,7 +15,11 @@ jobs:
           username: root
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           script: |
-            cd /opt/pixie/microsoft-worker && git pull && cd pixie-microsoft-rm-creation-process && docker compose up -d --build --remove-orphans pixie-microsoft
+            cd /opt/pixie/microsoft-worker
+            git fetch origin main
+            git reset --hard origin/main
+            cd pixie-microsoft-rm-creation-process
+            docker compose up -d --build --remove-orphans pixie-microsoft
 
   deploy-google:
     runs-on: ubuntu-latest
@@ -27,4 +31,8 @@ jobs:
           username: root
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           script: |
-            cd /opt/pixie-google && git pull && cd pixie_google_smartlead && docker compose up -d --build --remove-orphans pixie-google-paid-worker pixie-google-free-nonprofit-worker
+            cd /opt/pixie-google
+            git fetch origin main
+            git reset --hard origin/main
+            cd pixie_google_smartlead
+            docker compose up -d --build --remove-orphans pixie-google-paid-worker pixie-google-free-nonprofit-worker
