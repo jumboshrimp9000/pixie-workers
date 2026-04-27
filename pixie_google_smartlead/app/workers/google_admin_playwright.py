@@ -1800,6 +1800,9 @@ class GoogleAdminPlaywrightClient:
         page = self._require_page()
 
         def selected_text() -> str:
+            visible_selected = self._read_visible_selected_dkim_domain()
+            if visible_selected:
+                return visible_selected
             return self._inner_text_any(
                 [
                     "//div[@role='listbox' and contains(@aria-label,'Selected domain')]",
@@ -1882,6 +1885,75 @@ class GoogleAdminPlaywrightClient:
 
         debug = self._capture_debug_state(f"dkim_domain_not_selectable_{self._slug(domain_name)}")
         raise RuntimeError(f"Could not select DKIM domain {domain_name}. {debug}")
+
+    def _read_visible_selected_dkim_domain(self) -> str:
+        page = self._require_page()
+        try:
+            value = page.evaluate(
+                """() => {
+                  const visible = (el) => {
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.visibility !== 'hidden'
+                      && style.display !== 'none'
+                      && rect.width > 0
+                      && rect.height > 0;
+                  };
+                  const normalize = (text) => (text || '').replace(/\\s+/g, ' ').trim();
+                  const domainRe = /[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+/ig;
+                  const elements = Array.from(document.querySelectorAll('body *')).filter(visible);
+                  const labels = elements
+                    .map((el) => ({ el, text: normalize(el.textContent).toLowerCase(), rect: el.getBoundingClientRect() }))
+                    .filter((item) => item.text === 'selected domain');
+
+                  for (const label of labels) {
+                    const statusTop = elements
+                      .map((el) => ({ text: normalize(el.textContent).toLowerCase(), rect: el.getBoundingClientRect() }))
+                      .filter((item) => item.text.startsWith('status:') && item.rect.top > label.rect.bottom)
+                      .map((item) => item.rect.top)
+                      .sort((a, b) => a - b)[0] || label.rect.bottom + 140;
+
+                    const candidates = [];
+                    for (const el of elements) {
+                      if (el === label.el) continue;
+                      const rect = el.getBoundingClientRect();
+                      if (rect.top < label.rect.bottom - 4 || rect.top > statusTop) continue;
+                      if (rect.left < label.rect.left - 40 || rect.left > label.rect.left + 520) continue;
+
+                      const text = normalize(el.textContent).toLowerCase();
+                      const matches = [...text.matchAll(domainRe)].map((m) => m[0].toLowerCase());
+                      const unique = [...new Set(matches)];
+                      if (unique.length !== 1) continue;
+
+                      const childHasSameDomain = Array.from(el.children || []).some((child) => {
+                        if (!visible(child)) return false;
+                        const childText = normalize(child.textContent).toLowerCase();
+                        const childMatches = [...childText.matchAll(domainRe)].map((m) => m[0].toLowerCase());
+                        return childMatches.includes(unique[0]);
+                      });
+                      candidates.push({
+                        domain: unique[0],
+                        top: rect.top,
+                        left: rect.left,
+                        exact: text === unique[0],
+                        leaf: !childHasSameDomain,
+                      });
+                    }
+
+                    candidates.sort((a, b) => {
+                      if (a.exact !== b.exact) return a.exact ? -1 : 1;
+                      if (a.leaf !== b.leaf) return a.leaf ? -1 : 1;
+                      if (Math.abs(a.top - b.top) > 2) return a.top - b.top;
+                      return a.left - b.left;
+                    });
+                    if (candidates.length) return candidates[0].domain;
+                  }
+                  return '';
+                }"""
+            )
+            return str(value or "").strip().lower()
+        except Exception:
+            return ""
 
     @staticmethod
     def _dkim_selected_domain_matches(text: str, domain: str) -> bool:
