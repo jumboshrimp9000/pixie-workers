@@ -1735,15 +1735,15 @@ class GoogleAdminPlaywrightClient:
                     "status_text": self._read_dkim_status_text(),
                 }
 
-            self._click_any(
+            self._dismiss_dkim_overlays()
+            self._click_start_dkim_authentication_dom() or self._click_any(
                 [
-                    "//div[@role='button']//span[translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='start authentication']",
+                    "//div[@role='button'][.//span[translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='start authentication']]",
                     "//button[.//span[translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='start authentication']]",
-                    "//span[translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='start authentication']",
                 ],
                 timeout_ms=12_000,
                 optional=True,
-            ) or self._click_start_dkim_authentication_dom()
+            )
             time.sleep(1.8)
 
             self._open_dkim_page()
@@ -1887,6 +1887,17 @@ class GoogleAdminPlaywrightClient:
         status_text = self._read_dkim_status_text().lower()
         return "authenticating email with dkim" in status_text
 
+    def _dismiss_dkim_overlays(self) -> None:
+        self._click_any(
+            [
+                "//span[translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='got it']",
+                "//button[.//span[translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='got it']]",
+            ],
+            timeout_ms=2_000,
+            optional=True,
+        )
+        time.sleep(0.4)
+
     def _click_start_dkim_authentication_dom(self) -> bool:
         page = self._require_page()
         try:
@@ -1901,15 +1912,25 @@ class GoogleAdminPlaywrightClient:
                           && rect.width > 0
                           && rect.height > 0;
                       };
-                      const controls = Array.from(document.querySelectorAll('button, [role="button"], span, div'));
+                      const clickTarget = (target) => {
+                        target.scrollIntoView({ block: 'center', inline: 'nearest' });
+                        target.click();
+                        return true;
+                      };
+                      const controls = Array.from(document.querySelectorAll('button, [role="button"]'));
                       for (const el of controls) {
+                        const text = (el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                        if (!text.includes('start authentication') || !visible(el)) continue;
+                        if (el.disabled || el.getAttribute('aria-disabled') === 'true') continue;
+                        return clickTarget(el);
+                      }
+                      const labels = Array.from(document.querySelectorAll('span, div'));
+                      for (const el of labels) {
                         const text = (el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
                         if (text !== 'start authentication' || !visible(el)) continue;
                         const target = el.closest('button, [role="button"]') || el;
                         if (target.disabled || target.getAttribute('aria-disabled') === 'true') continue;
-                        target.scrollIntoView({ block: 'center', inline: 'nearest' });
-                        target.click();
-                        return true;
+                        return clickTarget(target);
                       }
                       return false;
                     }"""
