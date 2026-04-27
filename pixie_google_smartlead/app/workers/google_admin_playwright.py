@@ -1737,13 +1737,13 @@ class GoogleAdminPlaywrightClient:
 
             self._click_any(
                 [
-                    "//div[@role='button']//span[normalize-space()='Start authentication']",
-                    "//button[.//span[normalize-space()='Start authentication']]",
-                    "//span[normalize-space()='Start authentication']",
+                    "//div[@role='button']//span[translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='start authentication']",
+                    "//button[.//span[translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='start authentication']]",
+                    "//span[translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='start authentication']",
                 ],
                 timeout_ms=12_000,
                 optional=True,
-            )
+            ) or self._click_start_dkim_authentication_dom()
             time.sleep(1.8)
 
             self._open_dkim_page()
@@ -1876,9 +1876,9 @@ class GoogleAdminPlaywrightClient:
     def _is_dkim_enabled(self) -> bool:
         if self._exists(
             [
-                "//div[@role='button']//span[normalize-space()='Stop authentication']",
-                "//button[.//span[normalize-space()='Stop authentication']]",
-                "//span[normalize-space()='Stop authentication']",
+                "//div[@role='button']//span[translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='stop authentication']",
+                "//button[.//span[translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='stop authentication']]",
+                "//span[translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='stop authentication']",
             ],
             timeout_ms=6_000,
         ):
@@ -1886,6 +1886,37 @@ class GoogleAdminPlaywrightClient:
 
         status_text = self._read_dkim_status_text().lower()
         return "authenticating email with dkim" in status_text
+
+    def _click_start_dkim_authentication_dom(self) -> bool:
+        page = self._require_page()
+        try:
+            return bool(
+                page.evaluate(
+                    """() => {
+                      const visible = (el) => {
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style.visibility !== 'hidden'
+                          && style.display !== 'none'
+                          && rect.width > 0
+                          && rect.height > 0;
+                      };
+                      const controls = Array.from(document.querySelectorAll('button, [role="button"], span, div'));
+                      for (const el of controls) {
+                        const text = (el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                        if (text !== 'start authentication' || !visible(el)) continue;
+                        const target = el.closest('button, [role="button"]') || el;
+                        if (target.disabled || target.getAttribute('aria-disabled') === 'true') continue;
+                        target.scrollIntoView({ block: 'center', inline: 'nearest' });
+                        target.click();
+                        return true;
+                      }
+                      return false;
+                    }"""
+                )
+            )
+        except Exception:
+            return False
 
     def _generate_dkim_record(self) -> None:
         self._click_any(
