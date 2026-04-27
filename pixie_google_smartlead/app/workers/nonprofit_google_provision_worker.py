@@ -663,6 +663,7 @@ class NonprofitGoogleProvisionWorker:
                 "name": dkim_name,
                 "content": dns_value,
                 "ttl": 3600,
+                "replace_existing": True,
             }
             dkim_dns_summary = self._get_cloudflare().upsert_dns_records(
                 cloudflare_zone_id,

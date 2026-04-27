@@ -294,6 +294,7 @@ class CloudflareClient:
         created = 0
         skipped = 0
         failed = 0
+        deleted = 0
         errors: List[Dict[str, str]] = []
 
         for record in records:
@@ -314,6 +315,8 @@ class CloudflareClient:
                 body["priority"] = int(record["priority"])
 
             try:
+                if bool(record.get("replace_existing")):
+                    deleted += self._delete_existing_dns_records(zone_id, rec_type, name)
                 self._request("POST", f"/zones/{zone_id}/dns_records", json_body=body)
                 created += 1
                 continue
@@ -334,7 +337,58 @@ class CloudflareClient:
                 )
                 logger.warning("Cloudflare DNS record failed for %s %s: %s", rec_type, name, msg)
 
-        return {"created": created, "skipped": skipped, "failed": failed, "errors": errors[:20]}
+        return {"created": created, "skipped": skipped, "failed": failed, "deleted": deleted, "errors": errors[:20]}
+
+    def _delete_existing_dns_records(self, zone_id: str, rec_type: str, name: str) -> int:
+        deleted = 0
+        for record_id in self._find_dns_record_ids(zone_id, rec_type, name):
+            self._request("DELETE", f"/zones/{zone_id}/dns_records/{record_id}")
+            deleted += 1
+        return deleted
+
+    def _find_dns_record_ids(self, zone_id: str, rec_type: str, name: str) -> List[str]:
+        ids: List[str] = []
+        seen: set[str] = set()
+        for query_name in self._dns_name_query_candidates(zone_id, name):
+            data = self._request(
+                "GET",
+                f"/zones/{zone_id}/dns_records",
+                params={"type": rec_type, "name": query_name},
+            )
+            for row in data.get("result") or []:
+                record_id = str(row.get("id") or "").strip()
+                if not record_id or record_id in seen:
+                    continue
+                seen.add(record_id)
+                ids.append(record_id)
+        return ids
+
+    def _dns_name_query_candidates(self, zone_id: str, name: str) -> List[str]:
+        clean_name = str(name or "").strip().rstrip(".").lower()
+        if not clean_name:
+            return []
+
+        zone_name = ""
+        try:
+            zone_name = str(self.get_zone(zone_id).get("name") or "").strip().rstrip(".").lower()
+        except Exception:
+            zone_name = ""
+
+        candidates: List[str] = []
+        if zone_name:
+            if clean_name == "@":
+                candidates.append(zone_name)
+            elif clean_name == zone_name or clean_name.endswith(f".{zone_name}"):
+                candidates.append(clean_name)
+            else:
+                candidates.append(f"{clean_name}.{zone_name}")
+        candidates.append(clean_name)
+
+        unique: List[str] = []
+        for candidate in candidates:
+            if candidate and candidate not in unique:
+                unique.append(candidate)
+        return unique
 
     @staticmethod
     def _extract_error_message(payload: Dict[str, Any]) -> str:
