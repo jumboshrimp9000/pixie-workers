@@ -1813,7 +1813,7 @@ class GoogleAdminPlaywrightClient:
                 optional=True,
             ).lower()
 
-        if domain_name in selected_text():
+        if self._dkim_selected_domain_matches(selected_text(), domain_name):
             return
 
         self._click_any(
@@ -1839,7 +1839,7 @@ class GoogleAdminPlaywrightClient:
         )
         if clicked:
             time.sleep(0.8)
-            if domain_name in selected_text():
+            if self._dkim_selected_domain_matches(selected_text(), domain_name):
                 return
 
         for _ in range(120):
@@ -1854,7 +1854,7 @@ class GoogleAdminPlaywrightClient:
                     option.scroll_into_view_if_needed(timeout=1_000)
                     option.click(timeout=1_500)
                     time.sleep(0.8)
-                    if domain_name in selected_text():
+                    if self._dkim_selected_domain_matches(selected_text(), domain_name):
                         return
                 except Exception:
                     pass
@@ -1882,6 +1882,25 @@ class GoogleAdminPlaywrightClient:
 
         debug = self._capture_debug_state(f"dkim_domain_not_selectable_{self._slug(domain_name)}")
         raise RuntimeError(f"Could not select DKIM domain {domain_name}. {debug}")
+
+    @staticmethod
+    def _dkim_selected_domain_matches(text: str, domain: str) -> bool:
+        clean_domain = str(domain or "").strip().lower()
+        clean_text = str(text or "").strip().lower()
+        if not clean_domain or not clean_text:
+            return False
+
+        domains = re.findall(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", clean_text)
+        unique_domains = []
+        for found in domains:
+            if found not in unique_domains:
+                unique_domains.append(found)
+
+        if len(unique_domains) == 1:
+            return unique_domains[0] == clean_domain
+
+        compact = re.sub(r"\s+", " ", clean_text)
+        return compact in {clean_domain, f"selected domain {clean_domain}"}
 
     def _is_dkim_enabled(self) -> bool:
         if self._exists(
