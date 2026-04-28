@@ -7,4 +7,5 @@ __pycache__/
 debug_screens/
 debug_screens_nonheadless/
 debug_screenshots/
+pixie_google_smartlead/debug_screens_nonprofit/
 *.pyc
