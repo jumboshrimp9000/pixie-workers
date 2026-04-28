@@ -1,14 +1,49 @@
 import os
+import re
 import time
 import logging
 import threading
 from datetime import datetime, timedelta, timezone
+from html import escape
 from typing import Any, Dict, List, Optional, Union
 
 import requests
 
 
 logger = logging.getLogger(__name__)
+
+APP_URL = os.getenv("APP_URL", "https://app.simpleinboxes.com").rstrip("/")
+
+INTERNAL_FAILURE_PATTERNS = [
+    re.compile(r"cannot find module", re.I),
+    re.compile(r"playwright dependency", re.I),
+    re.compile(r"missing dependency", re.I),
+    re.compile(r"module not found", re.I),
+    re.compile(r"syntaxerror|referenceerror|typeerror", re.I),
+    re.compile(r"supabase .* failed", re.I),
+]
+
+TEMPORARY_FAILURE_PATTERNS = [
+    re.compile(r"job in progress", re.I),
+    re.compile(r"temporar", re.I),
+    re.compile(r"rate limit|too many requests", re.I),
+    re.compile(r"timed out|timeout", re.I),
+    re.compile(r"pending|propagat|not ready yet|still processing", re.I),
+]
+
+CREDENTIAL_FAILURE_PATTERNS = [
+    re.compile(r"credential", re.I),
+    re.compile(r"api key|apikey", re.I),
+    re.compile(r"unauthori[sz]ed|forbidden|\b401\b|\b403\b", re.I),
+    re.compile(r"invalid token|invalid key|oauth", re.I),
+    re.compile(r"workspace.*not found", re.I),
+    re.compile(r"login failed|password|auth|permission|access denied", re.I),
+]
+
+UPLOAD_FAILURE_PATTERNS = [
+    re.compile(r"sending[- ]?tool|upload|re-?upload", re.I),
+    re.compile(r"instantly|smartlead|email[- ]?bison|plusvibe|pipl|masterinbox", re.I),
+]
 
 
 class SupabaseError(RuntimeError):
@@ -299,6 +334,8 @@ class SupabaseRestClient:
             )
         if not rows and isinstance(action_or_id, dict):
             logger.warning("Skipped completion for action %s because the lease fence no longer matched", action_or_id.get("id"))
+        if rows and isinstance(action_or_id, dict):
+            self._resolve_fulfillment_notifications_for_completed_action(action_or_id)
         return bool(rows)
 
     def update_action(self, action_or_id: Union[str, Dict[str, Any]], fields: Dict[str, Any]) -> bool:
@@ -356,7 +393,219 @@ class SupabaseRestClient:
                 )
         if not rows:
             logger.warning("Skipped failure update for action %s because the lease fence no longer matched", action.get("id"))
+        elif is_final:
+            self.notify_fulfillment_blocker_if_customer_action_required(action, error_message)
         return bool(rows)
+
+    def _matches_any(self, text: str, patterns: List[re.Pattern]) -> bool:
+        return any(pattern.search(text) for pattern in patterns)
+
+    def _tool_label_for_domain(self, domain_id: str) -> str:
+        try:
+            rows = self._request(
+                "GET",
+                "domain_credentials",
+                params={
+                    "select": "sending_tool_credentials(sending_tools(slug,name))",
+                    "domain_id": f"eq.{domain_id}",
+                    "limit": "1",
+                },
+            )
+            tool = rows[0].get("sending_tool_credentials", {}).get("sending_tools", {}) if rows else {}
+            return str(tool.get("name") or tool.get("slug") or "your sending tool").strip()
+        except Exception as exc:
+            logger.warning("Failed to load sending-tool label for %s: %s", domain_id, exc)
+            return "your sending tool"
+
+    def _active_inbox_count(self, domain_id: str) -> int:
+        try:
+            rows = self._request(
+                "GET",
+                "inboxes",
+                params={
+                    "select": "id",
+                    "domain_id": f"eq.{domain_id}",
+                    "status": "eq.active",
+                },
+                prefer="count=exact",
+            )
+            return len(rows)
+        except Exception:
+            return 0
+
+    def _customer_email(self, customer_id: str) -> str:
+        rows = self._request(
+            "GET",
+            "customers",
+            params={"select": "email", "id": f"eq.{customer_id}", "limit": "1"},
+        )
+        return str(rows[0].get("email") or "").strip().lower() if rows else ""
+
+    def _notification_exists(self, customer_id: str, dedupe_key: str) -> bool:
+        rows = self._request(
+            "GET",
+            "notifications",
+            params={
+                "select": "id",
+                "customer_id": f"eq.{customer_id}",
+                "dedupe_key": f"eq.{dedupe_key}",
+                "limit": "1",
+            },
+        )
+        return bool(rows)
+
+    def _send_action_required_email(self, to_email: str, title: str, message: str, required_action: str, action_url: str) -> None:
+        api_key = os.getenv("RESEND_API_KEY", "").strip()
+        if not api_key:
+            logger.info("RESEND_API_KEY missing; skipped customer blocker email to %s: %s", to_email, title)
+            return
+        from_email = os.getenv("EMAIL_FROM", "SimpleInboxes <noreply@simpleinboxes.com>")
+        html = f"""
+        <div style="font-family:Arial,sans-serif;background:#f5f8ff;padding:28px;">
+          <div style="max-width:620px;margin:0 auto;background:white;border:1px solid #d8e4f3;border-radius:16px;overflow:hidden;">
+            <div style="padding:26px 30px;background:#fff7ed;border-bottom:1px solid #fed7aa;">
+              <div style="font-size:12px;font-weight:800;color:#dc2626;text-transform:uppercase;letter-spacing:.08em;">Action required</div>
+              <h1 style="margin:14px 0 0;color:#0f172a;font-size:28px;line-height:1.15;">{escape(title)}</h1>
+            </div>
+            <div style="padding:28px 30px;color:#334155;font-size:15px;line-height:1.6;">
+              <p>{escape(message)}</p>
+              <div style="margin:18px 0;padding:14px 16px;border:1px solid #fecaca;background:#fef2f2;border-radius:10px;color:#991b1b;">
+                {escape(required_action)}
+              </div>
+              <p>Once this is fixed, SimpleInboxes will retry the blocked fulfillment step automatically.</p>
+              <a href="{escape(action_url)}" style="display:inline-block;margin-top:10px;padding:12px 18px;border-radius:10px;background:#dc2626;color:white;text-decoration:none;font-weight:800;">Fix this now</a>
+            </div>
+          </div>
+        </div>
+        """
+        response = self.session.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "from": from_email,
+                "to": [to_email],
+                "subject": title,
+                "html": html,
+                "text": f"{message}\n\nAction needed: {required_action}\n\nOpen: {action_url}",
+            },
+            timeout=self.timeout_seconds,
+        )
+        if response.status_code >= 300:
+            logger.warning("Resend failed for customer blocker email (%s): %s", response.status_code, response.text)
+
+    def notify_fulfillment_blocker_if_customer_action_required(self, action: Dict[str, Any], error_message: str) -> bool:
+        domain_id = str(action.get("domain_id") or "").strip()
+        customer_id = str(action.get("customer_id") or "").strip()
+        if not domain_id or not customer_id:
+            return False
+
+        try:
+            domain = self.get_domain(domain_id)
+        except Exception as exc:
+            logger.warning("Failed to load domain for customer blocker notification: %s", exc)
+            return False
+        if not domain:
+            return False
+
+        text = " ".join([
+            str(action.get("type") or ""),
+            str(action.get("status") or ""),
+            str(domain.get("status") or ""),
+            str(domain.get("interim_status") or ""),
+            str(error_message or ""),
+        ])
+        if self._matches_any(text, INTERNAL_FAILURE_PATTERNS):
+            return False
+        if self._matches_any(text, TEMPORARY_FAILURE_PATTERNS) and not self._matches_any(text, CREDENTIAL_FAILURE_PATTERNS):
+            return False
+        if not (self._matches_any(text, UPLOAD_FAILURE_PATTERNS) or self._matches_any(text, CREDENTIAL_FAILURE_PATTERNS)):
+            return False
+
+        domain_name = str(domain.get("domain") or "your domain").strip()
+        tool = self._tool_label_for_domain(domain_id)
+        inbox_count = self._active_inbox_count(domain_id)
+        inbox_text = f"{inbox_count} inbox{'es' if inbox_count != 1 else ''}" if inbox_count > 0 else "Your inboxes"
+        inbox_verb = "was" if inbox_count == 1 else "were"
+        action_url = f"/credential-issues?domain={domain_name}"
+        dedupe_tool = re.sub(r"[^a-z0-9]+", "-", tool.lower()).strip("-") or "sending-tool"
+        dedupe_key = f"fulfillment-blocker:{domain_id}:sending-tool-credentials:{dedupe_tool}"
+
+        try:
+            already_notified = self._notification_exists(customer_id, dedupe_key)
+            if not already_notified:
+                self._request(
+                    "POST",
+                    "notifications",
+                    payload={
+                        "customer_id": customer_id,
+                        "workspace_id": domain.get("workspace_id"),
+                        "category": "action_required",
+                        "type": "sending_tool_credentials_required",
+                        "severity": "action_required",
+                        "title": f"Update {tool} credentials for {domain_name}",
+                        "body": f"{inbox_text} {inbox_verb} created, but upload to {tool} is blocked. Update the credential and we will retry automatically.",
+                        "entity_type": "domain",
+                        "entity_id": domain_id,
+                        "domain_id": domain_id,
+                        "order_batch_id": domain.get("order_batch_id") or action.get("order_batch_id"),
+                        "action_url": action_url,
+                        "dedupe_key": dedupe_key,
+                        "metadata": {
+                            "domain": domain_name,
+                            "tool": tool,
+                            "inboxCount": inbox_count,
+                            "latestActionType": action.get("type"),
+                            "latestActionError": str(error_message or "")[:1000],
+                            "owner": "customer",
+                            "requiredAction": f"Update the {tool} credential, then retry upload.",
+                        },
+                    },
+                )
+                to_email = self._customer_email(customer_id)
+                if to_email:
+                    self._send_action_required_email(
+                        to_email,
+                        f"Update {tool} credentials for {domain_name}",
+                        f"{inbox_text} {inbox_verb} created, but upload to {tool} is blocked. Update the {tool} credential and we will retry automatically.",
+                        f"Update the {tool} credential, then retry upload.",
+                        f"{APP_URL}{action_url}",
+                    )
+            return True
+        except Exception as exc:
+            logger.warning("Failed to create customer blocker notification for %s: %s", domain_name, exc)
+            return False
+
+    def _resolve_fulfillment_notifications_for_completed_action(self, action: Dict[str, Any]) -> None:
+        action_type = str(action.get("type") or "").lower()
+        if not any(token in action_type for token in ["provision", "reupload"]):
+            return
+        domain_id = str(action.get("domain_id") or "").strip()
+        customer_id = str(action.get("customer_id") or "").strip()
+        if not domain_id or not customer_id:
+            return
+        now = _to_iso(_utc_now())
+        try:
+            self._request(
+                "PATCH",
+                "notifications",
+                params={
+                    "customer_id": f"eq.{customer_id}",
+                    "domain_id": f"eq.{domain_id}",
+                    "category": "eq.action_required",
+                    "dismissed_at": "is.null",
+                },
+                payload={
+                    "read_at": now,
+                    "dismissed_at": now,
+                    "metadata": {
+                        "resolved": True,
+                        "resolvedAt": now,
+                        "resolvedBy": f"{action_type}_completed",
+                    },
+                },
+            )
+        except Exception as exc:
+            logger.warning("Failed to resolve customer blocker notifications for %s: %s", domain_id, exc)
 
     def defer_action(
         self,
