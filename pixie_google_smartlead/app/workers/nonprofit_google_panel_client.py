@@ -51,6 +51,16 @@ class NonprofitGooglePanelClient:
     def delete_user(self, email: str, permanent: bool = True) -> Dict[str, Any]:
         return self._post_json({"action": "deleteUser", "email": email, "permanent": bool(permanent)})
 
+    def delete_domain(self, domain: str) -> Dict[str, Any]:
+        clean_domain = str(domain or "").strip().lower()
+        if not clean_domain:
+            raise ValueError("domain is required")
+
+        result = self._post_json({"action": "deleteDomain", "domain": clean_domain})
+        if self._looks_like_unsupported_action(result):
+            result = self._post_json({"action": "removeDomain", "domain": clean_domain})
+        return result
+
     def check_status(self, email: str) -> Dict[str, Any]:
         return self._post_json({"action": "checkStatus", "email": email})
 
@@ -84,3 +94,15 @@ class NonprofitGooglePanelClient:
         if isinstance(data, dict):
             return data
         raise RuntimeError(f"Apps Script returned unexpected JSON type for payload={payload}: {type(data).__name__}")
+
+    @staticmethod
+    def _looks_like_unsupported_action(result: Dict[str, Any]) -> bool:
+        if not isinstance(result, dict):
+            return False
+        if result.get("success") is not False:
+            return False
+        text = " ".join(
+            str(result.get(key) or "")
+            for key in ("error", "message", "details", "action")
+        ).lower()
+        return any(token in text for token in ("unknown action", "unsupported action", "invalid action"))

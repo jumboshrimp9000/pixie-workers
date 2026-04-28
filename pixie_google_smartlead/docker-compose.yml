@@ -22,6 +22,9 @@ services:
       - |
         export GOOGLE_WORKER_ACTION_TYPES="$${GOOGLE_WORKER_ACTION_TYPES:-google_provision}"
         export GOOGLE_LIFECYCLE_ACTION_TYPES="$${GOOGLE_LIFECYCLE_ACTION_TYPES:-google_add_inboxes,google_remove_inboxes,google_update_inboxes,google_update_profile_photos}"
+        export GOOGLE_CANCEL_ACTION_TYPES="$${GOOGLE_CANCEL_ACTION_TYPES:-google_cancel_domain}"
+        export GOOGLE_CANCEL_POLL_SECONDS="$${GOOGLE_CANCEL_POLL_SECONDS:-10}"
+        export GOOGLE_CANCEL_DELETE_TYPE="$${GOOGLE_CANCEL_DELETE_TYPE:-IMMEDIATE}"
         exec python3 main.py
 
   pixie-google-free-nonprofit-worker:

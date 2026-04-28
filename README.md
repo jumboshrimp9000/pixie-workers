@@ -58,6 +58,9 @@ Google lifecycle changes also flow through Supabase actions:
 - `google_remove_inboxes`
 - `google_update_inboxes`
 - `google_update_profile_photos`
+- `google_cancel_domain`
+
+Paid Google cancellation is ordered as Google-side teardown first, supplier cancellation second: delete/remove users as needed, remove the domain from Google Admin, then cancel the PartnerHub/PartnerStage subscription. Free promo Google cancellation uses `free_google_cancel_domain` and follows the same rule inside the nonprofit panel flow.
 
 Microsoft lifecycle changes also flow through Supabase actions:
 - `microsoft_update_inboxes`

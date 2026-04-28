@@ -161,6 +161,47 @@ class NonprofitGoogleCancelWorker:
                     complete_step(step, {"deleted": len(deleted), "results": deleted})
                     persist()
 
+            if not checkpoint("remove_domain"):
+                if panel_client is None:
+                    steps.append(
+                        {
+                            "step": "remove_domain",
+                            "status": "skipped",
+                            "details": {"reason": "No nonprofit panel assignment found"},
+                        }
+                    )
+                else:
+                    step = start_step("remove_domain")
+                    try:
+                        result = panel_client.delete_domain(domain_name)
+                        if isinstance(result, dict) and result.get("success") is False:
+                            error_text = str(
+                                result.get("error")
+                                or result.get("message")
+                                or result.get("details")
+                                or result
+                            )
+                            if self._is_idempotent_delete_error(error_text):
+                                complete_step(step, {"domain": domain_name, "result": result, "idempotent": True})
+                            else:
+                                raise RuntimeError(f"Domain removal failed: {error_text}")
+                        else:
+                            complete_step(step, {"domain": domain_name, "result": result})
+                    except Exception as exc:
+                        error_text = str(exc)
+                        if self._is_idempotent_delete_error(error_text):
+                            complete_step(
+                                step,
+                                {
+                                    "domain": domain_name,
+                                    "result": {"success": False, "error": error_text},
+                                    "idempotent": True,
+                                },
+                            )
+                        else:
+                            raise
+                    persist()
+
             if not checkpoint("mark_deleted"):
                 step = start_step("mark_deleted")
                 now_iso = self._iso_now()

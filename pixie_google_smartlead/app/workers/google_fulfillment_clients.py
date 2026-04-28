@@ -454,6 +454,55 @@ class PartnerHubClient:
             raise RuntimeError(f"PartnerHub get order by id failed: {data}")
         return data
 
+    def delete_order_by_order_id(self, order_id: str, delete_type: str = "IMMEDIATE") -> Dict[str, Any]:
+        clean_order_id = str(order_id or "").strip()
+        clean_delete_type = str(delete_type or "IMMEDIATE").strip().upper()
+        if not clean_order_id:
+            raise RuntimeError("PartnerHub delete order requires order_id")
+
+        data, status_code, ok = self._request(
+            "DELETE",
+            "/integration/orders",
+            params={"orderId": clean_order_id, "deleteType": clean_delete_type},
+        )
+        success_flag = data.get("success") if isinstance(data, dict) else None
+        not_found = status_code in {404, 410} or "not found" in str(data).lower()
+        if not ok or success_flag is False:
+            if not_found:
+                return {
+                    "success": True,
+                    "not_found": True,
+                    "order_id": clean_order_id,
+                    "delete_type": clean_delete_type,
+                    "response": data,
+                }
+            raise RuntimeError(f"PartnerHub delete order failed: status={status_code} response={data}")
+
+        return {
+            "success": True,
+            "order_id": clean_order_id,
+            "delete_type": clean_delete_type,
+            "response": data,
+        }
+
+    def delete_order_by_domain(self, domain: str, delete_type: str = "IMMEDIATE") -> Dict[str, Any]:
+        clean_domain = str(domain or "").strip().lower()
+        if not clean_domain:
+            raise RuntimeError("PartnerHub delete order requires domain")
+
+        order_id = self.resolve_order_id_by_domain(clean_domain)
+        if not order_id:
+            return {
+                "success": True,
+                "not_found": True,
+                "domain": clean_domain,
+                "delete_type": str(delete_type or "IMMEDIATE").strip().upper(),
+            }
+
+        result = self.delete_order_by_order_id(order_id, delete_type)
+        result["domain"] = clean_domain
+        return result
+
     def resolve_order_id_by_domain(self, domain: str) -> Optional[str]:
         clean_domain = str(domain or "").strip().lower()
         if not clean_domain:

@@ -5,6 +5,7 @@ import threading
 import time
 
 from app import setup_logging
+from app.workers.google_cancel_worker import GoogleCancelWorker
 from app.workers.google_inbox_lifecycle_worker import GoogleInboxLifecycleWorker
 from app.workers.google_supabase_worker import GoogleSupabaseWorker
 
@@ -24,14 +25,16 @@ def _touch_heartbeat() -> None:
 def main() -> None:
     setup_logging()
     logger = logging.getLogger(__name__)
-    logger.info("Starting pixie_google_smartlead workers (provisioning + lifecycle)...")
+    logger.info("Starting pixie_google_smartlead workers (provisioning + lifecycle + cancellation)...")
 
     provision_worker = GoogleSupabaseWorker()
     lifecycle_worker = GoogleInboxLifecycleWorker()
+    cancel_worker = GoogleCancelWorker()
 
     threads = [
         threading.Thread(target=provision_worker.run_forever, name="google-provision-worker", daemon=True),
         threading.Thread(target=lifecycle_worker.run_forever, name="google-lifecycle-worker", daemon=True),
+        threading.Thread(target=cancel_worker.run_forever, name="google-cancel-worker", daemon=True),
     ]
     for thread in threads:
         thread.start()

@@ -1062,6 +1062,172 @@ class GoogleAdminPlaywrightClient:
                 logger.warning("Playwright suspend user failed for %s: %s", target, exc)
         return {"suspended": suspended, "failed": failed}
 
+    def delete_users(self, emails: List[str], *, permanent: bool = True) -> Dict[str, Any]:
+        deleted = 0
+        already_missing = 0
+        failed = 0
+        errors: List[Dict[str, str]] = []
+
+        for email in emails:
+            target = str(email or "").strip().lower()
+            if not target:
+                failed += 1
+                errors.append({"email": target, "error": "email is required"})
+                continue
+
+            try:
+                if not self._user_exists(target):
+                    already_missing += 1
+                    continue
+
+                self._open_user(target)
+                self._click_any(
+                    [
+                        "//button[contains(@aria-label,'More actions')]",
+                        "//button[contains(@aria-label,'More options')]",
+                        "//div[@role='button' and contains(@aria-label,'More')]",
+                        "//*[@aria-label='More actions']",
+                    ],
+                    timeout_ms=8_000,
+                    optional=True,
+                )
+                clicked_delete = self._click_any(
+                    [
+                        "//span[normalize-space()='Delete user']",
+                        "//div[normalize-space()='Delete user']",
+                        "//button[.//span[normalize-space()='Delete user']]",
+                        "text=Delete user",
+                    ],
+                    timeout_ms=8_000,
+                    optional=True,
+                )
+                if not clicked_delete:
+                    raise RuntimeError(f"Delete user action was not visible for {target}")
+
+                # Google may show one or more confirmation/transfer screens.
+                # Click explicit destructive controls only; if the flow changes,
+                # this fails before any supplier cancellation can happen.
+                for _ in range(4):
+                    clicked = self._click_any(
+                        [
+                            "//div[@role='dialog']//button[.//span[normalize-space()='Delete user']]",
+                            "//div[@role='dialog']//span[normalize-space()='Delete user']",
+                            "//div[@role='dialog']//button[.//span[normalize-space()='Delete']]",
+                            "//div[@role='dialog']//span[normalize-space()='Delete']",
+                            "//button[.//span[normalize-space()='Delete user']]",
+                            "//button[.//span[normalize-space()='Delete']]",
+                            "text=Delete user",
+                            "text=Delete",
+                        ],
+                        timeout_ms=4_000,
+                        optional=True,
+                    )
+                    if not clicked:
+                        break
+                    time.sleep(1.5)
+                    if not self._visible_text_excerpt(limit=1200).lower().count("delete"):
+                        break
+
+                time.sleep(2.0)
+                if self._user_exists(target):
+                    raise RuntimeError(f"Google Admin still shows {target} after delete flow")
+
+                deleted += 1
+            except Exception as exc:
+                failed += 1
+                message = str(exc)
+                errors.append({"email": target, "error": message})
+                logger.warning("Playwright delete user failed for %s: %s", target, message)
+
+        return {
+            "deleted": deleted,
+            "already_missing": already_missing,
+            "failed": failed,
+            "permanent": 1 if permanent else 0,
+            "errors": errors[:20],
+        }
+
+    def remove_domain(self, domain: str) -> Dict[str, Any]:
+        domain_name = str(domain or "").strip().lower()
+        if not domain_name:
+            raise RuntimeError("domain is required for Google domain removal")
+
+        self._open_domain_management_page(domain_name)
+        time.sleep(1.0)
+        if not self._ensure_domain_visible_in_domain_management(domain_name):
+            if self._domain_absence_is_explicit():
+                return {"removed": 0, "already_absent": True, "domain": domain_name}
+            debug = self._capture_debug_state(f"google_domain_presence_unclear_{self._slug(domain_name)}")
+            text = self._visible_text_excerpt(limit=1200)
+            raise RuntimeError(
+                f"Could not confirm whether {domain_name} exists in Google Admin. "
+                f"Refusing supplier cancellation until domain presence is deterministic. text={text} {debug}"
+            )
+
+        clicked = self._click_domain_row_action(domain_name)
+        if not clicked:
+            # Last-resort: open the row/details and look for the action there.
+            self._click_any(
+                [
+                    f"//*[@data-domain-name='{domain_name}']",
+                    f"//*[contains(normalize-space(), '{domain_name}')]",
+                ],
+                timeout_ms=6_000,
+                optional=True,
+            )
+            time.sleep(1.0)
+            clicked = self._click_any(
+                [
+                    "//button[.//span[normalize-space()='Remove domain']]",
+                    "//button[.//span[normalize-space()='Remove']]",
+                    "//button[.//span[normalize-space()='Delete domain']]",
+                    "//span[normalize-space()='Remove domain']",
+                    "//span[normalize-space()='Delete domain']",
+                    "text=Remove domain",
+                    "text=Delete domain",
+                ],
+                timeout_ms=8_000,
+                optional=True,
+            )
+
+        if not clicked:
+            debug = self._capture_debug_state(f"google_domain_remove_action_missing_{self._slug(domain_name)}")
+            text = self._visible_text_excerpt(limit=1200)
+            raise RuntimeError(
+                f"Could not find a remove-domain action for {domain_name}. "
+                f"This may be the primary domain or Google changed the Admin UI. text={text} {debug}"
+            )
+
+        for _ in range(4):
+            clicked_confirm = self._click_any(
+                [
+                    "//div[@role='dialog']//button[.//span[normalize-space()='Remove domain']]",
+                    "//div[@role='dialog']//button[.//span[normalize-space()='Remove']]",
+                    "//div[@role='dialog']//button[.//span[normalize-space()='Delete domain']]",
+                    "//div[@role='dialog']//button[.//span[normalize-space()='Delete']]",
+                    "//div[@role='dialog']//span[normalize-space()='Remove domain']",
+                    "//div[@role='dialog']//span[normalize-space()='Remove']",
+                    "//div[@role='dialog']//span[normalize-space()='Delete domain']",
+                    "//div[@role='dialog']//span[normalize-space()='Delete']",
+                    "text=Remove domain",
+                    "text=Delete domain",
+                ],
+                timeout_ms=5_000,
+                optional=True,
+            )
+            if not clicked_confirm:
+                break
+            time.sleep(2.0)
+
+        self._open_domain_management_page(domain_name)
+        time.sleep(2.0)
+        if self._ensure_domain_visible_in_domain_management(domain_name):
+            debug = self._capture_debug_state(f"google_domain_still_listed_{self._slug(domain_name)}")
+            text = self._visible_text_excerpt(limit=1200)
+            raise RuntimeError(f"Google Admin still lists {domain_name} after removal attempt. text={text} {debug}")
+
+        return {"removed": 1, "already_absent": False, "domain": domain_name}
+
     # -----------------------------------------------------------------
     # Profile photos
     # -----------------------------------------------------------------
@@ -1433,6 +1599,222 @@ class GoogleAdminPlaywrightClient:
                 "//*[contains(normalize-space(),'Domains')]",
                 "//*[contains(normalize-space(),'Manage domains')]",
             ],
+        )
+
+    def _domain_is_listed(self, domain: str) -> bool:
+        domain_name = str(domain or "").strip().lower()
+        if not domain_name:
+            return False
+        try:
+            return bool(
+                self._require_page().evaluate(
+                    """
+                    (domain) => {
+                      const target = String(domain || '').trim().toLowerCase();
+                      if (!target) return false;
+                      const isVisible = (el) => {
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style.visibility !== 'hidden'
+                          && style.display !== 'none'
+                          && rect.width > 0
+                          && rect.height > 0;
+                      };
+                      return Array.from(document.querySelectorAll('[data-domain-name],tr,[role="row"],a,div,span'))
+                        .some((el) => {
+                          if (!isVisible(el)) return false;
+                          const label = [
+                            el.getAttribute('data-domain-name'),
+                            el.getAttribute('aria-label'),
+                            el.getAttribute('title'),
+                            el.textContent
+                          ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').toLowerCase();
+                          return label.includes(target);
+                        });
+                    }
+                    """,
+                    domain_name,
+                )
+            )
+        except Exception:
+            return self._exists(
+                [
+                    f"//*[@data-domain-name='{domain_name}']",
+                    f"//*[contains(normalize-space(), '{domain_name}')]",
+                ],
+                timeout_ms=3_000,
+            )
+
+    def _ensure_domain_visible_in_domain_management(self, domain: str) -> bool:
+        domain_name = str(domain or "").strip().lower()
+        if not domain_name:
+            return False
+        if self._domain_is_listed(domain_name):
+            return True
+
+        try:
+            search = self._find_any(
+                [
+                    "//input[contains(@aria-label,'Search')]",
+                    "//input[contains(@placeholder,'Search')]",
+                    "//input[@type='search']",
+                ],
+                timeout_ms=4_000,
+            )
+            search.fill(domain_name)
+            search.press("Enter")
+            time.sleep(2.0)
+            if self._domain_is_listed(domain_name):
+                return True
+        except Exception:
+            pass
+
+        page = self._require_page()
+        for _ in range(20):
+            if self._domain_is_listed(domain_name):
+                return True
+            try:
+                scroll_result = page.evaluate(
+                    """
+                    () => {
+                      const candidates = [
+                        document.scrollingElement,
+                        ...Array.from(document.querySelectorAll('[role="grid"],[role="table"],main,c-wiz,div'))
+                      ].filter(Boolean);
+                      const scrollables = candidates
+                        .map((el) => ({
+                          el,
+                          overflow: window.getComputedStyle(el).overflowY,
+                          before: el.scrollTop || 0,
+                          height: el.clientHeight || 0,
+                          maxTop: Math.max(0, (el.scrollHeight || 0) - (el.clientHeight || 0)),
+                        }))
+                        .filter((row) => row.maxTop > row.before && row.height > 120)
+                        .sort((a, b) => b.maxTop - a.maxTop);
+                      const target = scrollables[0];
+                      if (!target) return { scrolled: false };
+                      const delta = Math.max(220, Math.floor(target.height * 0.85));
+                      target.el.scrollTop = Math.min(target.maxTop, target.before + delta);
+                      target.el.dispatchEvent(new Event('scroll', { bubbles: true }));
+                      return { scrolled: target.el.scrollTop > target.before, after: target.el.scrollTop, maxTop: target.maxTop };
+                    }
+                    """
+                )
+                time.sleep(0.6)
+                if isinstance(scroll_result, dict) and not scroll_result.get("scrolled"):
+                    break
+            except Exception:
+                break
+
+        return self._domain_is_listed(domain_name)
+
+    def _domain_absence_is_explicit(self) -> bool:
+        try:
+            text = self._visible_text_excerpt(limit=1600).lower()
+        except Exception:
+            return False
+        return any(
+            token in text
+            for token in (
+                "no results",
+                "no matching",
+                "no domains",
+                "couldn't find",
+                "could not find",
+                "not found",
+            )
+        )
+
+    def _click_domain_row_action(self, domain: str) -> bool:
+        domain_name = str(domain or "").strip().lower()
+        if not domain_name:
+            return False
+
+        try:
+            clicked = bool(
+                self._require_page().evaluate(
+                    """
+                    (domain) => {
+                      const target = String(domain || '').trim().toLowerCase();
+                      const isVisible = (el) => {
+                        if (!el) return false;
+                        const style = window.getComputedStyle(el);
+                        const rect = el.getBoundingClientRect();
+                        return style.visibility !== 'hidden'
+                          && style.display !== 'none'
+                          && rect.width > 0
+                          && rect.height > 0;
+                      };
+                      const labelFor = (el) => [
+                        el.getAttribute('data-domain-name'),
+                        el.getAttribute('aria-label'),
+                        el.getAttribute('title'),
+                        el.innerText,
+                        el.textContent
+                      ].filter(Boolean).join(' ').replace(/\\s+/g, ' ').trim();
+                      const rows = Array.from(document.querySelectorAll('tr,[role="row"],li,div'))
+                        .filter((el) => isVisible(el) && labelFor(el).toLowerCase().includes(target));
+                      const actionRe = /\\b(remove domain|delete domain|remove|delete)\\b/i;
+                      for (const row of rows) {
+                        const direct = Array.from(row.querySelectorAll('button,a,[role="button"]'))
+                          .find((el) => isVisible(el) && actionRe.test(labelFor(el)));
+                        if (direct) {
+                          direct.scrollIntoView({block: 'center', inline: 'center'});
+                          direct.click();
+                          return true;
+                        }
+                      }
+                      for (const row of rows) {
+                        const menu = Array.from(row.querySelectorAll('button,[role="button"]'))
+                          .find((el) => {
+                            if (!isVisible(el)) return false;
+                            const label = labelFor(el).toLowerCase();
+                            return label.includes('more') || label.includes('actions') || label === 'more_vert';
+                          });
+                        if (menu) {
+                          menu.scrollIntoView({block: 'center', inline: 'center'});
+                          menu.click();
+                          return true;
+                        }
+                      }
+                      return false;
+                    }
+                    """,
+                    domain_name,
+                )
+            )
+        except Exception:
+            clicked = False
+
+        if clicked:
+            time.sleep(0.8)
+            menu_clicked = self._click_any(
+                [
+                    "//span[normalize-space()='Remove domain']",
+                    "//span[normalize-space()='Delete domain']",
+                    "//span[normalize-space()='Remove']",
+                    "//span[normalize-space()='Delete']",
+                    "//div[normalize-space()='Remove domain']",
+                    "//div[normalize-space()='Delete domain']",
+                    "text=Remove domain",
+                    "text=Delete domain",
+                ],
+                timeout_ms=6_000,
+                optional=True,
+            )
+            return bool(menu_clicked) or clicked
+
+        return bool(
+            self._click_any(
+                [
+                    f"//tr[.//*[contains(normalize-space(), '{domain_name}')]]//button[.//span[contains(normalize-space(),'Remove')]]",
+                    f"//*[@role='row'][.//*[contains(normalize-space(), '{domain_name}')]]//button[.//span[contains(normalize-space(),'Remove')]]",
+                    f"//tr[.//*[contains(normalize-space(), '{domain_name}')]]//button[.//span[contains(normalize-space(),'Delete')]]",
+                    f"//*[@role='row'][.//*[contains(normalize-space(), '{domain_name}')]]//button[.//span[contains(normalize-space(),'Delete')]]",
+                ],
+                timeout_ms=5_000,
+                optional=True,
+            )
         )
 
     def _open_domain_verification_flow(self, domain: str) -> None:

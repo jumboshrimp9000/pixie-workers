@@ -10,6 +10,7 @@ Paid Google service (`pixie-google-paid-worker`, `main.py`):
 - `google_remove_inboxes`
 - `google_update_inboxes`
 - `google_update_profile_photos`
+- `google_cancel_domain`
 
 Free/nonprofit Google service (`pixie-google-free-nonprofit-worker`, `main_nonprofit.py`):
 - `free_google_provision`
@@ -62,6 +63,11 @@ Existing-domain lifecycle:
 - remove inboxes
 - rename users / change usernames
 - upload profile photos
+- cancel a paid Google domain by removing Google-side users, removing the domain in Google Admin, then cancelling the PartnerHub/PartnerStage subscription
+
+Cancellation guardrail:
+- `google_cancel_domain` refuses free promo inboxes; those must use `free_google_cancel_domain`
+- `free_google_cancel_domain` removes nonprofit panel users and the domain before marking the order cancelled/releasing the panel assignment
 
 `google_update_inboxes` now also syncs tracked mutation state back to Supabase:
 - request status

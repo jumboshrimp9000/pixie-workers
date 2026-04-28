@@ -44,3 +44,4 @@ Notes:
 - The nonprofit worker uses separate `OnePasswordCliClient` instances for admin credentials (`NONPROFIT_GOOGLE_ADMIN_OP_VAULT`) and user credentials (`NONPROFIT_GOOGLE_USER_OP_VAULT`).
 - Apps Script calls follow Google Apps Script `302` redirects manually before parsing JSON.
 - Provisioning failures do not release the panel assignment; retries reuse the same panel.
+- Cancellation removes users and then removes the Google domain through the assigned nonprofit panel Apps Script before marking the domain cancelled or releasing the panel assignment.
