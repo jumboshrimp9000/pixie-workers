@@ -58,6 +58,37 @@ if ([string]$loadStep.status -ne "completed") {
 
 $recoveryTenant = Get-RecoveryTenant -RecoveryTenantId ([string]$recoveryPool.recovery_tenant_id)
 if (-not $recoveryTenant) {
+    if (-not $recoveryPool.recovery_tenant_id) {
+        $dnsCleanupStep = Start-RecoveryStep -ActionId $actionId -ActionType "microsoft_recovery_purge" -Domain $domain -StepName "cleanup_cloudflare_zone" -StepMap $stepMap -Summary $summary -Attempt ([int]$actionRecord.attempts)
+        if ([string]$dnsCleanupStep.status -ne "completed") {
+            if (-not $restoreToCustomer) {
+                $zoneId = Get-RecoveryPoolZoneId -RecoveryPoolRow $recoveryPool
+                if ($zoneId -and -not $DryRun) {
+                    foreach ($record in @(Get-CloudflareDnsRecords -ZoneId $zoneId)) {
+                        if (-not $record.id) { continue }
+                        try { Remove-CloudflareDnsRecord -ZoneId $zoneId -RecordId $record.id } catch { }
+                    }
+                }
+            }
+            Complete-RecoveryStep -ActionId $actionId -ActionType "microsoft_recovery_purge" -Domain $domain -StepMap $stepMap -Summary $summary -StepName "cleanup_cloudflare_zone" -Details @{ skipped = $restoreToCustomer; no_recovery_tenant = $true }
+        }
+
+        $finalizeStep = Start-RecoveryStep -ActionId $actionId -ActionType "microsoft_recovery_purge" -Domain $domain -StepName "finalize_recovery_purge" -StepMap $stepMap -Summary $summary -Attempt ([int]$actionRecord.attempts)
+        if ([string]$finalizeStep.status -ne "completed") {
+            if (-not $DryRun) {
+                Remove-RecoveryPoolRow -RecoveryPoolId $recoveryPoolId
+            }
+            Complete-RecoveryStep -ActionId $actionId -ActionType "microsoft_recovery_purge" -Domain $domain -StepMap $stepMap -Summary $summary -StepName "finalize_recovery_purge" -Details @{ deleted_recovery_pool = (-not $DryRun); no_recovery_tenant = $true }
+        }
+
+        Update-ActionStatus -ActionId $actionId -Status "completed" -Result @{
+            recovery_pool_id = $recoveryPoolId
+            restore_to_customer = $restoreToCustomer
+            restored_domain_id = $restoredDomainId
+            no_recovery_tenant = $true
+        }
+        return
+    }
     Stop-RecoveryPurge -ErrorMessage "Recovery tenant credentials not found" -StepName "connect_recovery_tenant"
 }
 
@@ -88,7 +119,7 @@ try {
     $tenantCleanupStep = Start-RecoveryStep -ActionId $actionId -ActionType "microsoft_recovery_purge" -Domain $domain -StepName "remove_recovery_tenant_domain" -StepMap $stepMap -Summary $summary -Attempt ([int]$actionRecord.attempts)
     if ([string]$tenantCleanupStep.status -ne "completed") {
         if (-not $DryRun) {
-            $mailboxEmail = if ($recoveryPool.recovery_mailbox) { [string]$recoveryPool.recovery_mailbox } else { "info@$domain" }
+            $mailboxEmail = if ($recoveryPool.recovery_mailbox) { [string]$recoveryPool.recovery_mailbox } else { "postmaster@$domain" }
             try { Remove-Mailbox -Identity $mailboxEmail -Confirm:$false -ErrorAction Stop } catch { }
             Remove-RecoveryAcceptedDomainFromExchange -Domain $domain | Out-Null
             $graphRemove = Remove-RecoveryDomainFromGraphWithRetry -Bearer $recoveryBearer -Domain $domain -MaxAttempts 3

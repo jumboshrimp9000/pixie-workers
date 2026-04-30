@@ -288,7 +288,22 @@ class NonprofitGoogleCancelWorker:
                     )
                     complete_step(step, {"recovery_pool_id": chain_recovery_pool_id})
                 except Exception as exc:
-                    complete_step(step, {"recovery_pool_id": chain_recovery_pool_id, "error": str(exc)})
+                    message = f"Failed to enqueue Microsoft recovery move after Google source teardown: {exc}"
+                    try:
+                        self.client._request(  # type: ignore[attr-defined]
+                            "PATCH",
+                            "recovery_pool",
+                            params={"id": f"eq.{chain_recovery_pool_id}"},
+                            payload={
+                                "recovery_status": "failed",
+                                "last_error": message,
+                            },
+                        )
+                    except Exception:
+                        pass
+                    complete_step(step, {"recovery_pool_id": chain_recovery_pool_id, "error": message})
+                    persist()
+                    raise RuntimeError(message) from exc
                 persist()
 
             result = {"steps": steps, "domain": domain_name, "cancelled": True}

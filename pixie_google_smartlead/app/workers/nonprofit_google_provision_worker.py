@@ -74,7 +74,7 @@ class NonprofitGoogleProvisionWorker:
         self.poll_interval_seconds = max(1.0, float(os.getenv("NONPROFIT_GOOGLE_POLL_SECONDS", "10")))
         self.batch_size = max(1, int(os.getenv("NONPROFIT_GOOGLE_BATCH_SIZE", "3")))
         self.max_retries = max(1, int(os.getenv("NONPROFIT_GOOGLE_MAX_RETRIES", "8")))
-        self.action_types = ["free_google_provision"]
+        self.action_types = ["free_google_provision", "google_recovery_move"]
         self.playwright_headless = self._as_bool(os.getenv("NONPROFIT_GOOGLE_PLAYWRIGHT_HEADLESS", "true"), default=True)
         self.require_mfa_enrollment = self._as_bool(
             os.getenv("NONPROFIT_GOOGLE_REQUIRE_MFA_ENROLLMENT", "true"),
@@ -161,6 +161,7 @@ class NonprofitGoogleProvisionWorker:
 
         domain_id = str(action.get("domain_id") or "").strip()
         payload = action.get("payload") or {}
+        action_type = str(action.get("type") or "").strip()
 
         def log_event(event_type: str, severity: str, message: str, metadata: Optional[Dict[str, Any]] = None) -> None:
             if severity == "error":
@@ -226,6 +227,33 @@ class NonprofitGoogleProvisionWorker:
                 pass
 
         try:
+            if action_type == "google_recovery_move":
+                try:
+                    self._process_google_recovery_action(
+                        action=action,
+                        payload=payload,
+                        steps=steps,
+                        checkpoint=checkpoint,
+                        start_step=start_step,
+                        complete_step=complete_step,
+                        fail_step=fail_step,
+                        log_event=log_event,
+                    )
+                except DeferredNonprofitAction:
+                    raise
+                except Exception as exc:
+                    recovery_pool_id = str(payload.get("recovery_pool_id") or "").strip()
+                    if recovery_pool_id:
+                        try:
+                            self._update_recovery_pool(
+                                recovery_pool_id,
+                                {"recovery_status": "failed", "last_error": str(exc)},
+                            )
+                        except Exception:
+                            pass
+                    raise
+                return
+
             if not domain_id:
                 raise RuntimeError("Action missing domain_id")
 
@@ -610,6 +638,336 @@ class NonprofitGoogleProvisionWorker:
                 pass
             self.client.fail_action(action, message, max_retries=self.max_retries)
 
+    def _process_google_recovery_action(
+        self,
+        *,
+        action: Dict[str, Any],
+        payload: Dict[str, Any],
+        steps: List[Dict[str, Any]],
+        checkpoint: Any,
+        start_step: Any,
+        complete_step: Any,
+        fail_step: Any,
+        log_event: Any,
+    ) -> None:
+        recovery_pool_id = str(payload.get("recovery_pool_id") or "").strip()
+        if not recovery_pool_id:
+            raise RuntimeError("Missing recovery_pool_id")
+
+        recovery_pool = self._get_recovery_pool_row(recovery_pool_id)
+        if not recovery_pool:
+            raise RuntimeError(f"Recovery pool row {recovery_pool_id} not found")
+
+        domain_name = str(recovery_pool.get("domain") or "").strip().lower()
+        if not domain_name:
+            raise RuntimeError("Recovery pool domain is missing")
+        customer_id = str(action.get("customer_id") or recovery_pool.get("original_customer_id") or "").strip()
+        mailbox_email = str(recovery_pool.get("recovery_mailbox") or f"postmaster@{domain_name}").strip().lower()
+        mailbox_password = str(
+            os.getenv("RECOVERY_GOOGLE_MAILBOX_PASSWORD")
+            or os.getenv("RECOVERY_MAILBOX_PASSWORD")
+            or ""
+        ).strip()
+        if not mailbox_password:
+            raise RuntimeError("RECOVERY_GOOGLE_MAILBOX_PASSWORD or RECOVERY_MAILBOX_PASSWORD is required")
+
+        log_event(
+            "action_started",
+            "info",
+            f"Starting Google Recovery Pool move for {domain_name}",
+            {"domain": domain_name, "recovery_pool_id": recovery_pool_id, "customer_id": customer_id},
+        )
+
+        panel_details = checkpoint("assign_recovery_panel")
+        if not panel_details:
+            step = start_step("assign_recovery_panel")
+            panel_details = self._assign_or_reuse_recovery_panel(
+                recovery_pool_id=recovery_pool_id,
+                customer_id=customer_id,
+                user_count=1,
+            )
+            complete_step(step, self._panel_step_details(panel_details))
+            self._update_recovery_pool(recovery_pool_id, {"recovery_status": "moving_in", "last_error": None})
+
+        panel_id = str(panel_details.get("panel_id") or panel_details.get("id") or "").strip()
+        if not panel_id:
+            raise RuntimeError("Recovery panel assignment did not return panel_id")
+
+        panel_record = self._get_panel_record(panel_id)
+        if not panel_record:
+            raise RuntimeError(f"Assigned recovery nonprofit panel {panel_id} not found")
+        admin_creds = self._resolve_panel_credentials(panel_record)
+        admin_op_client = self._maybe_build_op_client(self.admin_vault)
+        if admin_op_client is not None:
+            admin_creds["_op_client"] = admin_op_client
+        panel_client = NonprofitGooglePanelClient(str(admin_creds.get("apps_script_url") or ""))
+
+        zone_checkpoint = checkpoint("ensure_recovery_cloudflare_zone")
+        if zone_checkpoint:
+            zone_id = str(zone_checkpoint.get("zone_id") or "").strip()
+        else:
+            step = start_step("ensure_recovery_cloudflare_zone")
+            previous_config = self._coerce_dict(recovery_pool.get("previous_config"))
+            zone_id = str(recovery_pool.get("cloudflare_zone_id") or previous_config.get("cloudflare_zone_id") or "").strip()
+            created = False
+            if not zone_id:
+                zone_id, created = self._get_cloudflare().get_or_create_zone(domain_name)
+            ns1, ns2 = self._get_cloudflare().get_zone_nameservers(zone_id)
+            self._update_recovery_pool(
+                recovery_pool_id,
+                {
+                    "cloudflare_zone_id": zone_id,
+                    "cloudflare_ns1": ns1,
+                    "cloudflare_ns2": ns2,
+                    "recovery_mailbox": mailbox_email,
+                },
+            )
+            complete_step(step, {"zone_id": zone_id, "created": created, "ns1": ns1, "ns2": ns2})
+
+        active_checkpoint = checkpoint("wait_recovery_cloudflare_active")
+        if not active_checkpoint:
+            step = start_step("wait_recovery_cloudflare_active")
+            active = self._get_cloudflare().is_zone_active(zone_id)
+            if not active:
+                message = f"Waiting for Cloudflare nameservers to become active for {domain_name}."
+                step["status"] = "waiting"
+                step["completedAt"] = self._iso_now()
+                step["error"] = message
+                step["details"] = {"zone_id": zone_id, "nextRetrySeconds": self.dns_propagation_retry_seconds}
+                self._update_recovery_pool(
+                    recovery_pool_id,
+                    {"recovery_status": "ns_pending", "last_error": "Waiting for Cloudflare nameservers to become active"},
+                )
+                raise DeferredNonprofitAction(
+                    message,
+                    delay_seconds=self.dns_propagation_retry_seconds,
+                    consume_attempt=False,
+                )
+            complete_step(step, {"zone_id": zone_id, "active": True})
+            self._update_recovery_pool(recovery_pool_id, {"recovery_status": "moving_in", "last_error": None})
+
+        txt_checkpoint = checkpoint("get_recovery_domain_txt")
+        if txt_checkpoint:
+            txt_record = str(txt_checkpoint.get("txtRecord") or txt_checkpoint.get("txt_record") or "").strip()
+        else:
+            step = start_step("get_recovery_domain_txt")
+            txt_result = panel_client.get_domain_txt(domain_name)
+            txt_record = str(txt_result.get("txtRecord") or "").strip()
+            if not txt_result.get("success") or not txt_record:
+                raise RuntimeError(f"Apps Script failed to return TXT token: {txt_result}")
+            complete_step(step, {"txtRecord": txt_record, "response": txt_result})
+
+        txt_write_checkpoint = checkpoint("write_recovery_txt_record")
+        if not txt_write_checkpoint:
+            step = start_step("write_recovery_txt_record")
+            dns_summary = self._get_cloudflare().upsert_dns_records(
+                zone_id,
+                [{"type": "TXT", "name": "@", "content": txt_record, "ttl": 3600}],
+            )
+            if int(dns_summary.get("failed") or 0) > 0:
+                fail_step(step, f"Cloudflare TXT write failed for {domain_name}: {dns_summary}", dns_summary)
+                raise RuntimeError(f"Cloudflare TXT write failed for {domain_name}: {dns_summary}")
+            complete_step(step, dns_summary)
+
+        mail_dns_checkpoint = checkpoint("write_recovery_google_mail_dns")
+        if not mail_dns_checkpoint:
+            step = start_step("write_recovery_google_mail_dns")
+            dns_summary = self._get_cloudflare().upsert_dns_records(
+                zone_id,
+                self._default_google_mail_dns_records(),
+            )
+            if int(dns_summary.get("failed") or 0) > 0:
+                fail_step(step, f"Cloudflare Google mail DNS write failed for {domain_name}: {dns_summary}", dns_summary)
+                raise RuntimeError(f"Cloudflare Google mail DNS write failed for {domain_name}: {dns_summary}")
+            complete_step(step, dns_summary)
+
+        txt_visible_checkpoint = checkpoint("wait_recovery_public_txt")
+        if not txt_visible_checkpoint:
+            step = start_step("wait_recovery_public_txt")
+            public_dns = self._check_public_txt_record(domain_name, txt_record)
+            if not bool(public_dns.get("visible")):
+                message = f"Waiting for DNS propagation: Google verification TXT for {domain_name} is not visible yet."
+                step["status"] = "waiting"
+                step["completedAt"] = self._iso_now()
+                step["error"] = message
+                step["details"] = {**public_dns, "nextRetrySeconds": self.dns_propagation_retry_seconds}
+                self._update_recovery_pool(recovery_pool_id, {"recovery_status": "ns_pending", "last_error": message})
+                raise DeferredNonprofitAction(
+                    message,
+                    delay_seconds=self.dns_propagation_retry_seconds,
+                    consume_attempt=False,
+                )
+            complete_step(step, public_dns)
+            self._update_recovery_pool(recovery_pool_id, {"recovery_status": "moving_in", "last_error": None})
+
+        verify_checkpoint = checkpoint("verify_recovery_domain")
+        if not verify_checkpoint:
+            step = start_step("verify_recovery_domain")
+            api_verify_result = panel_client.verify_domain_via_api(domain_name)
+            if self._domain_verification_succeeded(api_verify_result):
+                admin_verify_result = asyncio.run(self._verify_domain_ui(domain_name, admin_creds))
+                verify_result = {
+                    "verified": self._domain_verification_succeeded(admin_verify_result),
+                    "method": "api_then_admin_ui",
+                    "api": api_verify_result,
+                    "admin": admin_verify_result,
+                }
+            else:
+                admin_verify_result = asyncio.run(self._verify_domain_ui(domain_name, admin_creds))
+                verify_result = {
+                    "verified": self._domain_verification_succeeded(admin_verify_result),
+                    "method": "admin_ui",
+                    "api": api_verify_result,
+                    "admin": admin_verify_result,
+                }
+            if not self._domain_verification_succeeded(verify_result):
+                if verify_result.get("timedOut") or "verification failed" in str(verify_result.get("error") or "").lower():
+                    message = (
+                        f"Waiting for Google to recognize DNS for {domain_name}. "
+                        f"Public TXT is visible, but Google verification is not complete yet: {verify_result}"
+                    )
+                    step["status"] = "waiting"
+                    step["completedAt"] = self._iso_now()
+                    step["error"] = message
+                    step["details"] = {
+                        "verifyResult": verify_result,
+                        "classification": "google_dns_recognition_pending",
+                        "playwrightAttempted": True,
+                        "nextRetrySeconds": self.dns_propagation_retry_seconds,
+                    }
+                    self._update_recovery_pool(recovery_pool_id, {"recovery_status": "ns_pending", "last_error": message})
+                    raise DeferredNonprofitAction(
+                        message,
+                        delay_seconds=self.dns_propagation_retry_seconds,
+                        consume_attempt=False,
+                    )
+                fail_step(step, f"Domain verification failed: {verify_result}", verify_result)
+                raise RuntimeError(f"Domain verification failed for {domain_name}: {verify_result}")
+            complete_step(step, verify_result)
+
+        user_payloads = [
+            {
+                "firstName": domain_name,
+                "lastName": "Recovery",
+                "email": mailbox_email,
+                "password": mailbox_password,
+                "orgUnitPath": f"/{domain_name}",
+                "recoveryEmail": None,
+            }
+        ]
+        fake_inboxes = [
+            {
+                "username": mailbox_email.split("@")[0],
+                "email": mailbox_email,
+                "password": mailbox_password,
+                "first_name": domain_name,
+                "last_name": "Recovery",
+            }
+        ]
+
+        create_checkpoint = checkpoint("create_recovery_postmaster")
+        if not create_checkpoint:
+            step = start_step("create_recovery_postmaster")
+            create_result = panel_client.batch_create_users(user_payloads, skip_photos=True)
+            errors = list(create_result.get("errors") or [])
+            non_duplicate = [row for row in errors if "already exists" not in str(row.get("error") or "").lower()]
+            if non_duplicate:
+                if self._is_directory_authorization_failure(non_duplicate):
+                    fallback_result = self._create_users_via_google_admin_ui(
+                        domain_name=domain_name,
+                        user_payloads=user_payloads,
+                        admin_creds=admin_creds,
+                    )
+                    if int(fallback_result.get("failed") or 0) > 0:
+                        fail_step(step, "Google Admin UI user creation failed", {"appsScriptErrors": non_duplicate, "playwright": fallback_result})
+                        raise RuntimeError(f"Google Admin UI user creation failed: {fallback_result}")
+                    create_result = {"primary": "apps_script", "fallback": "google_admin_playwright", "playwright": fallback_result}
+                else:
+                    fail_step(step, "Apps Script user creation failed", {"errors": non_duplicate})
+                    raise RuntimeError(f"Apps Script user creation failed: {non_duplicate}")
+            complete_step(step, create_result)
+
+        app_config_checkpoint = checkpoint("configure_recovery_admin_apps")
+        if not app_config_checkpoint:
+            step = start_step("configure_recovery_admin_apps")
+            app_result = self._configure_admin_apps(
+                {"required": [DEFAULT_INSTANTLY_APP_ID], "optional": [], "invalid": []},
+                admin_creds,
+            )
+            complete_step(step, app_result)
+
+        dkim_checkpoint = checkpoint("enable_recovery_dkim")
+        if not dkim_checkpoint:
+            step = start_step("enable_recovery_dkim")
+            try:
+                dkim_result = self._enable_dkim(domain_name, zone_id, admin_creds)
+            except DeferredNonprofitAction as exc:
+                step["status"] = "waiting"
+                step["completedAt"] = self._iso_now()
+                step["error"] = str(exc)
+                step["details"] = {**getattr(exc, "details", {}), "nextRetrySeconds": exc.delay_seconds}
+                raise
+            except Exception as exc:
+                fail_step(step, f"DKIM setup failed for {domain_name}: {exc}")
+                raise
+            complete_step(step, dkim_result)
+
+        mfa_checkpoint = checkpoint("setup_recovery_2fa")
+        mfa_details = dict(mfa_checkpoint or {})
+        if not mfa_checkpoint:
+            step = start_step("setup_recovery_2fa")
+            user_op_client = self._build_op_client(self.user_vault)
+            results = asyncio.run(self._setup_all_user_2fa(fake_inboxes, domain_name, admin_creds, user_op_client))
+            failures = [row for row in results if not row.get("success")]
+            mfa_details = {"completed": len(results) - len(failures), "failed": len(failures), "results": results}
+            if failures and self.require_mfa_enrollment:
+                fail_step(step, json.dumps(failures)[:2000], mfa_details)
+                raise RuntimeError(f"2FA setup failed for recovery mailbox {mailbox_email}")
+            complete_step(step, mfa_details)
+
+        upload_checkpoint = checkpoint("upload_recovery_instantly")
+        if not upload_checkpoint:
+            step = start_step("upload_recovery_instantly")
+            user_op_client = self._maybe_build_op_client(self.user_vault)
+            upload_result = self._upload_google_recovery_to_instantly(
+                mailbox_email=mailbox_email,
+                mailbox_password=mailbox_password,
+                onepassword=user_op_client,
+            )
+            failed_uploads = upload_result.get("failed_uploads") or []
+            if failed_uploads:
+                fail_step(step, "Recovery Instantly upload failed", upload_result)
+                raise RuntimeError(f"Recovery Instantly upload failed for {mailbox_email}: {failed_uploads}")
+            complete_step(step, upload_result)
+
+        finalize_checkpoint = checkpoint("finalize_google_recovery")
+        if not finalize_checkpoint:
+            step = start_step("finalize_google_recovery")
+            existing_flags = recovery_pool.get("blacklist_flags")
+            flag_count = len(existing_flags) if isinstance(existing_flags, list) else 0
+            self._update_recovery_pool(
+                recovery_pool_id,
+                {
+                    "recovery_status": "warming",
+                    "recovery_provider": "google",
+                    "recovery_mailbox": mailbox_email,
+                    "instantly_account_id": mailbox_email,
+                    "blacklist_delisting_status": (
+                        "outreach_pending"
+                        if flag_count > 0 and bool(recovery_pool.get("blacklist_authorized"))
+                        else "clean"
+                        if flag_count == 0
+                        else "unsupported"
+                    ),
+                    "last_error": None,
+                },
+            )
+            complete_step(step, {"status": "warming", "panel_id": panel_id, "mailbox": mailbox_email})
+
+        result = {"steps": steps, "panel_id": panel_id, "domain": domain_name, "recovery_pool_id": recovery_pool_id}
+        self.client.complete_action(action, result)
+        log_event("action_completed", "info", f"Google Recovery Pool move complete for {domain_name}", result)
+
     async def _verify_domain_ui(self, domain_name: str, admin_creds: Dict[str, Any]) -> Dict[str, Any]:
         admin_op = self._maybe_build_op_client(self.admin_vault)
         async with async_playwright() as pw:
@@ -758,8 +1116,9 @@ class NonprofitGoogleProvisionWorker:
                 try:
                     result = await setup_user_2fa(page, email, password, admin_creds, user_op_client, logger.info)
                     item_id = str(result.get("item_id") or "").strip()
-                    if item_id:
-                        self.client.update_inbox(str(inbox.get("id")), {"onepassword_item_id": item_id})
+                    inbox_id = str(inbox.get("id") or "").strip()
+                    if item_id and inbox_id:
+                        self.client.update_inbox(inbox_id, {"onepassword_item_id": item_id})
                     results.append({"email": email, **result})
                 except Exception as exc:
                     results.append({"email": email, "success": False, "error": str(exc)})
@@ -859,6 +1218,19 @@ class NonprofitGoogleProvisionWorker:
             },
         )
 
+    def _assign_or_reuse_recovery_panel(self, *, recovery_pool_id: str, customer_id: str, user_count: int) -> Dict[str, Any]:
+        existing = self._get_existing_recovery_panel_assignment(recovery_pool_id)
+        if existing:
+            return existing
+        return self._rpc(
+            "assign_recovery_nonprofit_panel",
+            {
+                "p_recovery_pool_id": recovery_pool_id,
+                "p_customer_id": customer_id or None,
+                "p_user_count": int(user_count),
+            },
+        )
+
     def _get_existing_panel_assignment(self, domain_id: str) -> Optional[Dict[str, Any]]:
         rows = self.client._request(  # type: ignore[attr-defined]
             "GET",
@@ -873,6 +1245,78 @@ class NonprofitGoogleProvisionWorker:
             "panel_id": row.get("panel_id"),
             "domain_id": row.get("domain_id"),
         }
+
+    def _get_existing_recovery_panel_assignment(self, recovery_pool_id: str) -> Optional[Dict[str, Any]]:
+        rows = self.client._request(  # type: ignore[attr-defined]
+            "GET",
+            "recovery_panel_assignments",
+            params={"select": "*", "recovery_pool_id": f"eq.{recovery_pool_id}", "status": "eq.assigned", "limit": "1"},
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        return {
+            "assignment_id": row.get("id"),
+            "panel_id": row.get("panel_id"),
+            "recovery_pool_id": row.get("recovery_pool_id"),
+        }
+
+    def _get_recovery_pool_row(self, recovery_pool_id: str) -> Optional[Dict[str, Any]]:
+        rows = self.client._request(  # type: ignore[attr-defined]
+            "GET",
+            "recovery_pool",
+            params={"select": "*", "id": f"eq.{recovery_pool_id}", "limit": "1"},
+        )
+        return rows[0] if rows else None
+
+    def _update_recovery_pool(self, recovery_pool_id: str, fields: Dict[str, Any]) -> None:
+        self.client._request(  # type: ignore[attr-defined]
+            "PATCH",
+            "recovery_pool",
+            params={"id": f"eq.{recovery_pool_id}"},
+            payload=fields,
+        )
+
+    @staticmethod
+    def _coerce_dict(value: Any) -> Dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    def _upload_google_recovery_to_instantly(
+        self,
+        *,
+        mailbox_email: str,
+        mailbox_password: str,
+        onepassword: Any,
+    ) -> Dict[str, Any]:
+        api_key = str(os.getenv("INSTANTLY_RECOVERY_API_KEY") or "").strip()
+        if not api_key:
+            raise RuntimeError("INSTANTLY_RECOVERY_API_KEY is not configured")
+        return self._sending_tool_uploader.upload_and_validate(
+            tool="instantly",
+            api_key=api_key,
+            inboxes=[
+                {
+                    "email": mailbox_email,
+                    "password": mailbox_password,
+                    "first_name": "Postmaster",
+                    "last_name": "Recovery",
+                }
+            ],
+            provider="google",
+            credential={"api_key": api_key},
+            settings={"enableWarmup": True, "instantlyWarmup": {"enabled": True}},
+            onepassword=onepassword,
+            headless=self.playwright_headless,
+            use_playwright_oauth=True,
+        )
 
     def _get_panel_record(self, panel_id: str) -> Optional[Dict[str, Any]]:
         rows = self.client._request(  # type: ignore[attr-defined]

@@ -35,6 +35,25 @@ $summary = [ordered]@{
     target_domain_id = $targetDomainId
     instantly_removed = $false
     mailbox_count = 0
+    upload_action_id = $null
+    uploaded = 0
+}
+
+function Get-ReactivationSendingToolSettings {
+    param([object]$Config)
+
+    if ($Config -is [string]) {
+        try { $Config = $Config | ConvertFrom-Json -Depth 20 } catch { $Config = $null }
+    }
+    if (-not $Config) { return $null }
+
+    if ($Config.PSObject.Properties.Name -contains "sending_tool_settings" -and $Config.sending_tool_settings) {
+        return $Config.sending_tool_settings
+    }
+    if ($Config.PSObject.Properties.Name -contains "sendingToolSettings" -and $Config.sendingToolSettings) {
+        return $Config.sendingToolSettings
+    }
+    return $null
 }
 
 function Stop-RecoveryReactivate {
@@ -98,7 +117,7 @@ try {
     $cleanupStep = Start-RecoveryStep -ActionId $actionId -ActionType "microsoft_recovery_reactivate" -Domain $domain -StepName "remove_from_recovery_tenant" -StepMap $stepMap -Summary $summary -Attempt ([int]$actionRecord.attempts)
     if ([string]$cleanupStep.status -ne "completed") {
         if (-not $DryRun) {
-            $mailboxEmail = if ($recoveryPool.recovery_mailbox) { [string]$recoveryPool.recovery_mailbox } else { "info@$domain" }
+            $mailboxEmail = if ($recoveryPool.recovery_mailbox) { [string]$recoveryPool.recovery_mailbox } else { "postmaster@$domain" }
             try { Remove-Mailbox -Identity $mailboxEmail -Confirm:$false -ErrorAction Stop } catch { }
             Remove-RecoveryAcceptedDomainFromExchange -Domain $domain | Out-Null
             $graphRemove = Remove-RecoveryDomainFromGraphWithRetry -Bearer $recoveryBearer -Domain $domain -MaxAttempts 3
@@ -203,6 +222,82 @@ try {
 
         $summary.mailbox_count = @((Get-DomainInboxes -DomainId $targetDomainId -Status "active")).Count
         Complete-RecoveryStep -ActionId $actionId -ActionType "microsoft_recovery_reactivate" -Domain $domain -StepMap $stepMap -Summary $summary -StepName "create_target_mailboxes" -Details @{ target_domain_id = $targetDomainId; mailbox_count = $summary.mailbox_count }
+    }
+
+    $uploadStep = Start-RecoveryStep -ActionId $actionId -ActionType "microsoft_recovery_reactivate" -Domain $domain -StepName "upload_to_sending_tool" -StepMap $stepMap -Summary $summary -Attempt ([int]$actionRecord.attempts)
+    if ([string]$uploadStep.status -ne "completed") {
+        if ($DryRun) {
+            Complete-RecoveryStep -ActionId $actionId -ActionType "microsoft_recovery_reactivate" -Domain $domain -StepMap $stepMap -Summary $summary -StepName "upload_to_sending_tool" -Details @{ dry_run = $true }
+        } else {
+            $targetDomain = Get-Domain -DomainId $targetDomainId
+            if (-not $targetDomain) {
+                Stop-RecoveryReactivate -ErrorMessage "Target domain not found before recovery upload validation" -StepName "upload_to_sending_tool"
+            }
+
+            $activeInboxes = @(Get-RecoveryActiveDomainInboxes -DomainId $targetDomainId)
+            $expectedActiveCount = $activeInboxes.Count
+            if ($expectedActiveCount -eq 0) {
+                Update-Domain -DomainId $targetDomainId -Fields @{
+                    status = "in_progress"
+                    interim_status = "Recovery - Sending Tool Upload Blocked"
+                }
+                Stop-RecoveryReactivate -ErrorMessage "No active inboxes found; refusing to finish recovery reactivation" -StepName "upload_to_sending_tool"
+            }
+
+            $sendingToolSettings = Get-ReactivationSendingToolSettings -Config $config
+            $uploadActionResult = Ensure-RecoverySendingToolUploadAction -DomainRecord $targetDomain -RecoveryActionId $actionId -ExpectedActiveInboxCount $expectedActiveCount -SendingToolSettings $sendingToolSettings
+            if (-not $uploadActionResult.Success) {
+                $reason = [string]$uploadActionResult.Reason
+                $interimStatus = if ($uploadActionResult.Blocked) { "Recovery - Sending Tool Credentials Required" } else { "Recovery - Sending Tool Upload Failed" }
+                Update-Domain -DomainId $targetDomainId -Fields @{
+                    status = "in_progress"
+                    interim_status = $interimStatus
+                }
+                Stop-RecoveryReactivate -ErrorMessage $reason -StepName "upload_to_sending_tool"
+            }
+
+            $uploadAction = $uploadActionResult.UploadAction
+            $uploadActionId = [string]$uploadAction.id
+            $summary.upload_action_id = $uploadActionId
+            $validation = Test-RecoverySendingToolUploadValidation -UploadAction $uploadAction -ExpectedActiveInboxCount $expectedActiveCount
+
+            if ($validation.Complete) {
+                $summary.uploaded = [int]$validation.Uploaded
+                Complete-RecoveryStep -ActionId $actionId -ActionType "microsoft_recovery_reactivate" -Domain $domain -StepMap $stepMap -Summary $summary -StepName "upload_to_sending_tool" -Details @{
+                    upload_action_id = $uploadActionId
+                    expected_active_inboxes = $expectedActiveCount
+                    uploaded = [int]$validation.Uploaded
+                }
+            } elseif ($validation.Failed) {
+                $reason = [string]$validation.Reason
+                Update-Domain -DomainId $targetDomainId -Fields @{
+                    status = "in_progress"
+                    interim_status = "Recovery - Sending Tool Upload Failed"
+                }
+                Stop-RecoveryReactivate -ErrorMessage "Sending-tool upload validation failed: $reason" -StepName "upload_to_sending_tool"
+            } else {
+                $delaySeconds = 120
+                if ($env:MICROSOFT_UPLOAD_POLL_SECONDS) {
+                    try { $delaySeconds = [Math]::Max(30, [int]$env:MICROSOFT_UPLOAD_POLL_SECONDS) } catch { $delaySeconds = 120 }
+                }
+                $uploadStep.details = @{
+                    upload_action_id = $uploadActionId
+                    expected_active_inboxes = $expectedActiveCount
+                    state = [string]$uploadAction.status
+                    created = [bool]$uploadActionResult.Created
+                }
+                Save-RecoveryProgress -ActionId $actionId -ActionType "microsoft_recovery_reactivate" -Domain $domain -StepMap $stepMap -Summary $summary
+                Update-Domain -DomainId $targetDomainId -Fields @{
+                    status = "in_progress"
+                    interim_status = "Recovery - Sending Tool Upload Pending"
+                }
+                Update-RecoveryPool -RecoveryPoolId $recoveryPoolId -Fields @{
+                    last_error = $null
+                }
+                Requeue-ActionWithoutPenalty -Action $actionRecord -Reason "Waiting for sending-tool upload validation (action $uploadActionId)" -DelaySeconds $delaySeconds
+                return
+            }
+        }
     }
 
     $finalizeStep = Start-RecoveryStep -ActionId $actionId -ActionType "microsoft_recovery_reactivate" -Domain $domain -StepName "finalize_reactivation" -StepMap $stepMap -Summary $summary -Attempt ([int]$actionRecord.attempts)

@@ -34,7 +34,7 @@ services:
       - /bin/sh
       - -c
       - |
-        export NONPROFIT_GOOGLE_ACTION_TYPES="$${NONPROFIT_GOOGLE_ACTION_TYPES:-free_google_provision,free_google_cancel_domain}"
+        export NONPROFIT_GOOGLE_ACTION_TYPES="$${NONPROFIT_GOOGLE_ACTION_TYPES:-free_google_provision,free_google_cancel_domain,google_recovery_move}"
         export NONPROFIT_GOOGLE_POLL_SECONDS="$${NONPROFIT_GOOGLE_POLL_SECONDS:-10}"
         export NONPROFIT_GOOGLE_PLAYWRIGHT_HEADLESS="$${NONPROFIT_GOOGLE_PLAYWRIGHT_HEADLESS:-true}"
         export NONPROFIT_GOOGLE_REQUIRE_MFA_ENROLLMENT="$${NONPROFIT_GOOGLE_REQUIRE_MFA_ENROLLMENT:-true}"

@@ -30,7 +30,7 @@ To verify a live deploy after pushing:
 - `pixie_google_smartlead/`
   - canonical Google worker folder
   - `pixie-google-paid-worker` owns paid Google provisioning and Google inbox lifecycle updates
-  - `pixie-google-free-nonprofit-worker` owns free/nonprofit Google provisioning and cancellation
+  - `pixie-google-free-nonprofit-worker` owns free/nonprofit Google provisioning, cancellation, and Google Recovery Pool move-in
 
 - `hyper-tide-google-feat-add-users-smartlead/`
   - legacy Google reference folder
@@ -74,7 +74,7 @@ Recommended ownership:
 - `provision_inbox` -> `pixie-microsoft-rm-creation-process`
 - `microsoft_update_inboxes` -> `pixie-microsoft-rm-creation-process`
 - paid `google_*` lifecycle + provisioning actions -> `pixie-google-paid-worker`
-- `free_google_provision` and `free_google_cancel_domain` -> `pixie-google-free-nonprofit-worker`
+- `free_google_provision`, `free_google_cancel_domain`, and `google_recovery_move` -> `pixie-google-free-nonprofit-worker`
 
 ## Production compose topology
 

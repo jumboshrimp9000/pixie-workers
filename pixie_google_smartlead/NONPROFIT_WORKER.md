@@ -5,7 +5,7 @@
 The production Google deploy runs both compose services from this folder:
 
 - `pixie-google-paid-worker` runs `main.py` and owns paid Google `google_*` actions.
-- `pixie-google-free-nonprofit-worker` runs `main_nonprofit.py` and owns `free_google_provision` plus `free_google_cancel_domain`.
+- `pixie-google-free-nonprofit-worker` runs `main_nonprofit.py` and owns `free_google_provision`, `free_google_cancel_domain`, and `google_recovery_move`.
 
 Both services read `.env.worker`. Keep the nonprofit worker enabled while the free trial offer can enqueue `free_google_provision` actions; otherwise those actions will remain pending.
 
@@ -15,7 +15,7 @@ Use `docker compose up -d --build --remove-orphans pixie-google-paid-worker pixi
 
 Environment variables:
 
-- `NONPROFIT_GOOGLE_ACTION_TYPES=free_google_provision,free_google_cancel_domain`
+- `NONPROFIT_GOOGLE_ACTION_TYPES=free_google_provision,free_google_cancel_domain,google_recovery_move`
 - `NONPROFIT_GOOGLE_POLL_SECONDS=10`
 - `NONPROFIT_GOOGLE_ADMIN_OP_VAULT`
 - `NONPROFIT_GOOGLE_USER_OP_VAULT=icje7jpscrdm6xtlcr252zxinq`

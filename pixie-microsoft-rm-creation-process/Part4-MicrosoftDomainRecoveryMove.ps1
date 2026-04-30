@@ -39,14 +39,15 @@ $summary = [ordered]@{
 function Stop-RecoveryMove {
     param(
         [string]$ErrorMessage,
-        [string]$StepName = ""
+        [string]$StepName = "",
+        [string]$RecoveryStatus = "failed"
     )
 
     if ($StepName) {
         Fail-RecoveryStep -ActionId $actionId -ActionType "microsoft_recovery_move" -Domain $domain -StepMap $stepMap -Summary $summary -StepName $StepName -ErrorMessage $ErrorMessage
     }
     Update-RecoveryPool -RecoveryPoolId $recoveryPoolId -Fields @{
-        recovery_status = "failed"
+        recovery_status = $RecoveryStatus
         last_error = $ErrorMessage
     }
     Fail-Action -Action $actionRecord -ErrorMessage $ErrorMessage -DefaultMaxRetries 5
@@ -139,11 +140,7 @@ try {
             $acceptedRemoved = if ($DryRun) { $true } else { Remove-RecoveryAcceptedDomainFromExchange -Domain $domain }
             $graphRemove = if ($DryRun) { @{ Success = $true; Attempts = 0; DryRun = $true } } else { Remove-RecoveryDomainFromGraphWithRetry -Bearer $sourceBearer -Domain $domain -MaxAttempts 3 }
             if (-not $graphRemove.Success) {
-                Update-RecoveryPool -RecoveryPoolId $recoveryPoolId -Fields @{
-                    recovery_status = "failed_stuck_source"
-                    last_error = "failed_stuck_source"
-                }
-                Stop-RecoveryMove -ErrorMessage "failed_stuck_source" -StepName "teardown_source_tenant"
+                Stop-RecoveryMove -ErrorMessage "failed_stuck_source" -StepName "teardown_source_tenant" -RecoveryStatus "failed_stuck_source"
             }
 
             $summary.source_teardown = "completed"
@@ -170,6 +167,18 @@ try {
     $zoneId = Get-RecoveryPoolZoneId -RecoveryPoolRow $recoveryPool
     if (-not $zoneId) {
         Stop-RecoveryMove -ErrorMessage "Missing Cloudflare zone for recovery move" -StepName "rewrite_cloudflare_dns"
+    }
+    if ([string]$recoveryPool.entry_source -eq "added_separately") {
+        $zoneStatus = Get-RecoveryCloudflareZoneStatus -ZoneId $zoneId
+        if ($zoneStatus -ne "active") {
+            Update-RecoveryPool -RecoveryPoolId $recoveryPoolId -Fields @{
+                recovery_status = "ns_pending"
+                last_error = "Waiting for Cloudflare nameservers to become active"
+            }
+            Complete-RecoveryStep -ActionId $actionId -ActionType "microsoft_recovery_move" -Domain $domain -StepMap $stepMap -Summary $summary -StepName "rewrite_cloudflare_dns" -Details @{ zone_id = $zoneId; zone_status = $zoneStatus; waiting = $true }
+            Requeue-ActionWithoutPenalty -Action $actionRecord -Reason "Waiting for Cloudflare nameservers to become active for $domain" -DelaySeconds 300
+            return
+        }
     }
 
     $recoveryTenant = Get-RecoveryTenant -RecoveryTenantId ([string]$recoveryPool.recovery_tenant_id)
@@ -259,7 +268,7 @@ try {
             Enable-RecoveryTenantSMTPAuth | Out-Null
             $roomResults = New-RecoveryRoomMailboxBulk -Domain $domain -Inboxes @(@{
                 id = $recoveryPoolId
-                username = "info"
+                username = "postmaster"
                 first_name = $domain
                 last_name = "Recovery"
             }) -Password $mailboxPassword -Bearer $recoveryBearer
@@ -269,7 +278,7 @@ try {
             }
         }
 
-        $recoveryMailbox = "info@$domain"
+        $recoveryMailbox = if ($recoveryPool.recovery_mailbox) { [string]$recoveryPool.recovery_mailbox } else { "postmaster@$domain" }
         $externalId = $null
         if (-not $DryRun) {
             $mailbox = Get-Mailbox -Identity $recoveryMailbox -ErrorAction SilentlyContinue
@@ -288,7 +297,7 @@ try {
 
     $instantlyStep = Start-RecoveryStep -ActionId $actionId -ActionType "microsoft_recovery_move" -Domain $domain -StepName "attach_recovery_mailbox_to_instantly" -StepMap $stepMap -Summary $summary -Attempt ([int]$actionRecord.attempts)
     if ([string]$instantlyStep.status -ne "completed") {
-        $recoveryMailbox = "info@$domain"
+        $recoveryMailbox = if ($recoveryPool.recovery_mailbox) { [string]$recoveryPool.recovery_mailbox } else { "postmaster@$domain" }
         $instantlyAccountId = if ($DryRun) { $recoveryMailbox } else { Add-RecoveryMailboxToInstantly -Email $recoveryMailbox -Password $env:RECOVERY_MAILBOX_PASSWORD }
         if (-not $DryRun) {
             Enable-RecoveryInstantlyWarmup -Email $recoveryMailbox | Out-Null
@@ -306,6 +315,7 @@ try {
         Update-RecoveryPool -RecoveryPoolId $recoveryPoolId -Fields @{
             blacklist_flags = $flags
             blacklist_checked_at = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
+            blacklist_delisting_status = if (@($flags).Count -gt 0 -and $recoveryPool.blacklist_authorized) { "outreach_pending" } elseif (@($flags).Count -gt 0) { "unsupported" } else { "clean" }
         }
         $summary.blacklist_count = @($flags).Count
         Complete-RecoveryStep -ActionId $actionId -ActionType "microsoft_recovery_move" -Domain $domain -StepMap $stepMap -Summary $summary -StepName "dnsbl_check" -Details @{ listings = @($flags).Count }

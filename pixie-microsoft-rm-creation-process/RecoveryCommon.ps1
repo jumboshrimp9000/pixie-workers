@@ -1,12 +1,12 @@
 . (Join-Path $PSScriptRoot "config.ps1")
 
 $script:RecoveryAzureCliPublicClientId = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
-$script:RecoveryDnsblZones = @(
-    "zen.spamhaus.org",
-    "b.barracudacentral.org",
-    "dnsbl.sorbs.net",
-    "bl.spamcop.net",
-    "sip.invaluement.com"
+$script:RecoveryDomainBlocklists = @(
+    @{ Name = "Spamhaus DBL"; Zone = "dbl.spamhaus.org"; Ignore = @("127.255.255.252", "127.255.255.254", "127.255.255.255", "127.0.1.255") },
+    @{ Name = "SURBL"; Zone = "multi.surbl.org"; Ignore = @() },
+    @{ Name = "URIBL"; Zone = "multi.uribl.com"; Ignore = @("127.0.0.1") },
+    @{ Name = "Abusix Domain Blocklist"; Zone = $(if ($env:ABUSIX_DOMAIN_BLOCKLIST_ZONE) { $env:ABUSIX_DOMAIN_BLOCKLIST_ZONE } elseif ($env:ABUSIX_API_KEY) { "$($env:ABUSIX_API_KEY).dblack.mail.abusix.zone" } else { "" }); Ignore = @() },
+    @{ Name = "Invaluement ivmURI"; Zone = $(if ($env:INVALUEMENT_IVMURI_ZONE) { $env:INVALUEMENT_IVMURI_ZONE } else { "ivmuri.dnsbl.invaluement.com" }); Ignore = @() }
 )
 
 function Ensure-RecoveryExchangeModule {
@@ -269,6 +269,178 @@ function Get-RecoveryActionPayloadValue {
     return $payload.$Key
 }
 
+function Get-RecoveryActiveDomainInboxes {
+    param([string]$DomainId)
+
+    $result = Invoke-SupabaseApi -Method GET -Table "inboxes" -Query "domain_id=eq.$DomainId&status=eq.active&order=created_at.asc&select=*"
+    if ($result.Success) { return @($result.Data) }
+    return @()
+}
+
+function Get-RecoveryDomainCredentialAssignments {
+    param([string]$DomainId)
+
+    $result = Invoke-SupabaseApi -Method GET -Table "domain_credentials" -Query "domain_id=eq.$DomainId&select=credential_id"
+    if ($result.Success) { return @($result.Data) }
+    return @()
+}
+
+function Get-RecoverySendingToolUploadActions {
+    param([string]$DomainId)
+
+    $result = Invoke-SupabaseApi -Method GET -Table "actions" -Query "domain_id=eq.$DomainId&type=eq.reupload_inboxes&order=created_at.desc&limit=20&select=*"
+    if ($result.Success) { return @($result.Data) }
+    return @()
+}
+
+function Test-RecoveryUploadActionMatchesReactivation {
+    param([object]$Action, [string]$RecoveryActionId)
+
+    if (-not $Action -or -not $Action.payload -or -not $RecoveryActionId) { return $false }
+    $payload = $Action.payload
+    if ($payload -is [string]) {
+        try { $payload = $payload | ConvertFrom-Json -Depth 20 } catch { $payload = $null }
+    }
+    if (-not $payload) { return $false }
+    return ([string]$payload.recovery_reactivate_action_id -eq $RecoveryActionId)
+}
+
+function New-RecoverySendingToolUploadAction {
+    param(
+        [object]$DomainRecord,
+        [string]$RecoveryActionId,
+        [int]$ExpectedActiveInboxCount,
+        [object]$SendingToolSettings = $null
+    )
+
+    $payload = @{
+        domain = $DomainRecord.domain
+        source = "microsoft_recovery_reactivate"
+        recovery_reactivate_action_id = $RecoveryActionId
+        expected_active_inboxes = $ExpectedActiveInboxCount
+    }
+
+    if ($SendingToolSettings) {
+        $payload.sending_tool_settings = $SendingToolSettings
+    }
+
+    $body = @{
+        customer_id = $DomainRecord.customer_id
+        domain_id = $DomainRecord.id
+        type = "reupload_inboxes"
+        status = "pending"
+        attempts = 0
+        max_attempts = 8
+        payload = $payload
+    }
+
+    $result = Invoke-SupabaseApi -Method POST -Table "actions" -Body $body
+    if ($result.Success -and $result.Data -and $result.Data.Count -gt 0) { return $result.Data[0] }
+    return $null
+}
+
+function Ensure-RecoverySendingToolUploadAction {
+    param(
+        [object]$DomainRecord,
+        [string]$RecoveryActionId,
+        [int]$ExpectedActiveInboxCount,
+        [object]$SendingToolSettings = $null
+    )
+
+    $credentialAssignments = @(Get-RecoveryDomainCredentialAssignments -DomainId $DomainRecord.id)
+    if ($credentialAssignments.Count -eq 0) {
+        return @{
+            Success = $false
+            Blocked = $true
+            Reason = "No saved sending-tool credential is assigned to this reactivated domain"
+        }
+    }
+
+    $uploadActions = @(Get-RecoverySendingToolUploadActions -DomainId $DomainRecord.id)
+    $matchingActions = @($uploadActions | Where-Object { Test-RecoveryUploadActionMatchesReactivation -Action $_ -RecoveryActionId $RecoveryActionId })
+
+    $existingOpenAction = $matchingActions | Where-Object { $_.status -in @("pending", "in_progress") } | Select-Object -First 1
+    if ($existingOpenAction) {
+        return @{ Success = $true; UploadAction = $existingOpenAction; Created = $false }
+    }
+
+    $existingCompletedAction = $matchingActions | Where-Object { $_.status -eq "completed" } | Select-Object -First 1
+    if ($existingCompletedAction) {
+        return @{ Success = $true; UploadAction = $existingCompletedAction; Created = $false }
+    }
+
+    $existingFailedAction = $matchingActions | Where-Object { $_.status -eq "failed" } | Select-Object -First 1
+    if ($existingFailedAction) {
+        return @{ Success = $true; UploadAction = $existingFailedAction; Created = $false }
+    }
+
+    $newAction = New-RecoverySendingToolUploadAction -DomainRecord $DomainRecord -RecoveryActionId $RecoveryActionId -ExpectedActiveInboxCount $ExpectedActiveInboxCount -SendingToolSettings $SendingToolSettings
+    if (-not $newAction) {
+        return @{
+            Success = $false
+            Blocked = $false
+            Reason = "Failed to enqueue reupload_inboxes action for recovery reactivation"
+        }
+    }
+
+    return @{ Success = $true; UploadAction = $newAction; Created = $true }
+}
+
+function Test-RecoverySendingToolUploadValidation {
+    param(
+        [object]$UploadAction,
+        [int]$ExpectedActiveInboxCount
+    )
+
+    if (-not $UploadAction) {
+        return @{ Complete = $false; Failed = $true; Reason = "Missing upload action" }
+    }
+
+    $status = [string]$UploadAction.status
+    if ($status -in @("pending", "in_progress")) {
+        return @{ Complete = $false; Failed = $false; Pending = $true; Reason = "Upload action is $status" }
+    }
+    if ($status -eq "failed") {
+        $errorMessage = if ($UploadAction.error) { [string]$UploadAction.error } else { "Upload action failed" }
+        return @{ Complete = $false; Failed = $true; Reason = $errorMessage }
+    }
+    if ($status -ne "completed") {
+        return @{ Complete = $false; Failed = $true; Reason = "Unexpected upload action status: $status" }
+    }
+
+    $result = $UploadAction.result
+    if ($result -is [string]) {
+        try { $result = $result | ConvertFrom-Json -Depth 20 } catch { $result = $null }
+    }
+    if (-not $result) {
+        return @{ Complete = $false; Failed = $true; Reason = "Upload action completed without result payload" }
+    }
+
+    $message = if ($result.PSObject.Properties.Name -contains "message") { [string]$result.message } else { "" }
+    if ($message -match "No sending tool credentials assigned") {
+        return @{ Complete = $false; Failed = $true; Reason = $message }
+    }
+
+    $uploaded = 0
+    if ($result.PSObject.Properties.Name -contains "uploaded" -and $null -ne $result.uploaded) {
+        try { $uploaded = [int]$result.uploaded } catch { $uploaded = 0 }
+    }
+
+    $failed = 0
+    if ($result.PSObject.Properties.Name -contains "failed" -and $null -ne $result.failed) {
+        try { $failed = [int]$result.failed } catch { $failed = 0 }
+    }
+
+    if ($failed -gt 0) {
+        return @{ Complete = $false; Failed = $true; Reason = "Upload validation completed with $failed failed inbox(es)" }
+    }
+    if ($uploaded -lt $ExpectedActiveInboxCount) {
+        return @{ Complete = $false; Failed = $true; Reason = "Upload validation confirmed $uploaded inbox(es), expected at least $ExpectedActiveInboxCount" }
+    }
+
+    return @{ Complete = $true; Failed = $false; Uploaded = $uploaded; FailedCount = $failed }
+}
+
 function Add-RecoveryActionLog {
     param(
         [object]$Action,
@@ -316,6 +488,18 @@ function Get-CloudflareDnsRecords {
         $page++
     } while ($response.result_info -and [int]$response.result_info.page -lt [int]$response.result_info.total_pages)
     return $records
+}
+
+function Get-RecoveryCloudflareZoneStatus {
+    param([string]$ZoneId)
+    if (-not $ZoneId) { return $null }
+    $headers = Get-RecoveryCloudflareHeaders
+    try {
+        $response = Invoke-RestMethod -Method GET -Uri "https://api.cloudflare.com/client/v4/zones/$ZoneId" -Headers $headers -UserAgent "pixie-worker/1.0" -TimeoutSec 30 -ErrorAction Stop
+        return [string]$response.result.status
+    } catch {
+        return $null
+    }
 }
 
 function Remove-CloudflareDnsRecord {
@@ -921,26 +1105,30 @@ function Get-RecoveryHealthLight {
 function Test-RecoveryDnsblListings {
     param([string]$Domain)
     $listings = @()
-    $ip = $null
-    try { $ip = (Resolve-DnsName -Name $Domain -Type A -QuickTimeout -ErrorAction Stop | Select-Object -First 1 -ExpandProperty IPAddress) } catch { }
-    if (-not $ip) { return @() }
-    $reversed = ($ip -split '\.')[-1..-4] -join '.'
-    foreach ($zone in $script:RecoveryDnsblZones) {
+    foreach ($item in $script:RecoveryDomainBlocklists) {
+        $zone = [string]$item.Zone
+        if (-not $zone) { continue }
         try {
             $job = Start-Job -ScriptBlock {
-                param($LookupName)
+                param($LookupName, $IgnoreCodes)
                 try {
-                    Resolve-DnsName -Name $LookupName -Type A -QuickTimeout -ErrorAction Stop | Out-Null
-                    return $true
+                    $records = @(Resolve-DnsName -Name $LookupName -Type A -QuickTimeout -ErrorAction Stop)
+                    foreach ($record in $records) {
+                        $ip = [string]$record.IPAddress
+                        if ($ip -and (-not (@($IgnoreCodes) -contains $ip))) {
+                            return $true
+                        }
+                    }
+                    return $false
                 } catch {
                     return $false
                 }
-            } -ArgumentList "$reversed.$zone"
+            } -ArgumentList "$Domain.$zone", @($item.Ignore)
             $finished = Wait-Job -Job $job -Timeout 2
             if ($finished) {
                 $listed = Receive-Job -Job $job
                 if ($listed) {
-                    $listings += @{ zone = $zone }
+                    $listings += @{ zone = [string]$item.Name }
                 }
             }
             Remove-Job -Job $job -Force | Out-Null
@@ -973,6 +1161,7 @@ function Remove-RecoveryTenantCapacityCount {
 
 function Get-RecoveryPoolZoneId {
     param([object]$RecoveryPoolRow)
+    if ($RecoveryPoolRow.cloudflare_zone_id) { return [string]$RecoveryPoolRow.cloudflare_zone_id }
     $previousConfig = $RecoveryPoolRow.previous_config
     if ($previousConfig -is [string]) {
         try { $previousConfig = $previousConfig | ConvertFrom-Json -Depth 20 } catch { $previousConfig = $null }
