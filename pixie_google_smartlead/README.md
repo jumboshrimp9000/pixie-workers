@@ -15,6 +15,8 @@ Paid Google service (`pixie-google-paid-worker`, `main.py`):
 Free/nonprofit Google service (`pixie-google-free-nonprofit-worker`, `main_nonprofit.py`):
 - `free_google_provision`
 - `free_google_cancel_domain`
+- `google_recovery_move`
+- `google_recovery_purge`
 
 Free/nonprofit actions use Google nonprofit panel credentials and do not call
 PartnerHub. Free Google promo domains must arrive as `free_google_provision`
@@ -68,6 +70,7 @@ Existing-domain lifecycle:
 Cancellation guardrail:
 - `google_cancel_domain` refuses free promo inboxes; those must use `free_google_cancel_domain`
 - `free_google_cancel_domain` removes nonprofit panel users and the domain before marking the order cancelled/releasing the panel assignment
+- `google_recovery_purge` removes the Recovery Pool mailbox/domain from the assigned nonprofit panel, releases the recovery panel assignment, and removes the `recovery_pool` row
 
 `google_update_inboxes` now also syncs tracked mutation state back to Supabase:
 - request status

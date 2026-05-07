@@ -18,7 +18,7 @@ class NonprofitGoogleCancelWorker:
         self.poll_interval_seconds = max(1.0, float(os.getenv("NONPROFIT_GOOGLE_POLL_SECONDS", "10")))
         self.batch_size = max(1, int(os.getenv("NONPROFIT_GOOGLE_BATCH_SIZE", "3")))
         self.max_retries = max(1, int(os.getenv("NONPROFIT_GOOGLE_MAX_RETRIES", "8")))
-        self.action_types = ["free_google_cancel_domain"]
+        self.action_types = ["free_google_cancel_domain", "google_recovery_purge"]
 
     def run_forever(self) -> None:
         logger.info("Nonprofit Google cancel worker started (poll=%.1fs)", self.poll_interval_seconds)
@@ -61,6 +61,7 @@ class NonprofitGoogleCancelWorker:
         }
         domain_id = str(action.get("domain_id") or "").strip()
         payload = action.get("payload") or {}
+        action_type = str(action.get("type") or "").strip()
 
         def start_step(name: str) -> Dict[str, Any]:
             row = {"step": name, "status": "in_progress", "startedAt": self._iso_now()}
@@ -98,6 +99,19 @@ class NonprofitGoogleCancelWorker:
                 pass
 
         try:
+            if action_type == "google_recovery_purge":
+                self._process_recovery_purge_action(
+                    action=action,
+                    payload=payload,
+                    steps=steps,
+                    start_step=start_step,
+                    complete_step=complete_step,
+                    checkpoint=checkpoint,
+                    persist=persist,
+                    log_event=log_event,
+                )
+                return
+
             if not domain_id:
                 raise RuntimeError("Action missing domain_id")
             domain = self.client.get_domain(domain_id)
@@ -313,6 +327,180 @@ class NonprofitGoogleCancelWorker:
             persist()
             log_event("action_failed", "error", str(exc))
             self.client.fail_action(action, str(exc), max_retries=self.max_retries)
+
+    def _process_recovery_purge_action(
+        self,
+        *,
+        action: Dict[str, Any],
+        payload: Dict[str, Any],
+        steps: List[Dict[str, Any]],
+        start_step: Any,
+        complete_step: Any,
+        checkpoint: Any,
+        persist: Any,
+        log_event: Any,
+    ) -> None:
+        recovery_pool_id = str(payload.get("recovery_pool_id") or "").strip()
+        if not recovery_pool_id:
+            raise RuntimeError("Missing recovery_pool_id")
+
+        recovery_pool = self._get_recovery_pool_row(recovery_pool_id)
+        if not recovery_pool:
+            result = {"skipped": True, "reason": "Recovery Pool row already removed", "recovery_pool_id": recovery_pool_id}
+            self.client.complete_action(action, result)
+            log_event("action_completed", "info", "Skipped Google recovery purge because row was already removed", result)
+            return
+
+        domain_name = str(recovery_pool.get("domain") or "").strip().lower()
+        if not domain_name:
+            raise RuntimeError("Recovery Pool row is missing domain")
+        mailbox_email = str(recovery_pool.get("recovery_mailbox") or f"postmaster@{domain_name}").strip().lower()
+
+        log_event(
+            "action_started",
+            "info",
+            f"Starting Google Recovery Pool purge for {domain_name}",
+            {"domain": domain_name, "recovery_pool_id": recovery_pool_id, "mailbox": mailbox_email},
+        )
+        self._update_recovery_pool(recovery_pool_id, {"recovery_status": "purging", "last_error": None})
+
+        panel_assignment = self._get_existing_recovery_panel_assignment(recovery_pool_id)
+        panel_client: Optional[NonprofitGooglePanelClient] = None
+        if not panel_assignment:
+            log_event(
+                "recovery_panel_assignment_missing",
+                "warn",
+                f"No recovery nonprofit panel assignment found for {domain_name}; skipping panel-side delete",
+                {"domain": domain_name, "recovery_pool_id": recovery_pool_id},
+            )
+        else:
+            panel = self._get_panel_record(str(panel_assignment.get("panel_id") or ""))
+            if not panel:
+                raise RuntimeError("Assigned recovery nonprofit panel not found")
+            creds = self._resolve_panel_credentials(panel)
+            panel_client = NonprofitGooglePanelClient(str(creds.get("apps_script_url") or ""))
+
+        if not checkpoint("delete_recovery_mailbox"):
+            if panel_client is None:
+                steps.append(
+                    {
+                        "step": "delete_recovery_mailbox",
+                        "status": "skipped",
+                        "details": {"reason": "No recovery nonprofit panel assignment found"},
+                    }
+                )
+            else:
+                step = start_step("delete_recovery_mailbox")
+                try:
+                    result = panel_client.delete_user(mailbox_email, permanent=True)
+                    if isinstance(result, dict) and result.get("success") is False:
+                        error_text = str(result.get("error") or result.get("message") or result.get("details") or result)
+                        if self._is_idempotent_delete_error(error_text):
+                            complete_step(step, {"email": mailbox_email, "result": result, "idempotent": True})
+                        else:
+                            raise RuntimeError(f"Recovery mailbox deletion failed: {error_text}")
+                    else:
+                        complete_step(step, {"email": mailbox_email, "result": result})
+                except Exception as exc:
+                    error_text = str(exc)
+                    if self._is_idempotent_delete_error(error_text):
+                        complete_step(
+                            step,
+                            {"email": mailbox_email, "result": {"success": False, "error": error_text}, "idempotent": True},
+                        )
+                    else:
+                        raise
+                persist()
+
+        if not checkpoint("remove_recovery_domain"):
+            if panel_client is None:
+                steps.append(
+                    {
+                        "step": "remove_recovery_domain",
+                        "status": "skipped",
+                        "details": {"reason": "No recovery nonprofit panel assignment found"},
+                    }
+                )
+            else:
+                step = start_step("remove_recovery_domain")
+                try:
+                    result = panel_client.delete_domain(domain_name)
+                    if isinstance(result, dict) and result.get("success") is False:
+                        error_text = str(result.get("error") or result.get("message") or result.get("details") or result)
+                        if self._is_idempotent_delete_error(error_text):
+                            complete_step(step, {"domain": domain_name, "result": result, "idempotent": True})
+                        else:
+                            raise RuntimeError(f"Recovery domain removal failed: {error_text}")
+                    else:
+                        complete_step(step, {"domain": domain_name, "result": result})
+                except Exception as exc:
+                    error_text = str(exc)
+                    if self._is_idempotent_delete_error(error_text):
+                        complete_step(
+                            step,
+                            {"domain": domain_name, "result": {"success": False, "error": error_text}, "idempotent": True},
+                        )
+                    else:
+                        raise
+                persist()
+
+        if not checkpoint("release_recovery_panel_assignment"):
+            if panel_assignment is None:
+                steps.append(
+                    {
+                        "step": "release_recovery_panel_assignment",
+                        "status": "skipped",
+                        "details": {"reason": "No recovery nonprofit panel assignment found"},
+                    }
+                )
+            else:
+                step = start_step("release_recovery_panel_assignment")
+                release = self._rpc("release_recovery_nonprofit_panel_assignment", {"p_recovery_pool_id": recovery_pool_id})
+                complete_step(step, release)
+                persist()
+
+        if not checkpoint("delete_recovery_pool_row"):
+            step = start_step("delete_recovery_pool_row")
+            self.client._request(  # type: ignore[attr-defined]
+                "DELETE",
+                "recovery_pool",
+                params={"id": f"eq.{recovery_pool_id}"},
+            )
+            complete_step(step, {"recovery_pool_id": recovery_pool_id})
+            persist()
+
+        result = {
+            "steps": steps,
+            "domain": domain_name,
+            "recovery_pool_id": recovery_pool_id,
+            "purged": True,
+        }
+        self.client.complete_action(action, result)
+        log_event("action_completed", "info", f"Purged Google Recovery Pool domain {domain_name}", result)
+
+    def _get_recovery_pool_row(self, recovery_pool_id: str) -> Optional[Dict[str, Any]]:
+        rows = self.client._request(  # type: ignore[attr-defined]
+            "GET",
+            "recovery_pool",
+            params={"select": "*", "id": f"eq.{recovery_pool_id}", "limit": "1"},
+        )
+        return rows[0] if rows else None
+
+    def _update_recovery_pool(self, recovery_pool_id: str, fields: Dict[str, Any]) -> None:
+        self.client._request(  # type: ignore[attr-defined]
+            "PATCH",
+            "recovery_pool",
+            params={"id": f"eq.{recovery_pool_id}"},
+            payload=fields,
+        )
+
+    def _get_existing_recovery_panel_assignment(self, recovery_pool_id: str) -> Optional[Dict[str, Any]]:
+        rows = self.client._request(  # type: ignore[attr-defined]
+            "GET",
+            "recovery_panel_assignments",
+            params={"select": "*", "recovery_pool_id": f"eq.{recovery_pool_id}", "status": "eq.assigned", "limit": "1"},
+        )
+        return rows[0] if rows else None
 
     def _get_existing_panel_assignment(self, domain_id: str) -> Optional[Dict[str, Any]]:
         rows = self.client._request(  # type: ignore[attr-defined]
