@@ -103,6 +103,13 @@ class SendingToolUploader:
                 credential=cred,
             )
 
+        if normalized_tool == "amplemarket":
+            return self._upload_amplemarket(
+                api_key=api_key,
+                inboxes=inboxes,
+                settings=self._normalize_settings(settings),
+            )
+
         return {
             "tool": normalized_tool or str(tool or ""),
             "total_candidates": len(inboxes),
@@ -629,6 +636,189 @@ class SendingToolUploader:
             missing_error_prefix="Smartlead account not found after validation",
             total_candidates=len(target_set),
         )
+
+    def _upload_amplemarket(
+        self,
+        *,
+        api_key: str,
+        inboxes: List[Dict[str, Any]],
+        settings: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        targets = [self._normalize_email(row.get("email")) for row in inboxes]
+        targets = [email for email in targets if email]
+        target_set = set(targets)
+        failed_uploads: List[Dict[str, str]] = []
+        uploaded_emails: Set[str] = set()
+
+        if not str(api_key or "").strip():
+            return {
+                "tool": "amplemarket",
+                "total_candidates": len(target_set),
+                "uploaded_emails": [],
+                "failed_uploads": [
+                    {"email": email, "error": "Missing Amplemarket API key"}
+                    for email in sorted(target_set)
+                ],
+                "skipped_already_uploaded": 0,
+            }
+
+        try:
+            mailboxes = self._fetch_amplemarket_mailboxes(api_key=api_key)
+        except Exception as exc:
+            return {
+                "tool": "amplemarket",
+                "total_candidates": len(target_set),
+                "uploaded_emails": [],
+                "failed_uploads": [
+                    {"email": email, "error": f"Amplemarket mailbox lookup failed ({exc})"}
+                    for email in sorted(target_set)
+                ],
+                "skipped_already_uploaded": 0,
+            }
+
+        mailbox_by_email: Dict[str, Dict[str, Any]] = {}
+        for mailbox in mailboxes:
+            email = self._normalize_email(mailbox.get("email"))
+            if not email:
+                continue
+            current = mailbox_by_email.get(email)
+            current_active = str((current or {}).get("status") or "").strip().lower() == "active"
+            next_active = str(mailbox.get("status") or "").strip().lower() == "active"
+            if current is None or (not current_active and next_active):
+                mailbox_by_email[email] = mailbox
+
+        apply_daily_limit = settings.get("applyRequested") is True and settings.get("dailyLimit") is not None
+        seen_failed: Set[str] = set()
+        for email in targets:
+            mailbox = mailbox_by_email.get(email)
+            if not mailbox:
+                if email not in seen_failed:
+                    failed_uploads.append({
+                        "email": email,
+                        "error": (
+                            "Amplemarket does not expose public mailbox creation. "
+                            "Connect this mailbox in Amplemarket, then retry upload validation."
+                        ),
+                    })
+                    seen_failed.add(email)
+                continue
+
+            status = str(mailbox.get("status") or "").strip().lower()
+            if status and status != "active":
+                if email not in seen_failed:
+                    failed_uploads.append({
+                        "email": email,
+                        "error": f"Amplemarket mailbox is {status}; reconnect or activate it before retrying.",
+                    })
+                    seen_failed.add(email)
+                continue
+
+            if apply_daily_limit:
+                try:
+                    self._apply_amplemarket_mailbox_settings(
+                        api_key=api_key,
+                        mailbox=mailbox,
+                        settings=settings,
+                    )
+                except Exception as exc:
+                    if email not in seen_failed:
+                        failed_uploads.append({
+                            "email": email,
+                            "error": f"Amplemarket settings apply failed ({exc})",
+                        })
+                        seen_failed.add(email)
+                    continue
+
+            uploaded_emails.add(email)
+
+        return {
+            "tool": "amplemarket",
+            "total_candidates": len(target_set),
+            "uploaded_emails": sorted(uploaded_emails),
+            "failed_uploads": failed_uploads,
+            "skipped_already_uploaded": 0,
+        }
+
+    def _fetch_amplemarket_mailboxes(self, *, api_key: str) -> List[Dict[str, Any]]:
+        mailboxes: List[Dict[str, Any]] = []
+        url = "https://api.amplemarket.com/mailboxes"
+        params: Optional[Dict[str, Any]] = {"page[size]": 20}
+        for _ in range(100):
+            response = requests.get(
+                url,
+                headers=self._amplemarket_headers(api_key),
+                params=params,
+                timeout=self.timeout_seconds,
+            )
+            if response.status_code >= 400:
+                raise RuntimeError(self._response_error(response))
+            payload = self._json_or_empty(response)
+            rows = payload.get("mailboxes") if isinstance(payload, dict) else []
+            if isinstance(rows, list):
+                for row in rows:
+                    mailbox = self._normalize_amplemarket_mailbox(row)
+                    if mailbox:
+                        mailboxes.append(mailbox)
+
+            links = payload.get("_links") if isinstance(payload, dict) else {}
+            next_href = str(((links or {}).get("next") or {}).get("href") or "").strip()
+            if not next_href:
+                break
+            url = next_href if next_href.startswith("http") else f"https://api.amplemarket.com{'' if next_href.startswith('/') else '/'}{next_href}"
+            params = None
+        return mailboxes
+
+    def _apply_amplemarket_mailbox_settings(
+        self,
+        *,
+        api_key: str,
+        mailbox: Dict[str, Any],
+        settings: Dict[str, Any],
+    ) -> None:
+        try:
+            daily_limit = int(round(float(settings.get("dailyLimit"))))
+        except Exception:
+            return
+        daily_limit = max(0, daily_limit)
+        if mailbox.get("daily_email_limit") == daily_limit:
+            return
+
+        mailbox_id = str(mailbox.get("id") or "").strip()
+        if not mailbox_id:
+            raise RuntimeError("Mailbox id is missing")
+        response = requests.patch(
+            f"https://api.amplemarket.com/mailboxes/{requests.utils.quote(mailbox_id)}",
+            headers=self._amplemarket_headers(api_key),
+            json={"daily_email_limit": daily_limit},
+            timeout=self.timeout_seconds,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(self._response_error(response))
+
+    @staticmethod
+    def _normalize_amplemarket_mailbox(row: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(row, dict):
+            return None
+        mailbox_id = str(row.get("id") or "").strip()
+        email = SendingToolUploader._normalize_email(row.get("email"))
+        if not mailbox_id or not email:
+            return None
+        result = dict(row)
+        result["id"] = mailbox_id
+        result["email"] = email
+        raw_daily_limit = result.get("daily_email_limit")
+        try:
+            result["daily_email_limit"] = int(round(float(raw_daily_limit)))
+        except Exception:
+            result["daily_email_limit"] = None
+        return result
+
+    @staticmethod
+    def _amplemarket_headers(api_key: str) -> Dict[str, str]:
+        return {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
 
     def _normalize_settings(self, settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         source = settings if isinstance(settings, dict) else {}
@@ -2570,6 +2760,8 @@ class SendingToolUploader:
             return "instantly.ai"
         if "smartlead" in text:
             return "smartlead.ai"
+        if "amplemarket" in text or "ample market" in text:
+            return "amplemarket"
         return text
 
     @staticmethod

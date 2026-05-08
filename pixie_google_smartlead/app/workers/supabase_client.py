@@ -42,7 +42,7 @@ CREDENTIAL_FAILURE_PATTERNS = [
 
 UPLOAD_FAILURE_PATTERNS = [
     re.compile(r"sending[- ]?tool|upload|re-?upload", re.I),
-    re.compile(r"instantly|smartlead|email[- ]?bison|plusvibe|pipl|masterinbox", re.I),
+    re.compile(r"instantly|smartlead|email[- ]?bison|plusvibe|pipl|ample[- ]?market|masterinbox", re.I),
 ]
 
 

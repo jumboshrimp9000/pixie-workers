@@ -1939,7 +1939,7 @@ class GoogleInboxLifecycleWorker:
             credential = tool_bundle.get("credential") or {}
             if not tool_slug:
                 raise RuntimeError(f"Sending tool slug missing on credential for domain {domain_name}")
-            if tool_slug not in {"instantly.ai", "smartlead.ai"}:
+            if tool_slug not in {"instantly.ai", "smartlead.ai", "amplemarket"}:
                 raise RuntimeError(f"Automated upload not implemented for {tool_slug} on domain {domain_name}")
 
             api_key = str(credential.get("api_key") or "").strip()
@@ -1950,7 +1950,11 @@ class GoogleInboxLifecycleWorker:
                 )
 
             op_client: Optional[OnePasswordCliClient] = None
-            if provider_name == "google" and self.sending_tool_playwright_oauth:
+            if (
+                provider_name == "google"
+                and self.sending_tool_playwright_oauth
+                and tool_slug in {"instantly.ai", "smartlead.ai"}
+            ):
                 try:
                     op_client = OnePasswordCliClient.from_env()
                 except Exception as op_exc:
@@ -2063,6 +2067,8 @@ class GoogleInboxLifecycleWorker:
             return "smartlead.ai"
         if "plusvibe" in text:
             return "plusvibe"
+        if "amplemarket" in text or "ample market" in text:
+            return "amplemarket"
         if "bison" in text:
             return "email-bison"
         if "master" in text:

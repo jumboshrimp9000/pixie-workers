@@ -1683,6 +1683,8 @@ class NonprofitGoogleProvisionWorker:
             return "instantly.ai"
         if "smartlead" in text:
             return "smartlead.ai"
+        if "amplemarket" in text or "ample market" in text:
+            return "amplemarket"
         return text
 
     def _resolve_google_admin_app_ids(self, payload: Dict[str, Any]) -> Dict[str, List[str]]:
