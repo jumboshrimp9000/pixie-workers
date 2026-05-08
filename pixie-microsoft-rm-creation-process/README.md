@@ -30,11 +30,12 @@ Part 2A: Microsoft provisioning (PowerShell)
   - enable email service
   - add M365 DNS records in Cloudflare
   - wait for Exchange sync
+  - grant SMTP+ tenants consent to the Simple Inboxes IMAP proxy app
   - create room mailboxes with unique temp display names
   - rename display names back to the requested values
   - disable calendar auto-processing
   - fix UPNs / primary SMTP state
-  - enable SMTP AUTH
+  - enable tenant SMTP AUTH, per-mailbox SMTP AUTH, and IMAP for SMTP/IMAP sending-tool upload
   - enable DKIM
   - enqueue `reupload_inboxes` for sending-tool upload/validation
   - finalize Supabase state only after upload validation confirms the expected active inbox count
@@ -65,6 +66,7 @@ PowerShell is required for the Exchange Online cmdlets that do not have a clean 
 - `New-Mailbox -Room`
 - `Set-CalendarProcessing`
 - `Set-Mailbox` mailbox-type / SMTP / alias operations
+- `Set-CASMailbox` per-mailbox SMTP AUTH / IMAP operations
 - `Get-DkimSigningConfig` / `Set-DkimSigningConfig` / `New-DkimSigningConfig`
 - `Set-TransportConfig -SmtpClientAuthenticationDisabled $false`
 - `Connect-ExchangeOnline`
@@ -80,6 +82,7 @@ Important behavior:
 - Microsoft does not allow duplicate display names during initial creation, so provisioning uses temporary display names and renames them back after creation
 - room mailboxes delete non-calendar items by default unless calendar auto-processing is disabled
 - this worker must run `Set-CalendarProcessing -AutomateProcessing None -DeleteNonCalendarItems $false`
+- SMTP+ uploads use the generated mailbox password for sending-tool SMTP/IMAP upload. SMTP goes to Microsoft directly; IMAP goes through `imap.simpleinboxes.com`, so this worker must grant the proxy app `IMAP.AccessAsUser.All` delegated tenant consent and run `Set-CASMailbox -SmtpClientAuthenticationDisabled $false -ImapEnabled $true` for each created mailbox before queuing `reupload_inboxes`.
 
 ## Sending Tool Upload Gate
 

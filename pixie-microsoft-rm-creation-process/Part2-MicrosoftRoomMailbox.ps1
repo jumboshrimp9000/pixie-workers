@@ -18,7 +18,7 @@
       9. Renames display names back to real names
      10. Disables calendar auto-processing (CRITICAL: prevents email deletion)
      11. Fixes UPNs
-     12. Enables SMTP AUTH
+     12. Enables tenant SMTP AUTH, per-mailbox SMTP AUTH, and IMAP
      13. Sets up DKIM
      14. Bulletproof final check
      15. Failsafe top-up
@@ -44,6 +44,11 @@ param(
 . (Join-Path $PSScriptRoot "config.ps1")
 
 $AzureCliPublicClientId = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
+$AzureAdPowerShellClientId = "1b730954-1685-4b74-9bfd-dac224a7b894"
+$ExchangeResourceAppId = "00000002-0000-0ff1-ce00-000000000000"
+$ImapProxyAppClientId = if ($env:IMAP_PROXY_CLIENT_ID) { $env:IMAP_PROXY_CLIENT_ID } else { "4abf3428-7905-494b-9184-bdca5d96e0d2" }
+$ImapProxyAppRoleId = "5e5addcd-3e8d-4e90-baf5-964efab2b20a"
+$ImapProxyDelegatedScope = "IMAP.AccessAsUser.All"
 
 # ============================================================================
 # CLOUDFLARE DNS FUNCTIONS
@@ -119,6 +124,27 @@ function Get-ROPCToken {
     }
 }
 
+function Get-DirectoryGraphToken {
+    param([string]$TenantId, [string]$Username, [string]$Password)
+
+    $tokenUrl = "https://login.microsoftonline.com/$TenantId/oauth2/token"
+    $body = @{
+        grant_type = "password"
+        client_id = $AzureAdPowerShellClientId
+        resource = "https://graph.microsoft.com"
+        username = $Username
+        password = $Password
+    }
+
+    try {
+        $response = Invoke-RestMethod -Method POST -Uri $tokenUrl -Body $body -ContentType "application/x-www-form-urlencoded" -TimeoutSec 30 -ErrorAction Stop
+        return $response.access_token
+    } catch {
+        Write-Log "Directory Graph token failed: $($_.Exception.Message)" -Level Warning
+        return $null
+    }
+}
+
 function Invoke-GraphRequest {
     param([string]$Method, [string]$Url, [string]$Bearer, [object]$Body = $null)
 
@@ -127,6 +153,89 @@ function Invoke-GraphRequest {
     if ($Body) { $params.Body = if ($Body -is [string]) { $Body } else { $Body | ConvertTo-Json -Depth 15 } }
 
     Invoke-RestMethod @params
+}
+
+function Get-ServicePrincipalByAppId {
+    param([string]$Bearer, [string]$AppId)
+
+    $filter = [System.Uri]::EscapeDataString("appId eq '$AppId'")
+    $result = Invoke-GraphRequest -Method GET -Url "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=$filter" -Bearer $Bearer
+    if ($result.value -and $result.value.Count -gt 0) {
+        return $result.value[0]
+    }
+    return $null
+}
+
+function Ensure-ServicePrincipal {
+    param([string]$Bearer, [string]$AppId, [string]$Label)
+
+    $existing = Get-ServicePrincipalByAppId -Bearer $Bearer -AppId $AppId
+    if ($existing) { return $existing }
+
+    Write-Log "Creating $Label service principal..." -Level Info
+    $created = Invoke-GraphRequest -Method POST -Url "https://graph.microsoft.com/v1.0/servicePrincipals" -Bearer $Bearer -Body @{ appId = $AppId }
+    Start-Sleep -Seconds 2
+    return $created
+}
+
+function Ensure-ImapProxyTenantConsent {
+    param([string]$Bearer, [string]$Domain)
+
+    try {
+        if (-not $ImapProxyAppClientId) {
+            return @{ Success = $false; Error = "IMAP proxy client id is not configured" }
+        }
+
+        $proxySp = Ensure-ServicePrincipal -Bearer $Bearer -AppId $ImapProxyAppClientId -Label "IMAP proxy"
+        $exchangeSp = Ensure-ServicePrincipal -Bearer $Bearer -AppId $ExchangeResourceAppId -Label "Exchange Online"
+        if (-not $proxySp -or -not $exchangeSp) {
+            return @{ Success = $false; Error = "Could not resolve IMAP proxy or Exchange service principal" }
+        }
+
+        $assignments = Invoke-GraphRequest -Method GET -Url "https://graph.microsoft.com/v1.0/servicePrincipals/$($proxySp.id)/appRoleAssignments" -Bearer $Bearer
+        $hasAppRole = $false
+        if ($assignments.value) {
+            $hasAppRole = [bool]($assignments.value | Where-Object { $_.resourceId -eq $exchangeSp.id -and $_.appRoleId -eq $ImapProxyAppRoleId } | Select-Object -First 1)
+        }
+        if (-not $hasAppRole) {
+            Invoke-GraphRequest -Method POST -Url "https://graph.microsoft.com/v1.0/servicePrincipals/$($proxySp.id)/appRoleAssignments" -Bearer $Bearer -Body @{
+                principalId = $proxySp.id
+                resourceId = $exchangeSp.id
+                appRoleId = $ImapProxyAppRoleId
+            } | Out-Null
+        }
+
+        $grantFilter = [System.Uri]::EscapeDataString("clientId eq '$($proxySp.id)' and resourceId eq '$($exchangeSp.id)'")
+        $grants = Invoke-GraphRequest -Method GET -Url "https://graph.microsoft.com/v1.0/oauth2PermissionGrants?`$filter=$grantFilter" -Bearer $Bearer
+        $grant = $null
+        if ($grants.value) {
+            $grant = $grants.value | Where-Object { $_.consentType -eq "AllPrincipals" } | Select-Object -First 1
+        }
+
+        if ($grant) {
+            $scopes = @()
+            if ($grant.scope) { $scopes = @($grant.scope -split "\s+" | Where-Object { $_ }) }
+            if ($scopes -notcontains $ImapProxyDelegatedScope) {
+                $scopes += $ImapProxyDelegatedScope
+                Invoke-GraphRequest -Method PATCH -Url "https://graph.microsoft.com/v1.0/oauth2PermissionGrants/$($grant.id)" -Bearer $Bearer -Body @{
+                    scope = (($scopes | Select-Object -Unique) -join " ")
+                } | Out-Null
+            }
+        } else {
+            Invoke-GraphRequest -Method POST -Url "https://graph.microsoft.com/v1.0/oauth2PermissionGrants" -Bearer $Bearer -Body @{
+                clientId = $proxySp.id
+                consentType = "AllPrincipals"
+                resourceId = $exchangeSp.id
+                scope = $ImapProxyDelegatedScope
+            } | Out-Null
+        }
+
+        Write-Log "IMAP proxy tenant consent confirmed for $Domain" -Level Success
+        return @{ Success = $true }
+    } catch {
+        Write-Log "IMAP proxy tenant consent failed: $($_.Exception.Message)" -Level Error
+        return @{ Success = $false; Error = $_.Exception.Message }
+    }
 }
 
 function Add-DomainToM365 {
@@ -998,6 +1107,48 @@ function Enable-TenantSMTPAuth {
     }
 }
 
+function Enable-MailboxClientAccessForDomain {
+    param([string]$Domain)
+
+    Write-Log "Enabling per-mailbox SMTP AUTH and IMAP for: $Domain" -Level Info
+    $mailboxes = Get-Mailbox -ResultSize Unlimited | Where-Object { $_.PrimarySmtpAddress -like "*@$Domain" }
+    $total = ($mailboxes | Measure-Object).Count
+    $enabled = 0
+    $failed = @()
+
+    foreach ($mb in $mailboxes) {
+        $email = $mb.PrimarySmtpAddress.ToString()
+        try {
+            Set-CASMailbox -Identity $email `
+                -SmtpClientAuthenticationDisabled $false `
+                -ImapEnabled $true `
+                -PopEnabled $false `
+                -ErrorAction Stop
+
+            $cas = Get-CASMailbox -Identity $email -ErrorAction SilentlyContinue
+            if ($cas -and $cas.SmtpClientAuthenticationDisabled -eq $false -and $cas.ImapEnabled -eq $true) {
+                $enabled++
+                Write-Log "Client access enabled: $email" -Level Success
+            } else {
+                $failed += "$email (verification did not show SMTP AUTH + IMAP enabled)"
+                Write-Log "Client access verification inconclusive: $email" -Level Warning
+            }
+        } catch {
+            $failed += "$email ($($_.Exception.Message))"
+            Write-Log "Failed to enable client access for ${email}: $($_.Exception.Message)" -Level Error
+        }
+    }
+
+    if ($total -eq 0) {
+        Write-Log "No mailboxes found for client access enablement" -Level Error
+        return @{ Success = $false; Total = 0; Enabled = 0; Failed = @("No mailboxes found") }
+    }
+
+    $success = ($failed.Count -eq 0 -and $enabled -eq $total)
+    Write-Log "Mailbox client access result: $enabled/$total enabled" -Level $(if ($success) { "Success" } else { "Warning" })
+    return @{ Success = $success; Total = $total; Enabled = $enabled; Failed = $failed }
+}
+
 # ============================================================================
 # UNBLOCK MAILBOXES + FIX UPNs
 # ============================================================================
@@ -1310,6 +1461,7 @@ function Process-MicrosoftDomain {
     $CustomerId = $DomainRecord.customer_id
     $ZoneId = $DomainRecord.cloudflare_zone_id
     $Source = $DomainRecord.source
+    $Provider = if ($DomainRecord.provider) { [string]$DomainRecord.provider } else { "microsoft" }
     $AdminEmail = $AdminRecord.email
     $AdminPassword = $AdminRecord.password
     $interimStatus = if ($DomainRecord.interim_status) { $DomainRecord.interim_status } else { "" }
@@ -1369,6 +1521,29 @@ function Process-MicrosoftDomain {
 
     # Configure user consent (non-fatal)
     Configure-UserConsent -Bearer $Bearer -TenantId $tenantId -AdminEmail $AdminEmail -AdminPassword $AdminPassword | Out-Null
+
+    if ($Provider -eq "smtp_plus") {
+        $consentBearer = Get-DirectoryGraphToken -TenantId $tenantId -Username $AdminEmail -Password $AdminPassword
+        if (-not $consentBearer) {
+            Write-Log "Using existing Graph token for IMAP proxy consent" -Level Warning
+            $consentBearer = $Bearer
+        }
+
+        $proxyConsent = Ensure-ImapProxyTenantConsent -Bearer $consentBearer -Domain $Domain
+        if (-not $proxyConsent.Success) {
+            $message = "IMAP proxy consent failed for SMTP+ upload: $($proxyConsent.Error)"
+            $history = Add-HistoryEntry -History $history -Entry "FAILED: $message"
+            Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "imap_proxy_consent_failed" -Severity "error" -Message $message -Metadata @{
+                provider = $Provider
+                domain = $Domain
+                next_action = "Confirm the Microsoft admin can grant tenant consent, then retry provisioning."
+            }
+            Update-Domain -DomainId $DomainId -Fields @{ interim_status = "Both - Failed"; action_history = $history }
+            Update-ActionStatus -ActionId $ActionId -Status "failed" -Error $message
+            return
+        }
+        $history = Add-HistoryEntry -History $history -Entry "IMAP proxy tenant consent confirmed"
+    }
 
     # Connect to Exchange Online
     if (-not $DryRun) {
@@ -1626,10 +1801,24 @@ function Process-MicrosoftDomain {
         $interimStatus = "Microsoft - Configuring Mailboxes"
     }
 
-    # ── STEP 9: SMTP AUTH ──
+    # ── STEP 9: SMTP AUTH + IMAP ──
     if ($interimStatus -eq "Microsoft - Configuring Mailboxes") {
-        if (-not $DryRun) { Enable-TenantSMTPAuth | Out-Null }
-        $history = Add-HistoryEntry -History $history -Entry "Tenant SMTP AUTH enabled"
+        if (-not $DryRun) {
+            $tenantSmtpOk = Enable-TenantSMTPAuth
+            $clientAccess = Enable-MailboxClientAccessForDomain -Domain $Domain
+            if (-not $tenantSmtpOk) { $failedSteps += "Tenant SMTP AUTH" }
+            if (-not $clientAccess.Success) {
+                $failedSteps += "Mailbox SMTP/IMAP Access"
+                Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "mailbox_client_access_failed" -Severity "error" -Message "SMTP/IMAP access could not be enabled for every mailbox" -Metadata @{
+                    enabled = $clientAccess.Enabled
+                    total = $clientAccess.Total
+                    failed = $clientAccess.Failed
+                }
+            }
+            $history = Add-HistoryEntry -History $history -Entry "Tenant SMTP AUTH enabled; mailbox SMTP/IMAP access $($clientAccess.Enabled)/$($clientAccess.Total)"
+        } else {
+            $history = Add-HistoryEntry -History $history -Entry "Tenant SMTP AUTH and mailbox SMTP/IMAP access enabled"
+        }
         Update-Domain -DomainId $DomainId -Fields @{ interim_status = "Microsoft - SMTP Enabled"; action_history = $history }
         $interimStatus = "Microsoft - SMTP Enabled"
     }
