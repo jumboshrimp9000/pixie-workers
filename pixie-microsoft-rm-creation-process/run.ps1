@@ -55,6 +55,59 @@ if ($nodeVersion -and -not (Test-Path $nodeModules)) {
     Pop-Location
 }
 
+function Reset-SmtpPlusUnknownProviderFailures {
+    if ($DryRun) {
+        Write-Log "Dry run: skipping SMTP+ unknown-provider self-heal" -Level Info
+        return
+    }
+
+    $encodedError = [uri]::EscapeDataString("Unknown provider: smtp_plus")
+    $query = "type=eq.provision_inbox&status=eq.failed&error=eq.$encodedError&order=updated_at.desc&limit=100&select=id,domain_id,customer_id,type,status,error,attempts,max_attempts"
+    $result = Invoke-SupabaseApi -Method GET -Table "actions" -Query $query
+    if (-not $result.Success) {
+        Write-Log "SMTP+ unknown-provider self-heal could not load failed actions" -Level Warning
+        return
+    }
+
+    $actions = @($result.Data)
+    if ($actions.Count -eq 0) { return }
+
+    $resetCount = 0
+    foreach ($failedAction in $actions) {
+        if (-not $failedAction.domain_id) { continue }
+        $domain = Get-Domain -DomainId ([string]$failedAction.domain_id)
+        if (-not $domain) { continue }
+
+        $provider = ([string]$domain.provider).Trim().ToLowerInvariant()
+        if ($provider -ne "smtp_plus") { continue }
+
+        $now = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $update = Invoke-SupabaseApi -Method PATCH -Table "actions" -Query "id=eq.$($failedAction.id)&status=eq.failed&error=eq.$encodedError" -Body @{
+            status = "pending"
+            error = $null
+            attempts = 0
+            next_retry_at = $null
+            started_at = $null
+            completed_at = $null
+            updated_at = $now
+        }
+
+        if ($update.Success -and @($update.Data).Count -gt 0) {
+            $resetCount += 1
+            Add-ActionLog -ActionId ([string]$failedAction.id) -DomainId ([string]$failedAction.domain_id) -CustomerId ([string]$failedAction.customer_id) -EventType "smtp_plus_provider_self_heal_queued" -Severity "info" -Message "Re-queued SMTP+ provisioning after worker routing fix" -Metadata @{
+                previous_error = [string]$failedAction.error
+                reset_at = $now
+            }
+        }
+    }
+
+    if ($resetCount -gt 0) {
+        Write-Log "Re-queued $resetCount SMTP+ provisioning action(s) that failed with Unknown provider: smtp_plus" -Level Success
+    }
+}
+
+Reset-SmtpPlusUnknownProviderFailures
+
 function Process-SingleAction {
     param([object]$Action)
 
