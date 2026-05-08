@@ -1953,7 +1953,7 @@ class GoogleInboxLifecycleWorker:
             if (
                 provider_name == "google"
                 and self.sending_tool_playwright_oauth
-                and tool_slug in {"instantly.ai", "smartlead.ai"}
+                and tool_slug in {"instantly.ai", "smartlead.ai", "amplemarket"}
             ):
                 try:
                     op_client = OnePasswordCliClient.from_env()

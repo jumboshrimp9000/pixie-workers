@@ -56,7 +56,7 @@ class SendingToolUploader:
         use_oauth_browser = (
             use_playwright_oauth
             and provider_name == "google"
-            and normalized_tool in {"instantly.ai", "smartlead.ai"}
+            and normalized_tool in {"instantly.ai", "smartlead.ai", "amplemarket"}
         )
         resolved_headless = self._as_bool(
             os.getenv("GOOGLE_PLAYWRIGHT_HEADLESS", "true"),
@@ -106,8 +106,14 @@ class SendingToolUploader:
         if normalized_tool == "amplemarket":
             return self._upload_amplemarket(
                 api_key=api_key,
+                amplemarket_username=str(cred.get("username") or "").strip(),
+                amplemarket_password=str(cred.get("password") or "").strip(),
                 inboxes=inboxes,
+                provider=provider_name,
                 settings=self._normalize_settings(settings),
+                onepassword=onepassword,
+                headless=resolved_headless,
+                use_browser=use_playwright_oauth,
             )
 
         return {
@@ -641,8 +647,14 @@ class SendingToolUploader:
         self,
         *,
         api_key: str,
+        amplemarket_username: str,
+        amplemarket_password: str,
         inboxes: List[Dict[str, Any]],
+        provider: str,
         settings: Dict[str, Any],
+        onepassword: Any,
+        headless: bool,
+        use_browser: bool,
     ) -> Dict[str, Any]:
         targets = [self._normalize_email(row.get("email")) for row in inboxes]
         targets = [email for email in targets if email]
@@ -662,6 +674,18 @@ class SendingToolUploader:
                 "skipped_already_uploaded": 0,
             }
 
+        if not str(amplemarket_username or "").strip() or not str(amplemarket_password or "").strip():
+            return {
+                "tool": "amplemarket",
+                "total_candidates": len(target_set),
+                "uploaded_emails": [],
+                "failed_uploads": [
+                    {"email": email, "error": "Missing Amplemarket username/password required for mailbox connection"}
+                    for email in sorted(target_set)
+                ],
+                "skipped_already_uploaded": 0,
+            }
+
         try:
             mailboxes = self._fetch_amplemarket_mailboxes(api_key=api_key)
         except Exception as exc:
@@ -676,16 +700,41 @@ class SendingToolUploader:
                 "skipped_already_uploaded": 0,
             }
 
-        mailbox_by_email: Dict[str, Dict[str, Any]] = {}
-        for mailbox in mailboxes:
-            email = self._normalize_email(mailbox.get("email"))
-            if not email:
-                continue
-            current = mailbox_by_email.get(email)
-            current_active = str((current or {}).get("status") or "").strip().lower() == "active"
-            next_active = str(mailbox.get("status") or "").strip().lower() == "active"
-            if current is None or (not current_active and next_active):
-                mailbox_by_email[email] = mailbox
+        mailbox_by_email = self._index_amplemarket_mailboxes(mailboxes)
+        browser_errors: Dict[str, str] = {}
+        inboxes_needing_browser = [
+            row
+            for row in inboxes
+            if self._normalize_email(row.get("email"))
+            and (
+                self._normalize_email(row.get("email")) not in mailbox_by_email
+                or not self._amplemarket_mailbox_active(
+                    mailbox_by_email.get(self._normalize_email(row.get("email")))
+                )
+            )
+        ]
+        if inboxes_needing_browser and use_browser:
+            browser_errors = self._upload_amplemarket_via_browser(
+                username=amplemarket_username,
+                password=amplemarket_password,
+                inboxes=inboxes_needing_browser,
+                provider=provider,
+                onepassword=onepassword,
+                headless=headless,
+            )
+            try:
+                mailboxes = self._fetch_amplemarket_mailboxes(api_key=api_key)
+                mailbox_by_email = self._index_amplemarket_mailboxes(mailboxes)
+            except Exception as exc:
+                for row in inboxes_needing_browser:
+                    email = self._normalize_email(row.get("email"))
+                    if email and email not in browser_errors:
+                        browser_errors[email] = f"Amplemarket mailbox lookup failed after browser upload ({exc})"
+        elif inboxes_needing_browser:
+            for row in inboxes_needing_browser:
+                email = self._normalize_email(row.get("email"))
+                if email:
+                    browser_errors[email] = "Amplemarket browser mailbox upload is disabled"
 
         apply_daily_limit = settings.get("applyRequested") is True and settings.get("dailyLimit") is not None
         seen_failed: Set[str] = set()
@@ -693,22 +742,29 @@ class SendingToolUploader:
             mailbox = mailbox_by_email.get(email)
             if not mailbox:
                 if email not in seen_failed:
+                    browser_error = browser_errors.get(email)
                     failed_uploads.append({
                         "email": email,
                         "error": (
-                            "Amplemarket does not expose public mailbox creation. "
-                            "Connect this mailbox in Amplemarket, then retry upload validation."
+                            f"Amplemarket mailbox was not found after browser upload ({browser_error})"
+                            if browser_error
+                            else "Amplemarket mailbox was not found after browser upload. Confirm the mailbox can be added in Amplemarket Account Settings > Mailboxes."
                         ),
                     })
                     seen_failed.add(email)
                 continue
 
             status = str(mailbox.get("status") or "").strip().lower()
-            if status and status != "active":
+            if not self._amplemarket_mailbox_active(mailbox):
                 if email not in seen_failed:
+                    browser_error = browser_errors.get(email)
                     failed_uploads.append({
                         "email": email,
-                        "error": f"Amplemarket mailbox is {status}; reconnect or activate it before retrying.",
+                        "error": (
+                            f"Amplemarket mailbox is {status or 'not active'} after browser upload ({browser_error})"
+                            if browser_error
+                            else f"Amplemarket mailbox is {status or 'not active'}; reconnect or activate it before retrying."
+                        ),
                     })
                     seen_failed.add(email)
                 continue
@@ -738,6 +794,337 @@ class SendingToolUploader:
             "failed_uploads": failed_uploads,
             "skipped_already_uploaded": 0,
         }
+
+    def _index_amplemarket_mailboxes(self, mailboxes: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        mailbox_by_email: Dict[str, Dict[str, Any]] = {}
+        for mailbox in mailboxes:
+            email = self._normalize_email(mailbox.get("email"))
+            if not email:
+                continue
+            current = mailbox_by_email.get(email)
+            if current is None or (
+                not self._amplemarket_mailbox_active(current)
+                and self._amplemarket_mailbox_active(mailbox)
+            ):
+                mailbox_by_email[email] = mailbox
+        return mailbox_by_email
+
+    @staticmethod
+    def _amplemarket_mailbox_active(mailbox: Optional[Dict[str, Any]]) -> bool:
+        if not mailbox:
+            return False
+        status = str(mailbox.get("status") or "").strip().lower()
+        return status in {"", "active", "connected"}
+
+    def _upload_amplemarket_via_browser(
+        self,
+        *,
+        username: str,
+        password: str,
+        inboxes: List[Dict[str, Any]],
+        provider: str,
+        onepassword: Any,
+        headless: bool,
+    ) -> Dict[str, str]:
+        failures: Dict[str, str] = {}
+        if not inboxes:
+            return failures
+
+        browser = None
+        playwright = None
+        context = None
+        page = None
+        try:
+            from playwright.sync_api import sync_playwright
+
+            playwright = sync_playwright().start()
+            browser = self._launch_playwright_browser(playwright, headless=headless)
+            context, page = self._create_oauth_context_page(browser)
+            self._amplemarket_login(page, username, password)
+
+            for inbox in inboxes:
+                email = self._normalize_email(inbox.get("email"))
+                if not email:
+                    continue
+                try:
+                    self._connect_amplemarket_mailbox(
+                        page=page,
+                        context=context,
+                        inbox=inbox,
+                        provider=provider,
+                        onepassword=onepassword,
+                    )
+                except Exception as exc:
+                    failures[email] = str(exc)
+                    logger.warning("[SendingToolUploader:Amplemarket] Browser upload failed for %s: %s", email, exc)
+                    try:
+                        self._close_non_primary_pages(context, page)
+                    except Exception:
+                        pass
+        except Exception as exc:
+            message = str(exc)
+            logger.warning("[SendingToolUploader:Amplemarket] Browser upload session failed: %s", message)
+            for inbox in inboxes:
+                email = self._normalize_email(inbox.get("email"))
+                if email and email not in failures:
+                    failures[email] = message
+        finally:
+            self._close_oauth_context_page(context=context, page=page)
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+            if playwright is not None:
+                try:
+                    playwright.stop()
+                except Exception:
+                    pass
+        return failures
+
+    def _amplemarket_login(self, page: Any, username: str, password: str) -> None:
+        login_url = str(os.getenv("AMPLEMARKET_LOGIN_URL") or "https://app.amplemarket.com/login").strip()
+        page.goto(login_url, wait_until="domcontentloaded")
+        self._fill_any(
+            page,
+            [
+                "input[name='email']",
+                "input[type='email']",
+                "input[autocomplete='email']",
+                "input[placeholder*='email' i]",
+            ],
+            username,
+            timeout_ms=30_000,
+        )
+        self._fill_any(
+            page,
+            [
+                "input[name='password']",
+                "input[type='password']",
+                "input[autocomplete='current-password']",
+                "input[placeholder*='password' i]",
+            ],
+            password,
+            timeout_ms=30_000,
+        )
+        self._click_any(
+            page,
+            [
+                "button[type='submit']",
+                "button:has-text('Sign in')",
+                "button:has-text('Log in')",
+                "button:has-text('Login')",
+                "//button[contains(.,'Sign in') or contains(.,'Log in') or contains(.,'Login')]",
+            ],
+            timeout_ms=20_000,
+        )
+
+        end_at = time.time() + 35
+        while time.time() < end_at:
+            url = str(getattr(page, "url", "") or "").lower()
+            if "/login" not in url and "/signin" not in url:
+                return
+            if self._exists(page, ["text=Invalid", "text=incorrect", "text=Wrong"], timeout_ms=500):
+                raise RuntimeError("Amplemarket rejected the supplied username/password")
+            time.sleep(0.75)
+        raise RuntimeError("Amplemarket login did not complete")
+
+    def _connect_amplemarket_mailbox(
+        self,
+        *,
+        page: Any,
+        context: Any,
+        inbox: Dict[str, Any],
+        provider: str,
+        onepassword: Any,
+    ) -> None:
+        email = self._normalize_email(inbox.get("email"))
+        if not email:
+            raise RuntimeError("Missing inbox email")
+
+        self._open_amplemarket_mailboxes(page)
+        if provider == "google":
+            oauth_page = self._start_amplemarket_google_oauth(page=page, context=context, inbox=inbox)
+            if oauth_page is not None:
+                self._complete_google_signin_and_consent(
+                    page=oauth_page,
+                    context=context,
+                    email=email,
+                    password=str(inbox.get("password") or "").strip(),
+                    onepassword=onepassword,
+                )
+                time.sleep(2.0)
+                self._close_non_primary_pages(context, page)
+                self._click_any(
+                    page,
+                    [
+                        "button:has-text('Done')",
+                        "button:has-text('Finish')",
+                        "button:has-text('Confirm')",
+                        "button:has-text('Save')",
+                        "//button[contains(.,'Done') or contains(.,'Finish') or contains(.,'Confirm') or contains(.,'Save')]",
+                    ],
+                    timeout_ms=8_000,
+                    optional=True,
+                )
+                return
+
+        self._connect_amplemarket_imap_smtp(page=page, inbox=inbox)
+
+    def _open_amplemarket_mailboxes(self, page: Any) -> None:
+        mailboxes_url = str(
+            os.getenv("AMPLEMARKET_MAILBOXES_URL")
+            or "https://app.amplemarket.com/dashboard/settings/mailboxes"
+        ).strip()
+        page.goto(mailboxes_url, wait_until="domcontentloaded")
+        if self._exists(page, ["text=Mailboxes", "text=Add Mailbox", "text=Add mailbox"], timeout_ms=8_000):
+            return
+        self._click_any(
+            page,
+            [
+                "text='Account Settings'",
+                "text='Settings'",
+                "//a[contains(.,'Account Settings') or contains(.,'Settings')]",
+                "//button[contains(.,'Account Settings') or contains(.,'Settings')]",
+            ],
+            timeout_ms=8_000,
+            optional=True,
+        )
+        self._click_any(
+            page,
+            [
+                "text='Mailboxes'",
+                "//a[contains(.,'Mailboxes')]",
+                "//button[contains(.,'Mailboxes')]",
+            ],
+            timeout_ms=12_000,
+        )
+
+    def _start_amplemarket_google_oauth(self, *, page: Any, context: Any, inbox: Dict[str, Any]) -> Optional[Any]:
+        before_pages = list(context.pages)
+        self._click_any(
+            page,
+            [
+                "button:has-text('Add Mailbox')",
+                "button:has-text('Add mailbox')",
+                "button:has-text('+ Add Mailbox')",
+                "button:has-text('Connect Mailbox')",
+                "//button[contains(.,'Add Mailbox') or contains(.,'Add mailbox') or contains(.,'Connect Mailbox')]",
+            ],
+            timeout_ms=15_000,
+        )
+        clicked = self._click_any(
+            page,
+            [
+                "text='Google'",
+                "text='Gmail'",
+                "text='Google Workspace'",
+                "button:has-text('Google')",
+                "button:has-text('Gmail')",
+                "//button[contains(.,'Google') or contains(.,'Gmail')]",
+            ],
+            timeout_ms=8_000,
+            optional=True,
+        )
+        if not clicked:
+            return None
+        try:
+            self._fill_any(
+                page,
+                ["input[type='email']", "input[name*='email' i]", "input[placeholder*='email' i]"],
+                self._normalize_email(inbox.get("email")),
+                timeout_ms=5_000,
+            )
+        except Exception:
+            pass
+        self._click_any(
+            page,
+            [
+                "button:has-text('Connect')",
+                "button:has-text('Continue')",
+                "button:has-text('Next')",
+                "//button[contains(.,'Connect') or contains(.,'Continue') or contains(.,'Next')]",
+            ],
+            timeout_ms=8_000,
+            optional=True,
+        )
+
+        oauth_page = self._detect_oauth_page(context=context, fallback_page=page, previous_pages=before_pages)
+        url = str(getattr(oauth_page, "url", "") or "").lower()
+        return oauth_page if "accounts.google.com" in url or oauth_page is not page else None
+
+    def _connect_amplemarket_imap_smtp(self, *, page: Any, inbox: Dict[str, Any]) -> None:
+        email = self._normalize_email(inbox.get("email"))
+        password = str(inbox.get("password") or "").strip()
+        if not email or not password:
+            raise RuntimeError("Missing inbox email/password for Amplemarket IMAP/SMTP setup")
+
+        imap_host = str(inbox.get("imap_host") or os.getenv("SMTP_PLUS_IMAP_HOST") or os.getenv("IMAP_PROXY_HOST") or "imap.simpleinboxes.com").strip()
+        imap_port = str(inbox.get("imap_port") or os.getenv("SMTP_PLUS_IMAP_PORT") or os.getenv("IMAP_PROXY_PORT") or "993").strip()
+        smtp_host = str(inbox.get("smtp_host") or os.getenv("SMTP_PLUS_SMTP_HOST") or "smtp.office365.com").strip()
+        smtp_port = str(inbox.get("smtp_port") or os.getenv("SMTP_PLUS_SMTP_PORT") or "587").strip()
+
+        self._click_any(
+            page,
+            [
+                "button:has-text('Add Mailbox')",
+                "button:has-text('Add mailbox')",
+                "button:has-text('+ Add Mailbox')",
+                "button:has-text('Connect Mailbox')",
+                "//button[contains(.,'Add Mailbox') or contains(.,'Add mailbox') or contains(.,'Connect Mailbox')]",
+            ],
+            timeout_ms=15_000,
+            optional=True,
+        )
+        self._click_any(
+            page,
+            [
+                "text='IMAP/SMTP Setup'",
+                "text='IMAP/SMTP'",
+                "text='SMTP'",
+                "button:has-text('IMAP/SMTP')",
+                "button:has-text('SMTP')",
+                "//button[contains(.,'IMAP') or contains(.,'SMTP')]",
+            ],
+            timeout_ms=12_000,
+            optional=True,
+        )
+        self._fill_any(
+            page,
+            [
+                "input[type='email']",
+                "input[name*='email' i]",
+                "input[placeholder*='email' i]",
+                "//label[contains(translate(normalize-space(.),'EMAIL','email'),'email')]/following::input[1]",
+            ],
+            email,
+            timeout_ms=12_000,
+        )
+        for selectors, value in (
+            (["input[name*='username' i]", "input[placeholder*='username' i]", "//label[contains(translate(normalize-space(.),'USERNAME','username'),'username')]/following::input[1]"], email),
+            (["input[type='password']", "input[name*='password' i]", "input[placeholder*='password' i]"], password),
+            (["input[name='imap_host']", "input[name='imapHost']", "input[placeholder*='IMAP host' i]", "//label[contains(translate(normalize-space(.),'IMAPHOST','imaphost'),'imap') and contains(translate(normalize-space(.),'IMAPHOST','imaphost'),'host')]/following::input[1]"], imap_host),
+            (["input[name='imap_port']", "input[name='imapPort']", "input[placeholder*='IMAP port' i]", "//label[contains(translate(normalize-space(.),'IMAPPORT','imapport'),'imap') and contains(translate(normalize-space(.),'IMAPPORT','imapport'),'port')]/following::input[1]"], imap_port),
+            (["input[name='smtp_host']", "input[name='smtpHost']", "input[placeholder*='SMTP host' i]", "//label[contains(translate(normalize-space(.),'SMTPHOST','smtphost'),'smtp') and contains(translate(normalize-space(.),'SMTPHOST','smtphost'),'host')]/following::input[1]"], smtp_host),
+            (["input[name='smtp_port']", "input[name='smtpPort']", "input[placeholder*='SMTP port' i]", "//label[contains(translate(normalize-space(.),'SMTPPORT','smtpport'),'smtp') and contains(translate(normalize-space(.),'SMTPPORT','smtpport'),'port')]/following::input[1]"], smtp_port),
+        ):
+            try:
+                self._fill_any(page, selectors, value, timeout_ms=8_000)
+            except Exception:
+                pass
+
+        self._click_any(
+            page,
+            [
+                "button:has-text('Confirm')",
+                "button:has-text('Connect')",
+                "button:has-text('Save')",
+                "button[type='submit']",
+                "//button[contains(.,'Confirm') or contains(.,'Connect') or contains(.,'Save')]",
+            ],
+            timeout_ms=20_000,
+        )
+        time.sleep(2.0)
 
     def _fetch_amplemarket_mailboxes(self, *, api_key: str) -> List[Dict[str, Any]]:
         mailboxes: List[Dict[str, Any]] = []

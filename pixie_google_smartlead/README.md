@@ -34,7 +34,7 @@ Initial Google provisioning:
 - enable DKIM
 - enroll inboxes into authenticator-based 2FA
 - create/update 1Password items and store OTP secrets in Supabase
-- upload inboxes to the selected sending tool (Instantly/Smartlead via Playwright OAuth for Google domains; Amplemarket via API validation of already-connected mailboxes)
+- upload inboxes to the selected sending tool (Instantly/Smartlead via Playwright OAuth for Google domains; Amplemarket via login-backed mailbox connection plus API validation/settings updates)
 - validate each expected inbox in the sending-tool API before marking the step complete
 - apply post-upload sending-tool settings from `domains.fulfillment_settings` (warmup, limits, tags, and tool-specific fields)
 - require real sending-tool API keys in validation tests (placeholder/empty keys are invalid test setup)
