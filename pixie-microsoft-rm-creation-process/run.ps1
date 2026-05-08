@@ -108,9 +108,9 @@ function Process-SingleAction {
     Write-Host "────────────────────────────────────────────────────────────" -ForegroundColor White
 
     if ($actionType -eq "microsoft_update_inboxes") {
-        if ($domain.provider -ne "microsoft") {
-            Write-Log "Mutation action $actionId is attached to non-Microsoft domain $($domain.domain)" -Level Error
-            Fail-Action -Action $Action -ErrorMessage "microsoft_update_inboxes is only valid for Microsoft domains"
+        if ($domain.provider -ne "microsoft" -and $domain.provider -ne "smtp_plus") {
+            Write-Log "Mutation action $actionId is attached to non-Microsoft-backed domain $($domain.domain)" -Level Error
+            Fail-Action -Action $Action -ErrorMessage "microsoft_update_inboxes is only valid for Microsoft-backed domains"
             return
         }
 
@@ -129,9 +129,9 @@ function Process-SingleAction {
     }
 
     if ($actionType -eq "microsoft_cancel_domain") {
-        if ($domain.provider -ne "microsoft") {
-            Write-Log "Cancellation action $actionId is attached to non-Microsoft domain $($domain.domain)" -Level Error
-            Fail-Action -Action $Action -ErrorMessage "microsoft_cancel_domain is only valid for Microsoft domains"
+        if ($domain.provider -ne "microsoft" -and $domain.provider -ne "smtp_plus") {
+            Write-Log "Cancellation action $actionId is attached to non-Microsoft-backed domain $($domain.domain)" -Level Error
+            Fail-Action -Action $Action -ErrorMessage "microsoft_cancel_domain is only valid for Microsoft-backed domains"
             return
         }
 
@@ -201,7 +201,7 @@ function Process-SingleAction {
     }
 
     # ── PART 2: Microsoft Exchange Pipeline (PowerShell) ──
-    if ($domain.provider -eq "microsoft") {
+    if ($domain.provider -eq "microsoft" -or $domain.provider -eq "smtp_plus") {
         Write-Log "Running Part 2: Microsoft Room Mailbox Creation..." -Level Info
 
         $ps1Script = Join-Path $PSScriptRoot "Part2-MicrosoftRoomMailbox.ps1"

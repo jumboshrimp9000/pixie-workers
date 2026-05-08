@@ -163,8 +163,8 @@ if (-not $domainRecord) {
 }
 
 $domainName = [string]$domainRecord.domain
-if ([string]$domainRecord.provider -ne "microsoft") {
-    throw "Domain $domainName is not a Microsoft domain"
+if ([string]$domainRecord.provider -ne "microsoft" -and [string]$domainRecord.provider -ne "smtp_plus") {
+    throw "Domain $domainName is not a Microsoft-backed domain"
 }
 
 $steps = @()

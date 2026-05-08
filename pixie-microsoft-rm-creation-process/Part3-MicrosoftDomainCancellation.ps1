@@ -519,8 +519,8 @@ if (-not $script:DomainRecord) {
 $script:DomainName = [string]$script:DomainRecord.domain
 $script:CustomerId = [string]$script:DomainRecord.customer_id
 
-if ([string]$script:DomainRecord.provider -ne "microsoft") {
-    Update-ActionStatus -ActionId $ActionId -Status "failed" -Error "microsoft_cancel_domain is only valid for Microsoft domains"
+if ([string]$script:DomainRecord.provider -ne "microsoft" -and [string]$script:DomainRecord.provider -ne "smtp_plus") {
+    Update-ActionStatus -ActionId $ActionId -Status "failed" -Error "microsoft_cancel_domain is only valid for Microsoft-backed domains"
     throw "Domain $($script:DomainName) is not Microsoft provider"
 }
 
