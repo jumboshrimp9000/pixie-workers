@@ -20,6 +20,7 @@ jobs:
             git reset --hard origin/main
             git clean -fd
             cd pixie-microsoft-rm-creation-process
+            docker rm -f pixie-microsoft-worker || true
             docker compose up -d --build --remove-orphans pixie-microsoft
 
   deploy-google:
