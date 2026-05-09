@@ -163,7 +163,7 @@ if (-not $domainRecord) {
 }
 
 $domainName = [string]$domainRecord.domain
-if ([string]$domainRecord.provider -ne "microsoft" -and [string]$domainRecord.provider -ne "smtp_plus") {
+if ([string]$domainRecord.provider -ne "microsoft" -and [string]$domainRecord.provider -ne "smtp_plus" -and [string]$domainRecord.provider -ne "azure") {
     throw "Domain $domainName is not a Microsoft-backed domain"
 }
 

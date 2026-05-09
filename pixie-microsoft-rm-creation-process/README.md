@@ -1,9 +1,9 @@
-# Pixie Microsoft Room Mailbox Worker
+# Pixie Microsoft/Azure Mailbox Worker
 
-Hybrid TypeScript + PowerShell worker for Microsoft 365 room mailboxes. This folder is Supabase-native and owns three Microsoft action families:
+Hybrid TypeScript + PowerShell worker for Microsoft-backed mailbox provisioning. This folder is Supabase-native and owns three Microsoft-backed action families:
 
-- `provision_inbox` — initial domain + room mailbox provisioning
-- `microsoft_update_inboxes` — tracked rename / username-change mutations on existing room mailboxes
+- `provision_inbox` — initial domain + mailbox provisioning for `microsoft`, `smtp_plus`, and `azure` domains
+- `microsoft_update_inboxes` — tracked rename / username-change mutations on existing Microsoft-backed mailboxes
 - `microsoft_cancel_domain` — post-grace cancellation teardown and final state sync
 
 ## Architecture
@@ -31,10 +31,13 @@ Part 2A: Microsoft provisioning (PowerShell)
   - add M365 DNS records in Cloudflare
   - wait for Exchange sync
   - grant SMTP+ tenants consent to the Simple Inboxes IMAP proxy app
-  - create room mailboxes with unique temp display names
+  - create mailbox type by provider:
+    - `microsoft` / `smtp_plus`: room/resource mailboxes with unique temp display names
+    - `azure`: shared mailboxes with unique temp display names
   - rename display names back to the requested values
-  - disable calendar auto-processing
+  - disable calendar auto-processing for room/resource mailboxes
   - fix UPNs / primary SMTP state
+  - set password and unblock mailbox users in the same readiness step
   - enable tenant SMTP AUTH, per-mailbox SMTP AUTH, and IMAP for SMTP/IMAP sending-tool upload
   - enable DKIM
   - enqueue `reupload_inboxes` for sending-tool upload/validation
@@ -44,7 +47,7 @@ Part 2B: Microsoft inbox mutations (PowerShell)
   - load the queued mutation request/items from Supabase
   - acquire a lease on the domain's assigned Microsoft admin
   - connect Exchange Online
-  - rename the existing room mailbox in place
+  - rename the existing mailbox in place
   - update first name / last name / display name
   - update UPN / primary SMTP address
   - explicitly preserve the old email as an alias
@@ -64,6 +67,7 @@ Part 3: Microsoft cancellation teardown (PowerShell)
 PowerShell is required for the Exchange Online cmdlets that do not have a clean Graph replacement for this workflow:
 
 - `New-Mailbox -Room`
+- `New-Mailbox -Shared`
 - `Set-CalendarProcessing`
 - `Set-Mailbox` mailbox-type / SMTP / alias operations
 - `Set-CASMailbox` per-mailbox SMTP AUTH / IMAP operations
@@ -71,11 +75,11 @@ PowerShell is required for the Exchange Online cmdlets that do not have a clean 
 - `Set-TransportConfig -SmtpClientAuthenticationDisabled $false`
 - `Connect-ExchangeOnline`
 
-PowerShell is also the correct place for Microsoft rename-in-place mutations because alias preservation is part of the contract and Exchange has to be authoritative for that step.
+PowerShell is also the correct place for Microsoft-backed rename-in-place mutations because alias preservation is part of the contract and Exchange has to be authoritative for that step.
 
-## Room Mailbox Model
+## Mailbox Models
 
-This worker creates **room/resource mailboxes**, not shared mailboxes and not long-lived licensed users.
+For `microsoft` and `smtp_plus`, this worker creates **room/resource mailboxes**, not long-lived licensed users.
 
 Important behavior:
 - room mailboxes do not need a permanent user license after creation
@@ -84,9 +88,11 @@ Important behavior:
 - this worker must run `Set-CalendarProcessing -AutomateProcessing None -DeleteNonCalendarItems $false`
 - SMTP+ uploads use the generated mailbox password for sending-tool SMTP/IMAP upload. SMTP goes to Microsoft directly; IMAP goes through `imap.simpleinboxes.com`, so this worker must grant the proxy app `IMAP.AccessAsUser.All` delegated tenant consent and run `Set-CASMailbox -SmtpClientAuthenticationDisabled $false -ImapEnabled $true` for each created mailbox before queuing `reupload_inboxes`.
 
+For `azure`, this worker uses the same tenant, DNS, DKIM, upload, update, and cancellation lifecycle, but creates shared mailboxes with `New-Mailbox -Shared`. Azure username changes still run through `microsoft_update_inboxes`; cancellation still deletes only recipients/users whose email/UPN belongs to the cancelled domain.
+
 ## Sending Tool Upload Gate
 
-Microsoft provisioning does not mark a domain `active` immediately after DKIM. After room mailboxes are created and active inbox rows are verified, the worker enqueues a Supabase `actions.type='reupload_inboxes'` row with `payload.source='microsoft_provision'`.
+Microsoft-backed provisioning does not mark a domain `active` immediately after DKIM. After mailboxes are created and active inbox rows are verified, the worker enqueues a Supabase `actions.type='reupload_inboxes'` row with `payload.source='microsoft_provision'`.
 
 Endpoint strategy and tradeoff:
 - The PowerShell worker uses Supabase REST to enqueue and poll the existing `reupload_inboxes` action because the AP `ReuploadWorker` already owns provider-specific upload and API validation for Instantly/Smartlead.
@@ -96,12 +102,12 @@ Endpoint strategy and tradeoff:
 
 ## Microsoft Mutation Model
 
-`microsoft_update_inboxes` is the Microsoft equivalent of the Google tracked identity-change flow.
+`microsoft_update_inboxes` is the Microsoft-backed equivalent of the Google tracked identity-change flow.
 
 What it does:
 1. Reads a queued mutation action from `actions`
 2. Loads `domain_mutation_requests` and `domain_mutation_items`
-3. Renames the existing room mailbox instead of deleting + recreating it
+3. Renames the existing mailbox instead of deleting + recreating it
 4. Updates `userPrincipalName` and primary SMTP
 5. Explicitly re-adds the old email as an alias
 6. Updates the canonical `inboxes` row in Supabase
@@ -135,9 +141,9 @@ Do not run multiple workers on the same action type.
 
 Recommended ownership:
 - `prepare_domain` -> `AP` `DomainPreparationWorker`
-- `provision_inbox` -> this folder
-- `microsoft_update_inboxes` -> this folder
-- `microsoft_cancel_domain` -> this folder
+- `provision_inbox` for `microsoft`, `smtp_plus`, and `azure` -> this folder
+- `microsoft_update_inboxes` for `microsoft`, `smtp_plus`, and `azure` -> this folder
+- `microsoft_cancel_domain` for `microsoft`, `smtp_plus`, and `azure` -> this folder
 - Google action types -> `job-workers/pixie_google_smartlead`
 
 The AP backend still contains in-process Microsoft worker code, but if this external PowerShell worker is active, do not run both against the same Microsoft queue actions.

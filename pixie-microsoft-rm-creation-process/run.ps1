@@ -161,7 +161,7 @@ function Process-SingleAction {
     Write-Host "────────────────────────────────────────────────────────────" -ForegroundColor White
 
     if ($actionType -eq "microsoft_update_inboxes") {
-        if ($domain.provider -ne "microsoft" -and $domain.provider -ne "smtp_plus") {
+        if ($domain.provider -ne "microsoft" -and $domain.provider -ne "smtp_plus" -and $domain.provider -ne "azure") {
             Write-Log "Mutation action $actionId is attached to non-Microsoft-backed domain $($domain.domain)" -Level Error
             Fail-Action -Action $Action -ErrorMessage "microsoft_update_inboxes is only valid for Microsoft-backed domains"
             return
@@ -182,7 +182,7 @@ function Process-SingleAction {
     }
 
     if ($actionType -eq "microsoft_cancel_domain") {
-        if ($domain.provider -ne "microsoft" -and $domain.provider -ne "smtp_plus") {
+        if ($domain.provider -ne "microsoft" -and $domain.provider -ne "smtp_plus" -and $domain.provider -ne "azure") {
             Write-Log "Cancellation action $actionId is attached to non-Microsoft-backed domain $($domain.domain)" -Level Error
             Fail-Action -Action $Action -ErrorMessage "microsoft_cancel_domain is only valid for Microsoft-backed domains"
             return
@@ -254,8 +254,9 @@ function Process-SingleAction {
     }
 
     # ── PART 2: Microsoft Exchange Pipeline (PowerShell) ──
-    if ($domain.provider -eq "microsoft" -or $domain.provider -eq "smtp_plus") {
-        Write-Log "Running Part 2: Microsoft Room Mailbox Creation..." -Level Info
+    if ($domain.provider -eq "microsoft" -or $domain.provider -eq "smtp_plus" -or $domain.provider -eq "azure") {
+        $part2Label = if ($domain.provider -eq "azure") { "Azure Mailbox Creation" } else { "Microsoft Room Mailbox Creation" }
+        Write-Log "Running Part 2: $part2Label..." -Level Info
 
         $ps1Script = Join-Path $PSScriptRoot "Part2-MicrosoftRoomMailbox.ps1"
         $part2Params = @{ DomainId = $domainId; ActionId = $actionId }

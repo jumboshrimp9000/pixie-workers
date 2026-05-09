@@ -105,7 +105,7 @@ try {
     if ([string]$teardownStep.status -ne "completed") {
         if ($sourceTeardownDone) {
             Complete-RecoveryStep -ActionId $actionId -ActionType "microsoft_recovery_move" -Domain $domain -StepMap $stepMap -Summary $summary -StepName "teardown_source_tenant" -Details @{ skipped = $true; reason = "source_teardown_done" }
-        } elseif ($provider -eq "microsoft" -or $provider -eq "smtp_plus") {
+        } elseif ($provider -eq "microsoft" -or $provider -eq "smtp_plus" -or $provider -eq "azure") {
             $assignedAdmin = if ($domainId) { Get-AssignedAdmin -DomainId $domainId } else { $null }
             $preferredAdminId = if ($assignedAdmin -and $assignedAdmin.id) { [string]$assignedAdmin.id } else { $null }
             $sourceAdminRecord = Acquire-MicrosoftAdminLock -ActionId $actionId -DomainId $domainId -PreferredAdminId $preferredAdminId

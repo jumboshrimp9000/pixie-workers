@@ -1088,6 +1088,160 @@ function New-RoomMailboxBulk {
 }
 
 # ============================================================================
+# AZURE MAILBOX CREATION
+#
+# Azure follows the same Microsoft-backed DNS, DKIM, upload, update, and
+# cancellation lifecycle. The only difference is the mailbox creation command.
+# ============================================================================
+function Set-MailboxAccountReady {
+    param(
+        [string]$Email,
+        [string]$Bearer,
+        [string]$Password,
+        [hashtable]$Headers = $null
+    )
+
+    if (-not $Headers) {
+        $Headers = @{ Authorization = "Bearer $Bearer"; "Content-Type" = "application/json" }
+    }
+
+    $userId = $null
+    try {
+        $mbx = Get-Mailbox -Identity $Email -ErrorAction SilentlyContinue
+        if ($mbx -and $mbx.ExternalDirectoryObjectId) {
+            $userId = [string]$mbx.ExternalDirectoryObjectId
+        }
+    } catch { }
+
+    if (-not $userId) {
+        try {
+            $user = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/$Email" -Headers $Headers -ErrorAction Stop
+            if ($user -and $user.id) { $userId = [string]$user.id }
+        } catch { }
+    }
+
+    if (-not $userId) {
+        Write-Log "Could not resolve Graph user for $Email" -Level Warning
+        return $false
+    }
+
+    Remove-OrphanUsersForEmail -Email $Email -CorrectUserId $userId -Headers $Headers | Out-Null
+
+    try { Set-Mailbox -Identity $Email -MicrosoftOnlineServicesID $Email -WindowsEmailAddress $Email -ErrorAction SilentlyContinue } catch { }
+
+    try {
+        $user = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/$userId" -Headers $Headers -ErrorAction Stop
+        $body = @{
+            accountEnabled = $true
+            passwordProfile = @{ forceChangePasswordNextSignIn = $false; password = $Password }
+        }
+        if ($user.userPrincipalName -ne $Email) { $body.userPrincipalName = $Email }
+        Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/$userId" -Method PATCH -Headers $Headers -Body ($body | ConvertTo-Json -Depth 4) -ErrorAction Stop | Out-Null
+        Write-Log "Password + unblock confirmed: $Email" -Level Success
+        return $true
+    } catch {
+        Write-Log "Password/unblock failed for ${Email}: $($_.Exception.Message)" -Level Warning
+        return $false
+    }
+}
+
+function New-AzureMailboxBulk {
+    param([string]$Domain, [array]$Inboxes, [string]$Password, [string]$Bearer)
+
+    Write-Log "Creating $($Inboxes.Count) Azure mailboxes for $Domain" -Level Info
+    $results = @{ Created = @(); Failed = @() }
+    $securePassword = ConvertTo-SecureString $Password -AsPlainText -Force
+    $headers = @{ Authorization = "Bearer $Bearer"; "Content-Type" = "application/json" }
+    $script:azureMailboxCounter = Get-Random -Minimum 10000 -Maximum 99999
+
+    $counter = 0
+    foreach ($inbox in $Inboxes) {
+        $counter++
+        $firstName = [string]$inbox.first_name
+        $lastName = [string]$inbox.last_name
+        $username = [string]$inbox.username
+        $email = "$username@$Domain"
+        $realDisplayName = "$firstName $lastName".Trim()
+        if (-not $realDisplayName) { $realDisplayName = $username }
+
+        $script:azureMailboxCounter++
+        $tempDisplayName = "$realDisplayName $($script:azureMailboxCounter)"
+
+        $existing = Get-Mailbox -Identity $email -ErrorAction SilentlyContinue
+        if ($existing) {
+            Write-Log "[$counter/$($Inboxes.Count)] Already exists ($($existing.RecipientTypeDetails)): $email" -Level Warning
+            Set-MailboxAccountReady -Email $email -Bearer $Bearer -Password $Password -Headers $headers | Out-Null
+            $results.Created += @{
+                InboxId = $inbox.id; Email = $email; FirstName = $firstName
+                LastName = $lastName; DisplayName = $realDisplayName
+                AlreadyExisted = $true
+            }
+            continue
+        }
+
+        Write-Log "[$counter/$($Inboxes.Count)] Creating Azure mailbox: $email" -Level Info
+        $createdOk = $false
+        try {
+            New-Mailbox -Shared -Name $tempDisplayName -DisplayName $tempDisplayName -PrimarySmtpAddress $email -Password $securePassword -ResetPasswordOnNextLogon $false -ErrorAction Stop | Out-Null
+            $createdOk = $true
+            Write-Log "Created Azure mailbox: $email" -Level Success
+        } catch {
+            $errorMsg = $_.Exception.Message
+            Write-Log "Direct Azure mailbox creation failed for ${email}: $errorMsg" -Level Warning
+
+            try {
+                $existingUser = $null
+                try { $existingUser = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/$email" -Headers $headers -ErrorAction Stop } catch { }
+                if ($existingUser) {
+                    Write-Log "User exists without mailbox; enabling mailbox for $email" -Level Warning
+                    Enable-Mailbox -Identity $email -PrimarySmtpAddress $email -ErrorAction Stop | Out-Null
+                    Start-Sleep -Seconds 10
+                    Set-Mailbox -Identity $email -Type Shared -ErrorAction Stop
+                    $createdOk = $true
+                    Write-Log "Enabled Azure mailbox for existing user: $email" -Level Success
+                }
+            } catch {
+                $errorMsg = $_.Exception.Message
+            }
+        }
+
+        if (-not $createdOk) {
+            $results.Failed += @{ InboxId = $inbox.id; Email = $email; Error = "Azure mailbox creation failed: $errorMsg" }
+            continue
+        }
+
+        for ($waitAttempt = 1; $waitAttempt -le 3; $waitAttempt++) {
+            $mbx = Get-Mailbox -Identity $email -ErrorAction SilentlyContinue
+            if ($mbx) { break }
+            Start-Sleep -Seconds 10
+        }
+
+        try {
+            Set-Mailbox -Identity $email -DisplayName $realDisplayName -Name $realDisplayName -Alias $username -MicrosoftOnlineServicesID $email -WindowsEmailAddress $email -ErrorAction Stop
+        } catch {
+            Write-Log "Failed to normalize Azure mailbox identity for ${email}: $($_.Exception.Message)" -Level Warning
+        }
+
+        try {
+            Set-User -Identity $email -DisplayName $realDisplayName -FirstName $firstName -LastName $lastName -ErrorAction SilentlyContinue
+        } catch { }
+
+        Set-MailboxAccountReady -Email $email -Bearer $Bearer -Password $Password -Headers $headers | Out-Null
+
+        $results.Created += @{
+            InboxId = $inbox.id; Email = $email; FirstName = $firstName
+            LastName = $lastName; DisplayName = $realDisplayName
+            TempDisplayName = $tempDisplayName; AlreadyExisted = $false
+        }
+
+        Start-Sleep -Seconds 3
+    }
+
+    Write-Log "Azure mailbox creation complete: $($results.Created.Count) created, $($results.Failed.Count) failed" -Level Info
+    return $results
+}
+
+# ============================================================================
 # SMTP AUTH
 # ============================================================================
 function Enable-TenantSMTPAuth {
@@ -1191,12 +1345,14 @@ function Unblock-DomainMailboxes {
 }
 
 # ============================================================================
-# BULLETPROOF CHECK (for Room mailboxes)
+# BULLETPROOF CHECK
 # ============================================================================
 function Invoke-BulletproofMailboxCheck {
-    param([string]$Domain, [string]$Bearer, [string]$Password, [int]$MaxRetries = 2)
+    param([string]$Domain, [string]$Bearer, [string]$Password, [string]$MailboxMode = "room", [int]$MaxRetries = 2)
 
-    Write-Log "========== BULLETPROOF FINAL CHECK: $Domain ==========" -Level Info
+    $isAzureMode = ([string]$MailboxMode).Trim().ToLowerInvariant() -eq "azure"
+    $modeLabel = if ($isAzureMode) { "Azure" } else { "Room" }
+    Write-Log "========== BULLETPROOF FINAL CHECK ($modeLabel): $Domain ==========" -Level Info
 
     $headers = @{ Authorization = "Bearer $Bearer"; "Content-Type" = "application/json" }
     $mailboxes = Get-Mailbox -ResultSize Unlimited | Where-Object { $_.PrimarySmtpAddress -like "*@$Domain" }
@@ -1209,31 +1365,41 @@ function Invoke-BulletproofMailboxCheck {
         $mailboxOk = $true
         $mailboxIssues = @()
 
-        # Verify it's a RoomMailbox
-        if ($mb.RecipientTypeDetails -ne "RoomMailbox") {
-            $mailboxOk = $false
-            $mailboxIssues += "NOT RoomMailbox (is $($mb.RecipientTypeDetails))"
-            try {
-                Set-Mailbox -Identity $email -Type Room -ErrorAction Stop
-                Write-Log "[$email] Converted to Room" -Level Success
-            } catch { Write-Log "[$email] Conversion failed: $($_.Exception.Message)" -Level Error }
-        }
+        if ($isAzureMode) {
+            if ($mb.RecipientTypeDetails -ne "SharedMailbox") {
+                $mailboxIssues += "NOT Azure mailbox type (is $($mb.RecipientTypeDetails))"
+                try {
+                    Set-Mailbox -Identity $email -Type Shared -ErrorAction Stop
+                    Write-Log "[$email] Converted to Azure mailbox type" -Level Success
+                } catch { Write-Log "[$email] Azure mailbox type conversion failed: $($_.Exception.Message)" -Level Error }
+            }
+        } else {
+            # Verify it's a RoomMailbox
+            if ($mb.RecipientTypeDetails -ne "RoomMailbox") {
+                $mailboxOk = $false
+                $mailboxIssues += "NOT RoomMailbox (is $($mb.RecipientTypeDetails))"
+                try {
+                    Set-Mailbox -Identity $email -Type Room -ErrorAction Stop
+                    Write-Log "[$email] Converted to Room" -Level Success
+                } catch { Write-Log "[$email] Conversion failed: $($_.Exception.Message)" -Level Error }
+            }
 
-        # Verify calendar processing is disabled
-        try {
-            $calProc = Get-CalendarProcessing -Identity $email -ErrorAction SilentlyContinue
-            if ($calProc -and $calProc.AutomateProcessing -ne "None") {
-                $mailboxIssues += "Calendar auto-processing is ON"
-                Set-CalendarProcessing -Identity $email -AutomateProcessing None -DeleteComments $false -DeleteSubject $false -RemovePrivateProperty $false -DeleteNonCalendarItems $false -ErrorAction Stop -WarningAction SilentlyContinue
-                Write-Log "[$email] Calendar processing fixed" -Level Success
+            # Verify calendar processing is disabled
+            try {
+                $calProc = Get-CalendarProcessing -Identity $email -ErrorAction SilentlyContinue
+                if ($calProc -and $calProc.AutomateProcessing -ne "None") {
+                    $mailboxIssues += "Calendar auto-processing is ON"
+                    Set-CalendarProcessing -Identity $email -AutomateProcessing None -DeleteComments $false -DeleteSubject $false -RemovePrivateProperty $false -DeleteNonCalendarItems $false -ErrorAction Stop -WarningAction SilentlyContinue
+                    Write-Log "[$email] Calendar processing fixed" -Level Success
+                }
+                if ($calProc -and $calProc.DeleteNonCalendarItems -eq $true) {
+                    $mailboxIssues += "DeleteNonCalendarItems is TRUE (emails would be deleted!)"
+                    Set-CalendarProcessing -Identity $email -DeleteNonCalendarItems $false -ErrorAction Stop -WarningAction SilentlyContinue
+                    Write-Log "[$email] DeleteNonCalendarItems set to false" -Level Success
+                }
+            } catch {
+                Write-Log "[$email] Calendar check failed: $($_.Exception.Message)" -Level Warning
             }
-            if ($calProc -and $calProc.DeleteNonCalendarItems -eq $true) {
-                $mailboxIssues += "DeleteNonCalendarItems is TRUE (emails would be deleted!)"
-                Set-CalendarProcessing -Identity $email -DeleteNonCalendarItems $false -ErrorAction Stop -WarningAction SilentlyContinue
-                Write-Log "[$email] DeleteNonCalendarItems set to false" -Level Success
-            }
-        } catch {
-            Write-Log "[$email] Calendar check failed: $($_.Exception.Message)" -Level Warning
         }
 
         # Check UPN + account via Graph
@@ -1462,6 +1628,10 @@ function Process-MicrosoftDomain {
     $ZoneId = $DomainRecord.cloudflare_zone_id
     $Source = $DomainRecord.source
     $Provider = if ($DomainRecord.provider) { [string]$DomainRecord.provider } else { "microsoft" }
+    $NormalizedProvider = $Provider.Trim().ToLowerInvariant()
+    $IsAzureProvider = $NormalizedProvider -eq "azure"
+    $MailboxMode = if ($IsAzureProvider) { "azure" } else { "room" }
+    $MailboxLabel = if ($IsAzureProvider) { "Azure mailboxes" } else { "room mailboxes" }
     $AdminEmail = $AdminRecord.email
     $AdminPassword = $AdminRecord.password
     $interimStatus = if ($DomainRecord.interim_status) { $DomainRecord.interim_status } else { "" }
@@ -1475,7 +1645,7 @@ function Process-MicrosoftDomain {
 
     Write-Host ""
     Write-Host "================================================================" -ForegroundColor Magenta
-    Write-Host "  Processing Domain (ROOM MAILBOX): $Domain" -ForegroundColor Magenta
+    Write-Host "  Processing Domain ($($MailboxLabel.ToUpperInvariant())): $Domain" -ForegroundColor Magenta
     Write-Host "  Admin: $AdminEmail | Interim: $interimStatus" -ForegroundColor Magenta
     Write-Host "  Inboxes: $($Inboxes.Count) | Zone: $ZoneId" -ForegroundColor Magenta
     Write-Host "================================================================" -ForegroundColor Magenta
@@ -1522,7 +1692,7 @@ function Process-MicrosoftDomain {
     # Configure user consent (non-fatal)
     Configure-UserConsent -Bearer $Bearer -TenantId $tenantId -AdminEmail $AdminEmail -AdminPassword $AdminPassword | Out-Null
 
-    if ($Provider -eq "smtp_plus") {
+    if ($NormalizedProvider -eq "smtp_plus") {
         $consentBearer = Get-DirectoryGraphToken -TenantId $tenantId -Username $AdminEmail -Password $AdminPassword
         if (-not $consentBearer) {
             Write-Log "Using existing Graph token for IMAP proxy consent" -Level Warning
@@ -1747,14 +1917,18 @@ function Process-MicrosoftDomain {
         $interimStatus = "Microsoft - Exchange Synced"
     }
 
-    # ── STEP 7: Create room mailboxes ──
+    # ── STEP 7: Create mailboxes ──
     $mailboxResults = $null
     if ($interimStatus -eq "Microsoft - Exchange Synced" -or $interimStatus -eq "Both - Creating Mailboxes") {
-        $history = Add-HistoryEntry -History $history -Entry "Creating $($Inboxes.Count) room mailboxes..."
+        $history = Add-HistoryEntry -History $history -Entry "Creating $($Inboxes.Count) $MailboxLabel..."
         Update-Domain -DomainId $DomainId -Fields @{ interim_status = "Both - Creating Mailboxes"; action_history = $history }
 
         if (-not $DryRun) {
-            $mailboxResults = New-RoomMailboxBulk -Domain $Domain -Inboxes $Inboxes -Password $InboxPassword -Bearer $Bearer
+            if ($IsAzureProvider) {
+                $mailboxResults = New-AzureMailboxBulk -Domain $Domain -Inboxes $Inboxes -Password $InboxPassword -Bearer $Bearer
+            } else {
+                $mailboxResults = New-RoomMailboxBulk -Domain $Domain -Inboxes $Inboxes -Password $InboxPassword -Bearer $Bearer
+            }
 
             if ($mailboxResults.Created.Count -eq 0) {
                 $history = Add-HistoryEntry -History $history -Entry "FAILED: No mailboxes created (0/$($Inboxes.Count))"
@@ -1790,7 +1964,7 @@ function Process-MicrosoftDomain {
             Unblock-DomainMailboxes -Domain $Domain -Bearer $Bearer -Password $InboxPassword
             $history = Add-HistoryEntry -History $history -Entry "Mailboxes unblocked"
 
-            $bulletproof = Invoke-BulletproofMailboxCheck -Domain $Domain -Bearer $Bearer -Password $InboxPassword
+            $bulletproof = Invoke-BulletproofMailboxCheck -Domain $Domain -Bearer $Bearer -Password $InboxPassword -MailboxMode $MailboxMode
             $history = Add-HistoryEntry -History $history -Entry "Bulletproof check: $($bulletproof.Passed)/$($bulletproof.Total) passed"
 
             if (-not $bulletproof.AllPassed) {
@@ -1867,9 +2041,9 @@ function Process-MicrosoftDomain {
             $history = $uploadState.History
 
             if ($uploadState.Complete) {
-                Write-Host "  [COMPLETE] $Domain - $actualCount room mailboxes, upload validated" -ForegroundColor Green
+                Write-Host "  [COMPLETE] $Domain - $actualCount $MailboxLabel, upload validated" -ForegroundColor Green
             } elseif ($uploadState.Pending) {
-                Write-Host "  [UPLOAD PENDING] $Domain - $actualCount room mailboxes, waiting for upload action $($uploadState.UploadActionId)" -ForegroundColor Yellow
+                Write-Host "  [UPLOAD PENDING] $Domain - $actualCount $MailboxLabel, waiting for upload action $($uploadState.UploadActionId)" -ForegroundColor Yellow
             } else {
                 Write-Host "  [PARTIAL] $Domain - Upload validation not complete" -ForegroundColor Yellow
             }
@@ -1906,7 +2080,7 @@ Import-Module ExchangeOnlineManagement -ErrorAction SilentlyContinue
 
 Write-Host ""
 Write-Host "=========================================================================" -ForegroundColor Cyan
-Write-Host "     Part 2: MICROSOFT ROOM MAILBOX CREATION (SUPABASE)" -ForegroundColor Cyan
+Write-Host "     Part 2: MICROSOFT/AZURE MAILBOX CREATION (SUPABASE)" -ForegroundColor Cyan
 Write-Host "=========================================================================" -ForegroundColor Cyan
 if ($DryRun) { Write-Host "                      *** DRY RUN MODE ***" -ForegroundColor Yellow }
 Write-Host ""
