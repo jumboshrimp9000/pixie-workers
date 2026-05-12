@@ -244,6 +244,30 @@ function Connect-RecoveryExchangeOnline {
     Connect-ExchangeOnline -Credential $creds -ShowBanner:$false -ErrorAction Stop
 }
 
+function Ensure-RecoveryExchangeOnlineConnected {
+    param([string]$Email, [string]$Password)
+
+    $script:RecoveryExchangeConnectionLastError = $null
+    $requiredCmdlets = @("Get-Mailbox", "New-Mailbox", "Set-Mailbox", "Get-AcceptedDomain", "Set-CASMailbox", "Get-CASMailbox")
+    $missing = @($requiredCmdlets | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) })
+    if ($missing.Count -eq 0) { return $true }
+
+    try {
+        Connect-RecoveryExchangeOnline -Email $Email -Password $Password
+    } catch {
+        $script:RecoveryExchangeConnectionLastError = $_.Exception.Message
+        return $false
+    }
+
+    $missingAfterConnect = @($requiredCmdlets | Where-Object { -not (Get-Command $_ -ErrorAction SilentlyContinue) })
+    if ($missingAfterConnect.Count -gt 0) {
+        $script:RecoveryExchangeConnectionLastError = "Exchange session missing cmdlet(s): $($missingAfterConnect -join ', ')"
+        return $false
+    }
+
+    return $true
+}
+
 function Get-RecoveryPoolRow {
     param([string]$RecoveryPoolId)
     $result = Invoke-SupabaseApi -Method GET -Table "recovery_pool" -Query "id=eq.$RecoveryPoolId&limit=1&select=*"

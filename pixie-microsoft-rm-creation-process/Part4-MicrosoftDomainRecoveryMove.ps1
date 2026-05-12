@@ -197,14 +197,12 @@ try {
     }
 
     $recoveryConnectStep = Start-RecoveryStep -ActionId $actionId -ActionType "microsoft_recovery_move" -Domain $domain -StepName "connect_recovery_tenant" -StepMap $stepMap -Summary $summary -Attempt ([int]$actionRecord.attempts)
-    if ([string]$recoveryConnectStep.status -ne "completed") {
-        if (-not $DryRun) {
-            try {
-                Connect-RecoveryExchangeOnline -Email $recoveryTenant.admin_email -Password $recoveryTenant.admin_password
-            } catch {
-                Stop-RecoveryMove -ErrorMessage "Recovery Exchange Online connection failed: $($_.Exception.Message)" -StepName "connect_recovery_tenant"
-            }
+    if (-not $DryRun) {
+        if (-not (Ensure-RecoveryExchangeOnlineConnected -Email $recoveryTenant.admin_email -Password $recoveryTenant.admin_password)) {
+            Stop-RecoveryMove -ErrorMessage "Recovery Exchange Online connection failed: $script:RecoveryExchangeConnectionLastError" -StepName "connect_recovery_tenant"
         }
+    }
+    if ([string]$recoveryConnectStep.status -ne "completed") {
         Complete-RecoveryStep -ActionId $actionId -ActionType "microsoft_recovery_move" -Domain $domain -StepMap $stepMap -Summary $summary -StepName "connect_recovery_tenant" -Details @{ tenant_id = $recoveryTenantId }
     }
 
