@@ -279,7 +279,7 @@ try {
 
             $recoveryMailboxForAccess = "postmaster@$domain"
             if (-not (Enable-RecoveryMailboxClientAccess -Email $recoveryMailboxForAccess)) {
-                Stop-RecoveryMove -ErrorMessage "Failed to enable SMTP AUTH/IMAP for recovery mailbox" -StepName "create_recovery_mailbox"
+                Stop-RecoveryMove -ErrorMessage "Failed to enable SMTP AUTH/IMAP for recovery mailbox: $script:RecoveryMailboxClientAccessLastError" -StepName "create_recovery_mailbox"
             }
         }
 
@@ -307,7 +307,7 @@ try {
             if (-not $DryRun) {
                 Enable-RecoveryTenantSMTPAuth | Out-Null
                 if (-not (Enable-RecoveryMailboxClientAccess -Email $recoveryMailbox)) {
-                    throw "Failed to enable SMTP AUTH/IMAP for recovery mailbox"
+                    throw "Failed to enable SMTP AUTH/IMAP for recovery mailbox: $script:RecoveryMailboxClientAccessLastError"
                 }
             }
             $instantlyAccountId = if ($DryRun) { $recoveryMailbox } else { Add-RecoveryMailboxToInstantly -Email $recoveryMailbox -Password $env:RECOVERY_MAILBOX_PASSWORD }

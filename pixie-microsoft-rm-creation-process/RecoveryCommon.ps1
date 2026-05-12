@@ -1006,6 +1006,7 @@ function Enable-RecoveryTenantSMTPAuth {
 
 function Enable-RecoveryMailboxClientAccess {
     param([string]$Email)
+    $script:RecoveryMailboxClientAccessLastError = $null
     if (-not $Email) { return $false }
     for ($attempt = 1; $attempt -le 5; $attempt++) {
         try {
@@ -1017,10 +1018,21 @@ function Enable-RecoveryMailboxClientAccess {
 
             $cas = Get-CASMailbox -Identity $Email -ErrorAction SilentlyContinue
             if ($cas -and $cas.SmtpClientAuthenticationDisabled -eq $false -and $cas.ImapEnabled -eq $true) {
+                $script:RecoveryMailboxClientAccessLastError = $null
                 return $true
             }
-        } catch { }
+            if ($cas) {
+                $script:RecoveryMailboxClientAccessLastError = "Verification failed: SmtpClientAuthenticationDisabled=$($cas.SmtpClientAuthenticationDisabled), ImapEnabled=$($cas.ImapEnabled)"
+            } else {
+                $script:RecoveryMailboxClientAccessLastError = "Verification failed: Get-CASMailbox returned no mailbox"
+            }
+        } catch {
+            $script:RecoveryMailboxClientAccessLastError = $_.Exception.Message
+        }
         if ($attempt -lt 5) { Start-Sleep -Seconds (15 * $attempt) }
+    }
+    if (-not $script:RecoveryMailboxClientAccessLastError) {
+        $script:RecoveryMailboxClientAccessLastError = "Unknown mailbox client-access failure"
     }
     return $false
 }
