@@ -276,6 +276,11 @@ try {
             if (@($roomResults.Created).Count -eq 0) {
                 Stop-RecoveryMove -ErrorMessage "Failed to create recovery room mailbox" -StepName "create_recovery_mailbox"
             }
+
+            $recoveryMailboxForAccess = "postmaster@$domain"
+            if (-not (Enable-RecoveryMailboxClientAccess -Email $recoveryMailboxForAccess)) {
+                Stop-RecoveryMove -ErrorMessage "Failed to enable SMTP AUTH/IMAP for recovery mailbox" -StepName "create_recovery_mailbox"
+            }
         }
 
         $recoveryMailbox = if ($recoveryPool.recovery_mailbox) { [string]$recoveryPool.recovery_mailbox } else { "postmaster@$domain" }

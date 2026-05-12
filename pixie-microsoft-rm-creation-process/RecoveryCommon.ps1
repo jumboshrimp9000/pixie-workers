@@ -1004,6 +1004,27 @@ function Enable-RecoveryTenantSMTPAuth {
     }
 }
 
+function Enable-RecoveryMailboxClientAccess {
+    param([string]$Email)
+    if (-not $Email) { return $false }
+    for ($attempt = 1; $attempt -le 5; $attempt++) {
+        try {
+            Set-CASMailbox -Identity $Email `
+                -SmtpClientAuthenticationDisabled $false `
+                -ImapEnabled $true `
+                -PopEnabled $false `
+                -ErrorAction Stop | Out-Null
+
+            $cas = Get-CASMailbox -Identity $Email -ErrorAction SilentlyContinue
+            if ($cas -and $cas.SmtpClientAuthenticationDisabled -eq $false -and $cas.ImapEnabled -eq $true) {
+                return $true
+            }
+        } catch { }
+        if ($attempt -lt 5) { Start-Sleep -Seconds (15 * $attempt) }
+    }
+    return $false
+}
+
 function Setup-RecoveryDomainDKIM {
     param([string]$Domain)
     $dk = $null
@@ -1055,14 +1076,32 @@ function Add-RecoveryMailboxToInstantly {
         [string]$Email,
         [string]$Password
     )
+    if (-not $env:INSTANTLY_RECOVERY_API_KEY) {
+        throw "INSTANTLY_RECOVERY_API_KEY is not configured"
+    }
+    try {
+        $existing = Get-RecoveryInstantlyAccount -InstantlyAccountId $Email
+        if ($existing) {
+            foreach ($candidate in @($existing.id, $existing.account_id, $existing.accountId, $existing.email, $Email)) {
+                if ($null -ne $candidate -and [string]$candidate) { return [string]$candidate }
+            }
+            return [string]$Email
+        }
+    } catch { }
+
     $body = @{
         email = $Email
-        password = $Password
-        smtp_host = "smtp.office365.com"
-        smtp_port = 587
+        first_name = "Postmaster"
+        last_name = "Recovery"
+        provider_code = 1
+        imap_username = $Email
+        imap_password = $Password
         imap_host = "outlook.office365.com"
         imap_port = 993
-        type = "microsoft"
+        smtp_username = $Email
+        smtp_password = $Password
+        smtp_host = "smtp.office365.com"
+        smtp_port = 587
     }
     try {
         $response = Invoke-RestMethod -Method POST -Uri "https://api.instantly.ai/api/v2/accounts" -Headers @{ Authorization = "Bearer $($env:INSTANTLY_RECOVERY_API_KEY)" } -Body ($body | ConvertTo-Json -Depth 10) -ContentType "application/json" -TimeoutSec 30 -ErrorAction Stop
