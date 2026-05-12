@@ -92,7 +92,7 @@ if (-not $recoveryTenant) {
     Stop-RecoveryPurge -ErrorMessage "Recovery tenant credentials not found" -StepName "connect_recovery_tenant"
 }
 
-$recoveryTenantId = if ($recoveryTenant.tenant_id) { [string]$recoveryTenant.tenant_id } else { Get-RecoveryTenantIdFromDomain -Domain (($recoveryTenant.admin_email -split '@')[1]) }
+$recoveryTenantId = Resolve-RecoveryTenantGraphId -RecoveryTenant $recoveryTenant
 $recoveryBearer = Get-RecoveryROPCToken -TenantId $recoveryTenantId -Username $recoveryTenant.admin_email -Password $recoveryTenant.admin_password
 if (-not $recoveryBearer) {
     Stop-RecoveryPurge -ErrorMessage "Failed to obtain recovery Graph token" -StepName "connect_recovery_tenant"

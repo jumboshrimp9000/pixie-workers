@@ -187,6 +187,29 @@ function Get-RecoveryTenantIdFromDomain {
     return $null
 }
 
+function Resolve-RecoveryTenantGraphId {
+    param([object]$RecoveryTenant)
+
+    if (-not $RecoveryTenant) { return $null }
+
+    $storedTenantId = if ($RecoveryTenant.tenant_id) { [string]$RecoveryTenant.tenant_id } else { "" }
+    $storedTenantId = $storedTenantId.Trim()
+
+    # Microsoft token endpoints accept a tenant GUID or verified domain. Some
+    # recovery rows store an internal display label, so resolve those from the
+    # admin's onmicrosoft.com domain instead.
+    if ($storedTenantId -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+        return $storedTenantId
+    }
+    if ($storedTenantId -match '\.') {
+        return $storedTenantId
+    }
+
+    $adminEmail = if ($RecoveryTenant.admin_email) { [string]$RecoveryTenant.admin_email } else { "" }
+    if ($adminEmail -notmatch '@') { return $null }
+    return Get-RecoveryTenantIdFromDomain -Domain (($adminEmail -split '@')[1])
+}
+
 function Get-RecoveryROPCToken {
     param(
         [string]$TenantId,

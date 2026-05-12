@@ -186,7 +186,7 @@ try {
         Stop-RecoveryMove -ErrorMessage "Recovery tenant credentials not found" -StepName "connect_recovery_tenant"
     }
 
-    $recoveryTenantId = if ($recoveryTenant.tenant_id) { [string]$recoveryTenant.tenant_id } else { Get-RecoveryTenantIdFromDomain -Domain (($recoveryTenant.admin_email -split '@')[1]) }
+    $recoveryTenantId = Resolve-RecoveryTenantGraphId -RecoveryTenant $recoveryTenant
     if (-not $recoveryTenantId) {
         Stop-RecoveryMove -ErrorMessage "Could not resolve recovery tenant id" -StepName "connect_recovery_tenant"
     }
