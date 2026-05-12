@@ -307,6 +307,10 @@ try {
                 if (-not (Enable-RecoveryMailboxClientAccess -Email $recoveryMailbox)) {
                     throw "Failed to enable SMTP AUTH/IMAP for recovery mailbox: $script:RecoveryMailboxClientAccessLastError"
                 }
+                $proxyConsent = Ensure-RecoveryImapProxyTenantConsent -Bearer $recoveryBearer -Domain $domain
+                if (-not $proxyConsent.Success) {
+                    throw "Failed to grant IMAP proxy tenant consent: $($proxyConsent.Error)"
+                }
             }
             $instantlyAccountId = if ($DryRun) { $recoveryMailbox } else { Add-RecoveryMailboxToInstantly -Email $recoveryMailbox -Password $env:RECOVERY_MAILBOX_PASSWORD }
             if (-not $DryRun) {

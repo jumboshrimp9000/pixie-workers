@@ -1,6 +1,10 @@
 . (Join-Path $PSScriptRoot "config.ps1")
 
 $script:RecoveryAzureCliPublicClientId = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
+$script:RecoveryExchangeResourceAppId = "00000002-0000-0ff1-ce00-000000000000"
+$script:RecoveryImapProxyAppClientId = if ($env:IMAP_PROXY_CLIENT_ID) { $env:IMAP_PROXY_CLIENT_ID } else { "4abf3428-7905-494b-9184-bdca5d96e0d2" }
+$script:RecoveryImapProxyAppRoleId = "5e5addcd-3e8d-4e90-baf5-964efab2b20a"
+$script:RecoveryImapProxyDelegatedScope = "IMAP.AccessAsUser.All"
 $script:RecoveryDomainBlocklists = @(
     @{ Name = "Spamhaus DBL"; Zone = "dbl.spamhaus.org"; Ignore = @("127.255.255.252", "127.255.255.254", "127.255.255.255", "127.0.1.255") },
     @{ Name = "SURBL"; Zone = "multi.surbl.org"; Ignore = @() },
@@ -173,6 +177,84 @@ function Invoke-RecoveryGraphRequest {
         $params.Body = if ($Body -is [string]) { $Body } else { $Body | ConvertTo-Json -Depth 20 }
     }
     Invoke-RestMethod @params
+}
+
+function Get-RecoveryServicePrincipalByAppId {
+    param([string]$Bearer, [string]$AppId)
+
+    $filter = [System.Uri]::EscapeDataString("appId eq '$AppId'")
+    $result = Invoke-RecoveryGraphRequest -Method GET -Url "https://graph.microsoft.com/v1.0/servicePrincipals?`$filter=$filter" -Bearer $Bearer
+    if ($result.value -and $result.value.Count -gt 0) { return $result.value[0] }
+    return $null
+}
+
+function Ensure-RecoveryServicePrincipal {
+    param([string]$Bearer, [string]$AppId, [string]$Label)
+
+    $existing = Get-RecoveryServicePrincipalByAppId -Bearer $Bearer -AppId $AppId
+    if ($existing) { return $existing }
+
+    $created = Invoke-RecoveryGraphRequest -Method POST -Url "https://graph.microsoft.com/v1.0/servicePrincipals" -Bearer $Bearer -Body @{ appId = $AppId }
+    Start-Sleep -Seconds 2
+    return $created
+}
+
+function Ensure-RecoveryImapProxyTenantConsent {
+    param([string]$Bearer, [string]$Domain)
+
+    try {
+        if (-not $script:RecoveryImapProxyAppClientId) {
+            return @{ Success = $false; Error = "IMAP proxy client id is not configured" }
+        }
+
+        $proxySp = Ensure-RecoveryServicePrincipal -Bearer $Bearer -AppId $script:RecoveryImapProxyAppClientId -Label "IMAP proxy"
+        $exchangeSp = Ensure-RecoveryServicePrincipal -Bearer $Bearer -AppId $script:RecoveryExchangeResourceAppId -Label "Exchange Online"
+        if (-not $proxySp -or -not $exchangeSp) {
+            return @{ Success = $false; Error = "Could not resolve IMAP proxy or Exchange service principal" }
+        }
+
+        $assignments = Invoke-RecoveryGraphRequest -Method GET -Url "https://graph.microsoft.com/v1.0/servicePrincipals/$($proxySp.id)/appRoleAssignments" -Bearer $Bearer
+        $hasAppRole = $false
+        if ($assignments.value) {
+            $hasAppRole = [bool]($assignments.value | Where-Object { $_.resourceId -eq $exchangeSp.id -and $_.appRoleId -eq $script:RecoveryImapProxyAppRoleId } | Select-Object -First 1)
+        }
+        if (-not $hasAppRole) {
+            Invoke-RecoveryGraphRequest -Method POST -Url "https://graph.microsoft.com/v1.0/servicePrincipals/$($proxySp.id)/appRoleAssignments" -Bearer $Bearer -Body @{
+                principalId = $proxySp.id
+                resourceId = $exchangeSp.id
+                appRoleId = $script:RecoveryImapProxyAppRoleId
+            } | Out-Null
+        }
+
+        $grantFilter = [System.Uri]::EscapeDataString("clientId eq '$($proxySp.id)' and resourceId eq '$($exchangeSp.id)'")
+        $grants = Invoke-RecoveryGraphRequest -Method GET -Url "https://graph.microsoft.com/v1.0/oauth2PermissionGrants?`$filter=$grantFilter" -Bearer $Bearer
+        $grant = $null
+        if ($grants.value) {
+            $grant = $grants.value | Where-Object { $_.consentType -eq "AllPrincipals" } | Select-Object -First 1
+        }
+
+        if ($grant) {
+            $scopes = @()
+            if ($grant.scope) { $scopes = @($grant.scope -split "\s+" | Where-Object { $_ }) }
+            if ($scopes -notcontains $script:RecoveryImapProxyDelegatedScope) {
+                $scopes += $script:RecoveryImapProxyDelegatedScope
+                Invoke-RecoveryGraphRequest -Method PATCH -Url "https://graph.microsoft.com/v1.0/oauth2PermissionGrants/$($grant.id)" -Bearer $Bearer -Body @{
+                    scope = (($scopes | Select-Object -Unique) -join " ")
+                } | Out-Null
+            }
+        } else {
+            Invoke-RecoveryGraphRequest -Method POST -Url "https://graph.microsoft.com/v1.0/oauth2PermissionGrants" -Bearer $Bearer -Body @{
+                clientId = $proxySp.id
+                consentType = "AllPrincipals"
+                resourceId = $exchangeSp.id
+                scope = $script:RecoveryImapProxyDelegatedScope
+            } | Out-Null
+        }
+
+        return @{ Success = $true }
+    } catch {
+        return @{ Success = $false; Error = $_.Exception.Message }
+    }
 }
 
 function Get-RecoveryTenantIdFromDomain {
@@ -1125,6 +1207,19 @@ function Add-RecoveryMailboxToInstantly {
         }
     } catch { }
 
+    $imapHost = if ($env:SMTP_PLUS_IMAP_HOST) { [string]$env:SMTP_PLUS_IMAP_HOST } elseif ($env:IMAP_PROXY_HOST) { [string]$env:IMAP_PROXY_HOST } else { "imap.simpleinboxes.com" }
+    $imapPort = 993
+    if ($env:SMTP_PLUS_IMAP_PORT) {
+        try { $imapPort = [int]$env:SMTP_PLUS_IMAP_PORT } catch { $imapPort = 993 }
+    } elseif ($env:IMAP_PROXY_PORT) {
+        try { $imapPort = [int]$env:IMAP_PROXY_PORT } catch { $imapPort = 993 }
+    }
+    $smtpHost = if ($env:SMTP_PLUS_SMTP_HOST) { [string]$env:SMTP_PLUS_SMTP_HOST } else { "smtp.office365.com" }
+    $smtpPort = 587
+    if ($env:SMTP_PLUS_SMTP_PORT) {
+        try { $smtpPort = [int]$env:SMTP_PLUS_SMTP_PORT } catch { $smtpPort = 587 }
+    }
+
     $body = @{
         email = $Email
         first_name = "Postmaster"
@@ -1132,12 +1227,12 @@ function Add-RecoveryMailboxToInstantly {
         provider_code = 1
         imap_username = $Email
         imap_password = $Password
-        imap_host = "outlook.office365.com"
-        imap_port = 993
+        imap_host = $imapHost
+        imap_port = $imapPort
         smtp_username = $Email
         smtp_password = $Password
-        smtp_host = "smtp.office365.com"
-        smtp_port = 587
+        smtp_host = $smtpHost
+        smtp_port = $smtpPort
     }
     try {
         $response = Invoke-RestMethod -Method POST -Uri "https://api.instantly.ai/api/v2/accounts" -Headers @{ Authorization = "Bearer $($env:INSTANTLY_RECOVERY_API_KEY)" } -Body ($body | ConvertTo-Json -Depth 10) -ContentType "application/json" -TimeoutSec 30 -ErrorAction Stop
