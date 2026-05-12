@@ -304,6 +304,12 @@ try {
     if ([string]$instantlyStep.status -ne "completed") {
         $recoveryMailbox = if ($recoveryPool.recovery_mailbox) { [string]$recoveryPool.recovery_mailbox } else { "postmaster@$domain" }
         try {
+            if (-not $DryRun) {
+                Enable-RecoveryTenantSMTPAuth | Out-Null
+                if (-not (Enable-RecoveryMailboxClientAccess -Email $recoveryMailbox)) {
+                    throw "Failed to enable SMTP AUTH/IMAP for recovery mailbox"
+                }
+            }
             $instantlyAccountId = if ($DryRun) { $recoveryMailbox } else { Add-RecoveryMailboxToInstantly -Email $recoveryMailbox -Password $env:RECOVERY_MAILBOX_PASSWORD }
             if (-not $DryRun) {
                 Enable-RecoveryInstantlyWarmup -Email $recoveryMailbox | Out-Null
