@@ -298,9 +298,13 @@ try {
     $instantlyStep = Start-RecoveryStep -ActionId $actionId -ActionType "microsoft_recovery_move" -Domain $domain -StepName "attach_recovery_mailbox_to_instantly" -StepMap $stepMap -Summary $summary -Attempt ([int]$actionRecord.attempts)
     if ([string]$instantlyStep.status -ne "completed") {
         $recoveryMailbox = if ($recoveryPool.recovery_mailbox) { [string]$recoveryPool.recovery_mailbox } else { "postmaster@$domain" }
-        $instantlyAccountId = if ($DryRun) { $recoveryMailbox } else { Add-RecoveryMailboxToInstantly -Email $recoveryMailbox -Password $env:RECOVERY_MAILBOX_PASSWORD }
-        if (-not $DryRun) {
-            Enable-RecoveryInstantlyWarmup -Email $recoveryMailbox | Out-Null
+        try {
+            $instantlyAccountId = if ($DryRun) { $recoveryMailbox } else { Add-RecoveryMailboxToInstantly -Email $recoveryMailbox -Password $env:RECOVERY_MAILBOX_PASSWORD }
+            if (-not $DryRun) {
+                Enable-RecoveryInstantlyWarmup -Email $recoveryMailbox | Out-Null
+            }
+        } catch {
+            Stop-RecoveryMove -ErrorMessage "Instantly recovery mailbox attach failed: $($_.Exception.Message)" -StepName "attach_recovery_mailbox_to_instantly"
         }
         Update-RecoveryPool -RecoveryPoolId $recoveryPoolId -Fields @{
             instantly_account_id = $instantlyAccountId

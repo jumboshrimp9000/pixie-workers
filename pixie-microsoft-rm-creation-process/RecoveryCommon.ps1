@@ -1064,7 +1064,15 @@ function Add-RecoveryMailboxToInstantly {
         imap_port = 993
         type = "microsoft"
     }
-    $response = Invoke-RestMethod -Method POST -Uri "https://api.instantly.ai/api/v2/accounts" -Headers @{ Authorization = "Bearer $($env:INSTANTLY_RECOVERY_API_KEY)" } -Body ($body | ConvertTo-Json -Depth 10) -ContentType "application/json" -TimeoutSec 30 -ErrorAction Stop
+    try {
+        $response = Invoke-RestMethod -Method POST -Uri "https://api.instantly.ai/api/v2/accounts" -Headers @{ Authorization = "Bearer $($env:INSTANTLY_RECOVERY_API_KEY)" } -Body ($body | ConvertTo-Json -Depth 10) -ContentType "application/json" -TimeoutSec 30 -ErrorAction Stop
+    } catch {
+        $message = $_.Exception.Message
+        if ($_.ErrorDetails.Message) {
+            $message = "$message :: $($_.ErrorDetails.Message)"
+        }
+        throw "Instantly account create failed for ${Email}: $message"
+    }
     foreach ($candidate in @($response.id, $response.account_id, $response.accountId, $response.email, $Email)) {
         if ($null -ne $candidate -and [string]$candidate) { return [string]$candidate }
     }
