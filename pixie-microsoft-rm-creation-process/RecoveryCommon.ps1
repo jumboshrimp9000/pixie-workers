@@ -1189,6 +1189,30 @@ function Complete-RecoveryDKIMSetup {
     return $false
 }
 
+function Find-RecoveryInstantlyAccountAfterUploadTimeout {
+    param(
+        [string]$Email,
+        [int]$Attempts = 12,
+        [int]$DelaySeconds = 10
+    )
+
+    if (-not $Email -or -not $env:INSTANTLY_RECOVERY_API_KEY) { return $null }
+    $escapedEmail = [System.Uri]::EscapeDataString($Email)
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try {
+            $response = Invoke-RestMethod -Method GET -Uri "https://api.instantly.ai/api/v2/accounts/$escapedEmail" -Headers @{ Authorization = "Bearer $($env:INSTANTLY_RECOVERY_API_KEY)" } -TimeoutSec 30 -ErrorAction Stop
+            $account = if ($response.account) { $response.account } else { $response }
+            foreach ($candidate in @($account.id, $account.account_id, $account.email, $Email)) {
+                if ($null -ne $candidate -and [string]$candidate) { return [string]$candidate }
+            }
+            return [string]$Email
+        } catch {
+            if ($attempt -lt $Attempts) { Start-Sleep -Seconds $DelaySeconds }
+        }
+    }
+    return $null
+}
+
 function Add-RecoveryMailboxToInstantly {
     param(
         [string]$RecoveryPoolId,
@@ -1198,6 +1222,9 @@ function Add-RecoveryMailboxToInstantly {
     )
     if (-not $Email) { throw "Recovery mailbox email is required for Instantly upload" }
     if (-not $Password) { throw "Recovery mailbox password is required for Instantly upload" }
+    $existingAccountId = Find-RecoveryInstantlyAccountAfterUploadTimeout -Email $Email -Attempts 1 -DelaySeconds 0
+    if ($existingAccountId) { return $existingAccountId }
+
     $recoveryUploadSecret = if ($env:RECOVERY_UPLOAD_SECRET) { [string]$env:RECOVERY_UPLOAD_SECRET } elseif ($env:CRON_SECRET) { [string]$env:CRON_SECRET } else { [string]$env:INSTANTLY_RECOVERY_API_KEY }
     if (-not $recoveryUploadSecret) { throw "RECOVERY_UPLOAD_SECRET, CRON_SECRET, or INSTANTLY_RECOVERY_API_KEY is required for Recovery Pool Instantly OAuth upload" }
 
@@ -1210,6 +1237,7 @@ function Add-RecoveryMailboxToInstantly {
         email = $Email
         password = $Password
         provider = $Provider
+        respondImmediately = $true
     }
     if ($env:INSTANTLY_RECOVERY_API_KEY) {
         $body.apiKey = [string]$env:INSTANTLY_RECOVERY_API_KEY
@@ -1222,10 +1250,19 @@ function Add-RecoveryMailboxToInstantly {
         if ($_.ErrorDetails.Message) {
             $message = "$message :: $($_.ErrorDetails.Message)"
         }
+        if ($message -match "504|Gateway Time-out|Gateway Timeout|timed out|operation has timed out|request.*aborted|request.*canceled") {
+            $completedAccountId = Find-RecoveryInstantlyAccountAfterUploadTimeout -Email $Email
+            if ($completedAccountId) { return $completedAccountId }
+        }
         throw "Instantly recovery OAuth upload failed for ${Email}: $message"
     }
     if (-not $response.success) {
         throw "Instantly recovery OAuth upload failed for ${Email}: $($response.message)"
+    }
+    if ($response.data -and $response.data.accepted) {
+        $completedAccountId = Find-RecoveryInstantlyAccountAfterUploadTimeout -Email $Email -Attempts 60 -DelaySeconds 10
+        if ($completedAccountId) { return $completedAccountId }
+        throw "Instantly recovery OAuth upload was accepted for ${Email}, but the account did not appear in Instantly before the timeout."
     }
     foreach ($candidate in @($response.data.accountId, $response.data.account_id, $response.data.email, $Email)) {
         if ($null -ne $candidate -and [string]$candidate) { return [string]$candidate }
