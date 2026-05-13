@@ -1191,59 +1191,42 @@ function Complete-RecoveryDKIMSetup {
 
 function Add-RecoveryMailboxToInstantly {
     param(
+        [string]$RecoveryPoolId,
         [string]$Email,
-        [string]$Password
+        [string]$Password,
+        [string]$Provider = "microsoft"
     )
-    if (-not $env:INSTANTLY_RECOVERY_API_KEY) {
-        throw "INSTANTLY_RECOVERY_API_KEY is not configured"
-    }
-    try {
-        $existing = Get-RecoveryInstantlyAccount -InstantlyAccountId $Email
-        if ($existing) {
-            foreach ($candidate in @($existing.id, $existing.account_id, $existing.accountId, $existing.email, $Email)) {
-                if ($null -ne $candidate -and [string]$candidate) { return [string]$candidate }
-            }
-            return [string]$Email
-        }
-    } catch { }
+    if (-not $Email) { throw "Recovery mailbox email is required for Instantly upload" }
+    if (-not $Password) { throw "Recovery mailbox password is required for Instantly upload" }
+    if (-not $env:CRON_SECRET) { throw "CRON_SECRET is required for Recovery Pool Instantly OAuth upload" }
 
-    $imapHost = if ($env:SMTP_PLUS_IMAP_HOST) { [string]$env:SMTP_PLUS_IMAP_HOST } elseif ($env:IMAP_PROXY_HOST) { [string]$env:IMAP_PROXY_HOST } else { "imap.simpleinboxes.com" }
-    $imapPort = 993
-    if ($env:SMTP_PLUS_IMAP_PORT) {
-        try { $imapPort = [int]$env:SMTP_PLUS_IMAP_PORT } catch { $imapPort = 993 }
-    } elseif ($env:IMAP_PROXY_PORT) {
-        try { $imapPort = [int]$env:IMAP_PROXY_PORT } catch { $imapPort = 993 }
-    }
-    $smtpHost = if ($env:SMTP_PLUS_SMTP_HOST) { [string]$env:SMTP_PLUS_SMTP_HOST } else { "smtp.office365.com" }
-    $smtpPort = 587
-    if ($env:SMTP_PLUS_SMTP_PORT) {
-        try { $smtpPort = [int]$env:SMTP_PLUS_SMTP_PORT } catch { $smtpPort = 587 }
-    }
+    $baseUrl = [string]$env:PIXIE_APP_API_BASE_URL
+    if (-not $baseUrl) { $baseUrl = "https://app.simpleinboxes.com/api/v1" }
+    $uri = "$($baseUrl.TrimEnd('/'))/internal/recovery/upload-instantly"
 
     $body = @{
+        recoveryPoolId = $RecoveryPoolId
         email = $Email
-        first_name = "Postmaster"
-        last_name = "Recovery"
-        provider_code = 1
-        imap_username = $Email
-        imap_password = $Password
-        imap_host = $imapHost
-        imap_port = $imapPort
-        smtp_username = $Email
-        smtp_password = $Password
-        smtp_host = $smtpHost
-        smtp_port = $smtpPort
+        password = $Password
+        provider = $Provider
     }
+    if ($env:INSTANTLY_RECOVERY_API_KEY) {
+        $body.apiKey = [string]$env:INSTANTLY_RECOVERY_API_KEY
+    }
+
     try {
-        $response = Invoke-RestMethod -Method POST -Uri "https://api.instantly.ai/api/v2/accounts" -Headers @{ Authorization = "Bearer $($env:INSTANTLY_RECOVERY_API_KEY)" } -Body ($body | ConvertTo-Json -Depth 10) -ContentType "application/json" -TimeoutSec 30 -ErrorAction Stop
+        $response = Invoke-RestMethod -Method POST -Uri $uri -Headers @{ "X-Cron-Secret" = $env:CRON_SECRET } -Body ($body | ConvertTo-Json -Depth 8) -ContentType "application/json" -TimeoutSec 600 -ErrorAction Stop
     } catch {
         $message = $_.Exception.Message
         if ($_.ErrorDetails.Message) {
             $message = "$message :: $($_.ErrorDetails.Message)"
         }
-        throw "Instantly account create failed for ${Email}: $message"
+        throw "Instantly recovery OAuth upload failed for ${Email}: $message"
     }
-    foreach ($candidate in @($response.id, $response.account_id, $response.accountId, $response.email, $Email)) {
+    if (-not $response.success) {
+        throw "Instantly recovery OAuth upload failed for ${Email}: $($response.message)"
+    }
+    foreach ($candidate in @($response.data.accountId, $response.data.account_id, $response.data.email, $Email)) {
         if ($null -ne $candidate -and [string]$candidate) { return [string]$candidate }
     }
     return [string]$Email

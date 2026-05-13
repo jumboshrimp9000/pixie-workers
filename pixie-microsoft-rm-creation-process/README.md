@@ -60,6 +60,11 @@ Part 3: Microsoft cancellation teardown (PowerShell)
   - remove remaining Graph users on the domain
   - remove accepted domain from Exchange (cleanup + retry loop)
   - set domain `cancelled` + inboxes `deleted` in Supabase
+
+Part 4: Recovery Pool move (PowerShell)
+  - create the `postmaster@domain` recovery mailbox
+  - upload it to Instantly through the app-side OAuth endpoint
+  - apply the fixed Recovery Pool warmup profile from the app upload path
 ```
 
 ## Why PowerShell
@@ -99,6 +104,10 @@ Endpoint strategy and tradeoff:
 - While upload is pending, the domain stays `status='in_progress'` with `interim_status='Both - Sending Tool Upload Pending'`; the `provision_inbox` action is requeued without consuming attempts.
 - The domain is marked `active` only when the upload action is `completed`, has zero failed uploads, and reports `uploaded >= active inbox count`.
 - If no sending-tool credential is assigned, or the upload action fails validation, provisioning stops in an actionable upload-blocked/failed state instead of pretending completion.
+
+## Recovery Pool Instantly Upload
+
+Recovery Pool mailbox upload must not use Instantly's SMTP/IMAP account-create API. The worker calls `POST /api/v1/internal/recovery/upload-instantly` with the recovery mailbox and lets the app run the provider OAuth upload path, then apply the Recovery Pool warmup settings.
 
 ## Microsoft Mutation Model
 

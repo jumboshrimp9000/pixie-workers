@@ -302,20 +302,7 @@ try {
     if ([string]$instantlyStep.status -ne "completed") {
         $recoveryMailbox = if ($recoveryPool.recovery_mailbox) { [string]$recoveryPool.recovery_mailbox } else { "postmaster@$domain" }
         try {
-            if (-not $DryRun) {
-                Enable-RecoveryTenantSMTPAuth | Out-Null
-                if (-not (Enable-RecoveryMailboxClientAccess -Email $recoveryMailbox)) {
-                    throw "Failed to enable SMTP AUTH/IMAP for recovery mailbox: $script:RecoveryMailboxClientAccessLastError"
-                }
-                $proxyConsent = Ensure-RecoveryImapProxyTenantConsent -Bearer $recoveryBearer -Domain $domain
-                if (-not $proxyConsent.Success) {
-                    throw "Failed to grant IMAP proxy tenant consent: $($proxyConsent.Error)"
-                }
-            }
-            $instantlyAccountId = if ($DryRun) { $recoveryMailbox } else { Add-RecoveryMailboxToInstantly -Email $recoveryMailbox -Password $env:RECOVERY_MAILBOX_PASSWORD }
-            if (-not $DryRun) {
-                Enable-RecoveryInstantlyWarmup -Email $recoveryMailbox | Out-Null
-            }
+            $instantlyAccountId = if ($DryRun) { $recoveryMailbox } else { Add-RecoveryMailboxToInstantly -RecoveryPoolId $recoveryPoolId -Email $recoveryMailbox -Password $env:RECOVERY_MAILBOX_PASSWORD -Provider "microsoft" }
         } catch {
             Stop-RecoveryMove -ErrorMessage "Instantly recovery mailbox attach failed: $($_.Exception.Message)" -StepName "attach_recovery_mailbox_to_instantly"
         }
@@ -323,7 +310,7 @@ try {
             instantly_account_id = $instantlyAccountId
         }
         $summary.instantly_account_id = $instantlyAccountId
-        Complete-RecoveryStep -ActionId $actionId -ActionType "microsoft_recovery_move" -Domain $domain -StepMap $stepMap -Summary $summary -StepName "attach_recovery_mailbox_to_instantly" -Details @{ instantly_account_id = $instantlyAccountId }
+        Complete-RecoveryStep -ActionId $actionId -ActionType "microsoft_recovery_move" -Domain $domain -StepMap $stepMap -Summary $summary -StepName "attach_recovery_mailbox_to_instantly" -Details @{ instantly_account_id = $instantlyAccountId; upload_method = "instantly_microsoft_oauth"; warmup = "10_per_day_slow_ramp_1_reply_60" }
     }
 
     $dnsblStep = Start-RecoveryStep -ActionId $actionId -ActionType "microsoft_recovery_move" -Domain $domain -StepName "dnsbl_check" -StepMap $stepMap -Summary $summary -Attempt ([int]$actionRecord.attempts)
