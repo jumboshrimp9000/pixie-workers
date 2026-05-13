@@ -712,39 +712,18 @@ class GoogleSupabaseWorker:
             create_users_checkpoint = checkpoint("create_users")
             user_updates = self._build_inbox_updates(domain_name, inboxes, partnerhub_users, payload)
             if create_users_checkpoint:
+                reconciled = self._apply_inbox_updates(inboxes, user_updates)
+                log_event(
+                    "step_info",
+                    "info",
+                    f"[create_users] Reconciled inbox roles for resumed Google order {domain_name}",
+                    reconciled,
+                )
                 persist_progress(INTERIM_STATUSES["USERS_CREATED"], "in_progress")
             else:
                 step = start_step("create_users")
-                updated = 0
-                admin_inbox_id = next(
-                    (
-                        str(inbox.get("id") or "").strip()
-                        for inbox in inboxes
-                        if bool((user_updates.get(str(inbox.get("id") or "")) or {}).get("is_admin"))
-                    ),
-                    "",
-                )
-                ordered_inboxes = sorted(
-                    inboxes,
-                    key=lambda row: 1
-                    if bool((user_updates.get(str(row.get("id") or "")) or {}).get("is_admin"))
-                    else 0,
-                )
-                for inbox in ordered_inboxes:
-                    update = user_updates.get(inbox["id"])
-                    if not update:
-                        continue
-                    self.client.update_inbox(
-                        inbox["id"],
-                        {
-                            "email": update["email"],
-                            "password": update["password"],
-                            "is_admin": bool(update.get("is_admin")),
-                            "status": "active",
-                        },
-                    )
-                    updated += 1
-                complete_step(step, {"updated": updated, "total": len(inboxes), "admin_inbox_id": admin_inbox_id})
+                update_summary = self._apply_inbox_updates(inboxes, user_updates)
+                complete_step(step, update_summary)
                 persist_progress(INTERIM_STATUSES["USERS_CREATED"], "in_progress")
 
             admin_checkpoint = checkpoint("resolve_admin_login")
@@ -1816,6 +1795,42 @@ class GoogleSupabaseWorker:
                 "is_admin": str(inbox.get("id") or "").strip() == admin_inbox_id,
             }
         return updates
+
+    def _apply_inbox_updates(
+        self,
+        inboxes: List[Dict[str, Any]],
+        user_updates: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        admin_inbox_id = next(
+            (
+                str(inbox.get("id") or "").strip()
+                for inbox in inboxes
+                if bool((user_updates.get(str(inbox.get("id") or "")) or {}).get("is_admin"))
+            ),
+            "",
+        )
+        ordered_inboxes = sorted(
+            inboxes,
+            key=lambda row: 1
+            if bool((user_updates.get(str(row.get("id") or "")) or {}).get("is_admin"))
+            else 0,
+        )
+        updated = 0
+        for inbox in ordered_inboxes:
+            update = user_updates.get(inbox["id"])
+            if not update:
+                continue
+            self.client.update_inbox(
+                inbox["id"],
+                {
+                    "email": update["email"],
+                    "password": update["password"],
+                    "is_admin": bool(update.get("is_admin")),
+                    "status": "active",
+                },
+            )
+            updated += 1
+        return {"updated": updated, "total": len(inboxes), "admin_inbox_id": admin_inbox_id}
 
     @staticmethod
     def _merge_partnerhub_order_users(
