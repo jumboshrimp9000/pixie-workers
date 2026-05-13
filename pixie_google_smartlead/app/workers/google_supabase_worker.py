@@ -1588,6 +1588,24 @@ class GoogleSupabaseWorker:
                 "delivery_validation": delivery_validation,
             }
             self.client.complete_action(action, result)
+            try:
+                completed_batch = self.client.complete_order_batch_if_fulfilled(
+                    domain.get("order_batch_id") or action.get("order_batch_id"),
+                    domain.get("customer_id") or action.get("customer_id"),
+                    sending_tool_skipped=upload_not_requested,
+                )
+                if completed_batch:
+                    log_event(
+                        "order_batch_completed",
+                        "info",
+                        f"Order batch completed for {domain_name}",
+                        {
+                            "order_batch_id": domain.get("order_batch_id") or action.get("order_batch_id"),
+                            "sending_tool_skipped": upload_not_requested,
+                        },
+                    )
+            except Exception as notify_exc:
+                logger.warning("Failed to complete order batch notification for %s: %s", domain_name, notify_exc)
             log_event("action_completed", "info", "Google provisioning completed", result)
 
         except Exception as exc:

@@ -493,6 +493,151 @@ class SupabaseRestClient:
         if response.status_code >= 300:
             logger.warning("Resend failed for customer blocker email (%s): %s", response.status_code, response.text)
 
+    def _send_order_completed_email(self, to_email: str, domain_label: str, inbox_count: int) -> None:
+        api_key = os.getenv("RESEND_API_KEY", "").strip()
+        if not api_key:
+            logger.info("RESEND_API_KEY missing; skipped order completed email to %s for %s", to_email, domain_label)
+            return
+        from_email = os.getenv("EMAIL_FROM", "SimpleInboxes <noreply@simpleinboxes.com>")
+        inbox_word = "inbox" if inbox_count == 1 else "inboxes"
+        verb = "is" if inbox_count == 1 else "are"
+        html = f"""
+        <div style="font-family:Arial,sans-serif;background:#f5f8ff;padding:28px;">
+          <div style="max-width:620px;margin:0 auto;background:white;border:1px solid #d8e4f3;border-radius:16px;overflow:hidden;">
+            <div style="padding:26px 30px;background:#ecfdf5;border-bottom:1px solid #bbf7d0;">
+              <div style="font-size:12px;font-weight:800;color:#059669;text-transform:uppercase;letter-spacing:.08em;">Delivery complete</div>
+              <h1 style="margin:14px 0 0;color:#0f172a;font-size:28px;line-height:1.15;">Your inboxes are ready</h1>
+            </div>
+            <div style="padding:28px 30px;color:#334155;font-size:15px;line-height:1.6;">
+              <p><strong>{escape(str(inbox_count))}</strong> {escape(inbox_word)} on <strong>{escape(domain_label)}</strong> {escape(verb)} ready to use.</p>
+              <p>Your credentials are available in your SimpleInboxes dashboard.</p>
+              <a href="{escape(APP_URL)}" style="display:inline-block;margin-top:10px;padding:12px 18px;border-radius:10px;background:#2563eb;color:white;text-decoration:none;font-weight:800;">View inboxes</a>
+            </div>
+          </div>
+        </div>
+        """
+        response = self.session.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "from": from_email,
+                "to": [to_email],
+                "subject": f"Inboxes ready - {domain_label}",
+                "html": html,
+                "text": f"Your {inbox_count} {inbox_word} on {domain_label} {verb} ready. View credentials at {APP_URL}.",
+            },
+            timeout=self.timeout_seconds,
+        )
+        if response.status_code >= 300:
+            logger.warning("Resend failed for order completed email (%s): %s", response.status_code, response.text)
+
+    def complete_order_batch_if_fulfilled(
+        self,
+        order_batch_id: Optional[str],
+        customer_id: Optional[str],
+        *,
+        sending_tool_skipped: bool = False,
+    ) -> bool:
+        clean_batch_id = str(order_batch_id or "").strip()
+        clean_customer_id = str(customer_id or "").strip()
+        if not clean_batch_id or not clean_customer_id:
+            return False
+
+        batch_rows = self._request(
+            "GET",
+            "order_batches",
+            params={
+                "select": "id,status,total_inboxes,workspace_id",
+                "id": f"eq.{clean_batch_id}",
+                "customer_id": f"eq.{clean_customer_id}",
+                "limit": "1",
+            },
+        )
+        if not batch_rows:
+            logger.warning("Order batch %s not found; leaving completion notification unsent", clean_batch_id)
+            return False
+        batch = batch_rows[0]
+
+        domain_rows = self._request(
+            "GET",
+            "domains",
+            params={
+                "select": "id,domain,status,workspace_id",
+                "order_batch_id": f"eq.{clean_batch_id}",
+                "customer_id": f"eq.{clean_customer_id}",
+            },
+        )
+        if not domain_rows:
+            logger.warning("Order batch %s has no domains; leaving status unchanged", clean_batch_id)
+            return False
+        if any(str(row.get("status") or "").strip().lower() != "active" for row in domain_rows):
+            return False
+
+        self._request(
+            "PATCH",
+            "order_batches",
+            params={
+                "id": f"eq.{clean_batch_id}",
+                "customer_id": f"eq.{clean_customer_id}",
+                "status": "neq.completed",
+            },
+            payload={"status": "completed"},
+        )
+
+        dedupe_key = f"order_batch_completed:{clean_batch_id}"
+        already_notified = self._notification_exists(clean_customer_id, dedupe_key)
+        if already_notified:
+            return True
+
+        domain_label = (
+            str(domain_rows[0].get("domain") or "your domain").strip()
+            if len(domain_rows) == 1
+            else f"{len(domain_rows)} domains"
+        )
+        inbox_count = max(1, int(batch.get("total_inboxes") or len(domain_rows)))
+        workspace_ids = [
+            str(row.get("workspace_id") or "").strip()
+            for row in domain_rows
+            if str(row.get("workspace_id") or "").strip()
+        ]
+        unique_workspace_ids = sorted(set(workspace_ids))
+        workspace_id = unique_workspace_ids[0] if len(unique_workspace_ids) == 1 else str(batch.get("workspace_id") or "").strip() or None
+        inbox_word = "inbox" if inbox_count == 1 else "inboxes"
+        verb = "is" if inbox_count == 1 else "are"
+        title = "Your inboxes are ready" if sending_tool_skipped else "Your inboxes are uploaded"
+        body = (
+            f"{inbox_count} {inbox_word} on {domain_label} {verb} ready. Add a sequencer later when you want to upload them."
+            if sending_tool_skipped
+            else f"{inbox_count} {inbox_word} on {domain_label} {verb} ready in your sending tool."
+        )
+        self._request(
+            "POST",
+            "notifications",
+            payload={
+                "customer_id": clean_customer_id,
+                "workspace_id": workspace_id,
+                "category": "fulfillment",
+                "type": "order_completed",
+                "severity": "success",
+                "title": title,
+                "body": body,
+                "entity_type": "order_batch",
+                "entity_id": clean_batch_id,
+                "order_batch_id": clean_batch_id,
+                "action_url": "/dashboard",
+                "dedupe_key": dedupe_key,
+                "metadata": {
+                    "domains": [row.get("domain") for row in domain_rows if row.get("domain")],
+                    "inboxCount": inbox_count,
+                    "sendingToolSkipped": sending_tool_skipped,
+                },
+            },
+        )
+        customer_email = self._customer_email(clean_customer_id)
+        if customer_email:
+            self._send_order_completed_email(customer_email, domain_label, inbox_count)
+        return True
+
     def notify_fulfillment_blocker_if_customer_action_required(self, action: Dict[str, Any], error_message: str) -> bool:
         domain_id = str(action.get("domain_id") or "").strip()
         customer_id = str(action.get("customer_id") or "").strip()
