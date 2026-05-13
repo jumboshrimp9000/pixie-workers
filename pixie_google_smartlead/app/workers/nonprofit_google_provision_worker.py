@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import random
+import re
 import string
 import time
 from datetime import datetime, timezone
@@ -1692,6 +1693,18 @@ class NonprofitGoogleProvisionWorker:
         optional: List[str] = []
         invalid: List[str] = []
 
+        for key in (
+            "required_google_app_ids",
+            "required_app_ids",
+            "required_admin_app_ids",
+            "google_required_app_ids",
+        ):
+            for entry in self._flatten_google_app_id_input(payload.get(key)):
+                if self._is_valid_google_app_id(entry):
+                    required.append(entry)
+                else:
+                    invalid.append(entry)
+
         if self._as_bool(payload.get("master_inbox_enable"), default=False):
             optional.append(OPTIONAL_GOOGLE_APP_IDS["master_inbox"])
         if self._as_bool(payload.get("warmy_enable"), default=False) or self._as_bool(
@@ -1791,7 +1804,7 @@ class NonprofitGoogleProvisionWorker:
     @staticmethod
     def _is_valid_google_app_id(value: str) -> bool:
         text = str(value or "").strip().lower()
-        return bool(text and text.endswith(".apps.googleusercontent.com"))
+        return bool(re.fullmatch(r"\d+-[a-z0-9]+\.apps\.googleusercontent\.com", text))
 
     @staticmethod
     def _normalize_dns_name_for_zone(dns_host: str, domain_name: str) -> str:

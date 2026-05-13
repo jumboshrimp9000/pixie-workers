@@ -1,6 +1,8 @@
+import json
 import logging
 import os
 import random
+import re
 import string
 import time
 from datetime import datetime
@@ -44,7 +46,7 @@ class GoogleInboxLifecycleWorker:
         self.max_retries = max(1, int(os.getenv("GOOGLE_LIFECYCLE_MAX_RETRIES", "8")))
         action_types = os.getenv(
             "GOOGLE_LIFECYCLE_ACTION_TYPES",
-            "google_add_inboxes,google_remove_inboxes,google_update_inboxes,google_update_profile_photos",
+            "google_add_inboxes,google_remove_inboxes,google_update_inboxes,google_update_profile_photos,google_configure_admin_apps",
         )
         self.action_types = [x.strip() for x in action_types.split(",") if x.strip()]
         self.max_inboxes_per_domain = max(1, int(os.getenv("GOOGLE_MAX_INBOXES_PER_DOMAIN", "5")))
@@ -65,6 +67,12 @@ class GoogleInboxLifecycleWorker:
         self.playwright_headless = self._as_bool(
             os.getenv("GOOGLE_PLAYWRIGHT_HEADLESS", os.getenv("GOOGLE_SELENIUM_HEADLESS", "true")),
             default=True,
+        )
+        self.require_admin_apps = self._as_bool(os.getenv("GOOGLE_REQUIRE_ADMIN_APPS"), default=True)
+        self.admin_apps_attempts = max(1, int(os.getenv("GOOGLE_ADMIN_APPS_ATTEMPTS", "3")))
+        self.admin_apps_retry_delay_seconds = max(
+            5.0,
+            float(os.getenv("GOOGLE_ADMIN_APPS_RETRY_DELAY_SECONDS", "20")),
         )
         self.sending_tool_playwright_oauth = self._as_bool(
             os.getenv("GOOGLE_SENDING_TOOL_USE_PLAYWRIGHT_OAUTH"),
@@ -294,6 +302,18 @@ class GoogleInboxLifecycleWorker:
 
             if action_type == "google_add_inboxes":
                 summary = self._handle_add(action, payload, domain, checkpoint, start_step, complete_step, fail_step, persist_progress, log_event)
+            elif action_type == "google_configure_admin_apps":
+                summary = self._handle_configure_admin_apps(
+                    action,
+                    payload,
+                    domain,
+                    checkpoint,
+                    start_step,
+                    complete_step,
+                    fail_step,
+                    persist_progress,
+                    log_event,
+                )
             elif action_type == "google_remove_inboxes":
                 summary = self._handle_remove(action, payload, domain, checkpoint, start_step, complete_step, fail_step, persist_progress, log_event)
             elif action_type == "google_update_inboxes":
@@ -400,6 +420,115 @@ class GoogleInboxLifecycleWorker:
                 f"{action_type} failed: {message}",
                 {"error": message, "steps": steps},
             )
+
+    def _handle_configure_admin_apps(
+        self,
+        action: Dict[str, Any],
+        payload: Dict[str, Any],
+        domain: Dict[str, Any],
+        checkpoint,
+        start_step,
+        complete_step,
+        fail_step,
+        persist_progress,
+        log_event,
+    ) -> Dict[str, Any]:
+        domain_id = str(domain.get("id"))
+        domain_name = str(domain.get("domain") or "").strip().lower()
+
+        app_config_details = checkpoint("configure_admin_apps")
+        if not app_config_details:
+            app_plan = self._resolve_google_admin_app_ids(payload)
+            step = start_step("configure_admin_apps")
+            step_details: Dict[str, Any] = {
+                "required_app_ids": app_plan["required"],
+                "optional_app_ids": app_plan["optional"],
+                "invalid_app_ids": app_plan["invalid"],
+                "max_attempts": self.admin_apps_attempts,
+            }
+            if not app_plan["all"]:
+                step_details["requested"] = []
+                step_details["skipped"] = "No Google app client IDs requested"
+                complete_step(step, step_details)
+                persist_progress()
+                app_config_details = step_details
+            else:
+                try:
+                    log_event(
+                        "step_started",
+                        "info",
+                        f"[configure_admin_apps] Configuring {len(app_plan['all'])} Google app IDs for {domain_name}",
+                        {"requested": app_plan["all"]},
+                    )
+                    step_details = self._configure_admin_apps(app_plan, domain_id, domain_name)
+                    required_failed = step_details.get("required_failed") or []
+                    if required_failed and self.require_admin_apps:
+                        fail_message = (
+                            f"Required Google app allowlist failed for {required_failed}. "
+                            f"failed={step_details.get('failed') or []}"
+                        )
+                        fail_step(step, fail_message)
+                        step["details"] = step_details
+                        persist_progress()
+                        raise RuntimeError(fail_message)
+                    if step_details.get("failed"):
+                        log_event(
+                            "step_warning",
+                            "warn",
+                            "[configure_admin_apps] Some app IDs failed to configure",
+                            {"failed": step_details.get("failed")},
+                        )
+                    complete_step(step, step_details)
+                    persist_progress()
+                    log_event(
+                        "step_completed",
+                        "info",
+                        f"[configure_admin_apps] Google app allowlist result for {domain_name}",
+                        step_details,
+                    )
+                    app_config_details = step_details
+                except Exception as app_exc:
+                    if str(step.get("status") or "").lower() != "failed":
+                        fail_step(step, str(app_exc))
+                    step.setdefault("details", step_details)
+                    persist_progress()
+                    log_event(
+                        "step_failed",
+                        "error",
+                        f"[configure_admin_apps] Google app allowlist failed for {domain_name}: {app_exc}",
+                        step.get("details") if isinstance(step.get("details"), dict) else {"error": str(app_exc)},
+                    )
+                    raise
+
+        reupload_details = checkpoint("enqueue_reupload")
+        if not reupload_details and self._as_bool(payload.get("enqueue_reupload"), default=False):
+            step = start_step("enqueue_reupload")
+            try:
+                reupload_details = self._enqueue_reupload_action(action, payload, domain)
+                complete_step(step, reupload_details)
+                persist_progress()
+                log_event(
+                    "step_completed",
+                    "info",
+                    f"[enqueue_reupload] Queued sending-tool upload after Google app allowlist for {domain_name}",
+                    reupload_details,
+                )
+            except Exception as enqueue_exc:
+                fail_step(step, str(enqueue_exc))
+                persist_progress()
+                log_event(
+                    "step_failed",
+                    "error",
+                    f"[enqueue_reupload] Failed to queue reupload for {domain_name}: {enqueue_exc}",
+                    {"error": str(enqueue_exc)},
+                )
+                raise
+
+        return {
+            "domain": domain_name,
+            "admin_apps": app_config_details or {},
+            "reupload": reupload_details or None,
+        }
 
     def _handle_add(
         self,
@@ -837,6 +966,68 @@ class GoogleInboxLifecycleWorker:
             step = start_step("mfa_enrollment_summary")
             complete_step(step, mfa_summary)
             persist_progress()
+
+        app_config_details = checkpoint("configure_admin_apps")
+        if not app_config_details:
+            app_plan = self._resolve_google_admin_app_ids(payload)
+            step = start_step("configure_admin_apps")
+            step_details: Dict[str, Any] = {
+                "required_app_ids": app_plan["required"],
+                "optional_app_ids": app_plan["optional"],
+                "invalid_app_ids": app_plan["invalid"],
+                "max_attempts": self.admin_apps_attempts,
+            }
+            if not app_plan["all"]:
+                step_details["requested"] = []
+                step_details["skipped"] = "No Google app client IDs requested"
+                complete_step(step, step_details)
+                persist_progress()
+            else:
+                try:
+                    log_event(
+                        "step_started",
+                        "info",
+                        f"[configure_admin_apps] Configuring {len(app_plan['all'])} Google app IDs for {domain_name}",
+                        {"requested": app_plan["all"]},
+                    )
+                    step_details = self._configure_admin_apps(app_plan, domain_id, domain_name)
+                    required_failed = step_details.get("required_failed") or []
+                    if required_failed and self.require_admin_apps:
+                        fail_message = (
+                            f"Required Google app allowlist failed for {required_failed}. "
+                            f"failed={step_details.get('failed') or []}"
+                        )
+                        fail_step(step, fail_message)
+                        step["details"] = step_details
+                        persist_progress()
+                        raise RuntimeError(fail_message)
+                    if step_details.get("failed"):
+                        log_event(
+                            "step_warning",
+                            "warn",
+                            "[configure_admin_apps] Some app IDs failed to configure",
+                            {"failed": step_details.get("failed")},
+                        )
+                    complete_step(step, step_details)
+                    persist_progress()
+                    log_event(
+                        "step_completed",
+                        "info",
+                        f"[configure_admin_apps] Google app allowlist result for added inboxes on {domain_name}",
+                        step_details,
+                    )
+                except Exception as app_exc:
+                    if str(step.get("status") or "").lower() != "failed":
+                        fail_step(step, str(app_exc))
+                    step.setdefault("details", step_details)
+                    persist_progress()
+                    log_event(
+                        "step_failed",
+                        "error",
+                        f"[configure_admin_apps] Google app allowlist failed for {domain_name}: {app_exc}",
+                        step.get("details") if isinstance(step.get("details"), dict) else {"error": str(app_exc)},
+                    )
+                    raise
 
         upload_details = checkpoint("upload_sending_tool")
         if upload_details:
@@ -2074,6 +2265,267 @@ class GoogleInboxLifecycleWorker:
         if "master" in text:
             return "masterinbox.com"
         return text
+
+    def _configure_admin_apps(self, app_plan: Dict[str, List[str]], domain_id: str, domain_name: str) -> Dict[str, Any]:
+        step_details: Dict[str, Any] = {
+            "required_app_ids": app_plan.get("required") or [],
+            "optional_app_ids": app_plan.get("optional") or [],
+            "invalid_app_ids": app_plan.get("invalid") or [],
+            "max_attempts": self.admin_apps_attempts,
+        }
+        requested = list(app_plan.get("all") or [])
+        if not requested:
+            step_details["requested"] = []
+            step_details["skipped"] = "No Google app client IDs requested"
+            return step_details
+
+        admin_row = self._resolve_domain_admin_login_row(domain_id, domain_name)
+        admin_email = str(admin_row.get("email") or "").strip().lower()
+        admin_password = str(admin_row.get("password") or "").strip()
+        if not admin_email or not admin_password:
+            raise RuntimeError(f"Admin credentials are required to configure Google app allowlisting for {domain_name}")
+
+        try:
+            op_client: Optional[OnePasswordCliClient] = OnePasswordCliClient.from_env()
+        except Exception as op_exc:
+            op_client = None
+            logger.warning(
+                "[configure_admin_apps] Proceeding without 1Password for %s: %s",
+                domain_name,
+                op_exc,
+            )
+
+        required_unresolved = list(app_plan.get("required") or [])
+        attempt_records: List[Dict[str, Any]] = []
+        added_ids: set = set()
+        already_configured_ids: set = set()
+        invalid_ids: set = set(app_plan.get("invalid") or [])
+        failed_by_id: Dict[str, Dict[str, str]] = {}
+
+        with GoogleAdminPlaywrightClient(headless=self.playwright_headless) as browser:
+            browser.login(
+                admin_email,
+                admin_password,
+                onepassword=op_client,
+                totp_secret=str(admin_row.get("otp_secret") or "").strip(),
+            )
+
+            for attempt in range(1, self.admin_apps_attempts + 1):
+                request_ids = requested if attempt == 1 else required_unresolved
+                if not request_ids:
+                    break
+
+                apps_result = browser.add_trusted_apps(request_ids)
+                attempt_records.append(
+                    {
+                        "attempt": attempt,
+                        "requested": request_ids,
+                        "result": apps_result,
+                    }
+                )
+
+                for client_id in apps_result.get("added") or []:
+                    clean = str(client_id or "").strip()
+                    if clean:
+                        added_ids.add(clean)
+                        failed_by_id.pop(clean, None)
+                for client_id in apps_result.get("already_configured") or []:
+                    clean = str(client_id or "").strip()
+                    if clean:
+                        already_configured_ids.add(clean)
+                        failed_by_id.pop(clean, None)
+                for client_id in apps_result.get("invalid") or []:
+                    clean = str(client_id or "").strip()
+                    if clean:
+                        invalid_ids.add(clean)
+                        failed_by_id.pop(clean, None)
+                for row in apps_result.get("failed") or []:
+                    if not isinstance(row, dict):
+                        continue
+                    clean = str(row.get("client_id") or "").strip()
+                    if clean:
+                        failed_by_id[clean] = {
+                            "client_id": clean,
+                            "error": str(row.get("error") or "").strip(),
+                        }
+
+                required_unresolved = [
+                    client_id
+                    for client_id in (app_plan.get("required") or [])
+                    if client_id not in added_ids and client_id not in already_configured_ids
+                ]
+                if required_unresolved and attempt < self.admin_apps_attempts:
+                    time.sleep(min(120.0, self.admin_apps_retry_delay_seconds * attempt))
+
+        failed_rows: List[Dict[str, str]] = []
+        for client_id in requested:
+            if client_id in added_ids or client_id in already_configured_ids:
+                continue
+            if client_id in failed_by_id:
+                failed_rows.append(failed_by_id[client_id])
+            else:
+                failed_rows.append(
+                    {
+                        "client_id": client_id,
+                        "error": "No success confirmation from Google Admin app flow",
+                    }
+                )
+
+        required_failed = sorted(
+            client_id
+            for client_id in (app_plan.get("required") or [])
+            if client_id not in added_ids and client_id not in already_configured_ids
+        )
+        step_details.update(
+            {
+                "attempts": attempt_records,
+                "requested": requested,
+                "added": sorted(added_ids),
+                "already_configured": sorted(already_configured_ids),
+                "invalid": sorted(invalid_ids),
+                "failed": failed_rows,
+                "required_failed": required_failed,
+            }
+        )
+        return step_details
+
+    def _enqueue_reupload_action(
+        self,
+        action: Dict[str, Any],
+        payload: Dict[str, Any],
+        domain: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        domain_id = str(domain.get("id") or action.get("domain_id") or "").strip()
+        domain_name = str(domain.get("domain") or payload.get("domain") or "").strip().lower()
+        customer_id = str(action.get("customer_id") or domain.get("customer_id") or "").strip()
+        if not domain_id or not customer_id:
+            raise RuntimeError("Cannot enqueue reupload without domain_id and customer_id")
+
+        raw_reupload_payload = payload.get("reupload_payload")
+        reupload_payload: Dict[str, Any] = (
+            dict(raw_reupload_payload)
+            if isinstance(raw_reupload_payload, dict)
+            else {}
+        )
+        if domain_name:
+            reupload_payload["domain"] = domain_name
+
+        credential_id = str(payload.get("credential_id") or payload.get("credentialId") or "").strip()
+        if credential_id:
+            reupload_payload["credential_id"] = credential_id
+
+        raw_settings = payload.get("sending_tool_settings") or payload.get("sendingToolSettings")
+        if (
+            raw_settings
+            and isinstance(raw_settings, dict)
+            and not isinstance(reupload_payload.get("sending_tool_settings"), dict)
+        ):
+            reupload_payload["sending_tool_settings"] = raw_settings
+
+        max_attempts = int(payload.get("reupload_max_attempts") or 8)
+        rows = self.client._request(
+            "POST",
+            "actions",
+            payload={
+                "customer_id": customer_id,
+                "domain_id": domain_id,
+                "type": "reupload_inboxes",
+                "status": "pending",
+                "payload": reupload_payload,
+                "attempts": 0,
+                "max_attempts": max_attempts,
+            },
+        )
+        reupload_action = rows[0] if rows else {}
+        reupload_action_id = str(reupload_action.get("id") or "").strip()
+        if not reupload_action_id:
+            raise RuntimeError("Supabase did not return a reupload action id")
+
+        return {
+            "reupload_action_id": reupload_action_id,
+            "credential_id": credential_id or None,
+            "max_attempts": max_attempts,
+        }
+
+    def _resolve_google_admin_app_ids(self, payload: Dict[str, Any]) -> Dict[str, List[str]]:
+        required: List[str] = []
+        optional: List[str] = []
+        invalid: List[str] = []
+
+        for key in (
+            "required_google_app_ids",
+            "required_app_ids",
+            "required_admin_app_ids",
+            "google_required_app_ids",
+        ):
+            for entry in self._flatten_google_app_id_input(payload.get(key)):
+                if self._is_valid_google_app_id(entry):
+                    required.append(entry)
+                else:
+                    invalid.append(entry)
+
+        for key in (
+            "additional_tools_id",
+            "additional_app_ids",
+            "google_app_ids",
+            "admin_app_ids",
+        ):
+            for entry in self._flatten_google_app_id_input(payload.get(key)):
+                if self._is_valid_google_app_id(entry):
+                    optional.append(entry)
+                else:
+                    invalid.append(entry)
+
+        merged: List[str] = []
+        seen = set()
+        for candidate in required + optional:
+            clean = str(candidate or "").strip()
+            if not clean or clean in seen:
+                continue
+            seen.add(clean)
+            merged.append(clean)
+
+        return {
+            "required": [v for v in required if v in merged],
+            "optional": [v for v in optional if v in merged and v not in required],
+            "invalid": sorted({v for v in invalid if v}),
+            "all": merged,
+        }
+
+    def _flatten_google_app_id_input(self, value: Any) -> List[str]:
+        if value is None:
+            return []
+
+        parsed = value
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return []
+            if text.startswith("["):
+                try:
+                    parsed = json.loads(text)
+                except Exception:
+                    parsed = text
+            elif "," in text:
+                parsed = [v.strip() for v in text.split(",") if v.strip()]
+            else:
+                parsed = text
+
+        if isinstance(parsed, list):
+            return [str(v).strip() for v in parsed if str(v or "").strip()]
+        if isinstance(parsed, dict):
+            values: List[str] = []
+            for candidate in parsed.values():
+                values.extend(self._flatten_google_app_id_input(candidate))
+            return values
+
+        text = str(parsed or "").strip()
+        return [text] if text else []
+
+    @staticmethod
+    def _is_valid_google_app_id(value: str) -> bool:
+        text = str(value or "").strip().lower()
+        return bool(re.fullmatch(r"\d+-[a-z0-9]+\.apps\.googleusercontent\.com", text))
 
     @staticmethod
     def _mfa_step_name(email: str) -> str:
