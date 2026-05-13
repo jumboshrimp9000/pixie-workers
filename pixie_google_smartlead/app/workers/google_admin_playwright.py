@@ -2793,6 +2793,9 @@ class GoogleAdminPlaywrightClient:
         ):
             clicked = self._click_google_action(
                 [
+                    "#gaplustosNext",
+                    "button#gaplustosNext",
+                    "button[name='action'][value='1']",
                     "input[value='I understand']",
                     "//input[@value='I understand']",
                     "//button[normalize-space()='I understand']",
@@ -2854,6 +2857,9 @@ class GoogleAdminPlaywrightClient:
         for _ in range(3):
             clicked = self._click_any(
                 [
+                    "#gaplustosNext",
+                    "button#gaplustosNext",
+                    "button[name='action'][value='1']",
                     "input[value='I understand']",
                     "//input[@value='I understand']",
                     "//span[text()='Not now']",
@@ -2875,6 +2881,9 @@ class GoogleAdminPlaywrightClient:
     def _accept_new_account_terms_if_present(self) -> bool:
         clicked = self._click_any(
             [
+                "#gaplustosNext",
+                "button#gaplustosNext",
+                "button[name='action'][value='1']",
                 "input[value='I understand']",
                 "//input[@value='I understand']",
                 "//button[.//span[text()='I understand']]",
