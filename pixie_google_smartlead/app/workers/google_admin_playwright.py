@@ -2784,7 +2784,7 @@ class GoogleAdminPlaywrightClient:
                 f"url={current_url}{text_suffix}"
             )
 
-        if "/speedbump/gaplustos" not in current_path:
+        if "/speedbump/gaplustos" not in current_path and "/speedbump/workspacetermsofservice" not in current_path:
             return
 
         if (
