@@ -709,7 +709,21 @@ class GoogleSupabaseWorker:
             else:
                 step = start_step("create_users")
                 updated = 0
-                for inbox in inboxes:
+                admin_inbox_id = next(
+                    (
+                        str(inbox.get("id") or "").strip()
+                        for inbox in inboxes
+                        if bool((user_updates.get(str(inbox.get("id") or "")) or {}).get("is_admin"))
+                    ),
+                    "",
+                )
+                ordered_inboxes = sorted(
+                    inboxes,
+                    key=lambda row: 1
+                    if bool((user_updates.get(str(row.get("id") or "")) or {}).get("is_admin"))
+                    else 0,
+                )
+                for inbox in ordered_inboxes:
                     update = user_updates.get(inbox["id"])
                     if not update:
                         continue
@@ -723,7 +737,7 @@ class GoogleSupabaseWorker:
                         },
                     )
                     updated += 1
-                complete_step(step, {"updated": updated, "total": len(inboxes)})
+                complete_step(step, {"updated": updated, "total": len(inboxes), "admin_inbox_id": admin_inbox_id})
                 persist_progress(INTERIM_STATUSES["USERS_CREATED"], "in_progress")
 
             admin_checkpoint = checkpoint("resolve_admin_login")
@@ -1767,16 +1781,32 @@ class GoogleSupabaseWorker:
     ) -> Dict[str, Dict[str, Any]]:
         updates: Dict[str, Dict[str, Any]] = {}
         default_password = str(payload.get("new_password") or payload.get("default_password") or "").strip()
+        admin_inbox_id = ""
+
+        for idx, inbox in enumerate(inboxes):
+            inbox_id = str(inbox.get("id") or "").strip()
+            if not inbox_id:
+                continue
+            mapped = partnerhub_users[idx] if idx < len(partnerhub_users) else {}
+            user_type = str(mapped.get("userType") or "").strip().lower()
+            if user_type == "admin":
+                admin_inbox_id = inbox_id
+                break
+
+        if not admin_inbox_id:
+            for inbox in inboxes:
+                admin_inbox_id = str(inbox.get("id") or "").strip()
+                if admin_inbox_id:
+                    break
 
         for idx, inbox in enumerate(inboxes):
             mapped = partnerhub_users[idx] if idx < len(partnerhub_users) else {}
             email = str(mapped.get("email") or inbox.get("email") or f"{inbox.get('username')}@{domain_name}")
             password = str(mapped.get("password") or inbox.get("password") or default_password or self._generate_password())
-            user_type = str(mapped.get("userType") or "normal").strip().lower()
             updates[inbox["id"]] = {
                 "email": email,
                 "password": password,
-                "is_admin": user_type == "admin",
+                "is_admin": str(inbox.get("id") or "").strip() == admin_inbox_id,
             }
         return updates
 
