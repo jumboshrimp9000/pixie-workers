@@ -706,6 +706,38 @@ class PartnerHubClient:
                 return str(row.get("id"))
         return None
 
+    @staticmethod
+    def extract_license_users(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return []
+
+        users: List[Dict[str, Any]] = []
+
+        def walk(value: Any) -> None:
+            if isinstance(value, dict):
+                for key in ("orderLicenceUsers", "orderLicenseUsers", "licenseUsers", "licenceUsers"):
+                    nested = value.get(key)
+                    if isinstance(nested, list):
+                        users.extend([row for row in nested if isinstance(row, dict)])
+                for child in value.values():
+                    walk(child)
+            elif isinstance(value, list):
+                for item in value:
+                    walk(item)
+
+        walk(payload)
+
+        seen: set = set()
+        unique: List[Dict[str, Any]] = []
+        for user in users:
+            email = str(user.get("email") or "").strip().lower()
+            key = email or id(user)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(user)
+        return unique
+
     def extract_dns_records(self, payload: Dict[str, Any], domain: str) -> List[Dict[str, Any]]:
         if not isinstance(payload, dict):
             return []

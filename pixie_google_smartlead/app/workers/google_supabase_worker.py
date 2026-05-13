@@ -647,7 +647,14 @@ class GoogleSupabaseWorker:
                     if not dns_fetch_checkpoint:
                         complete_step(step, {"dry_run": True, "records": len(dns_records), "fallback": True})
                 else:
-                    order_details = self._get_partnerhub().get_order_details(domain_name)
+                    order_details = (
+                        self._get_partnerhub().get_order_by_id(order_id)
+                        if str(order_id or "").strip()
+                        else self._get_partnerhub().get_order_details(domain_name)
+                    )
+                    order_users = self._get_partnerhub().extract_license_users(order_details)
+                    if order_users:
+                        partnerhub_users = self._merge_partnerhub_order_users(partnerhub_users, order_users)
                     dns_records = self._get_partnerhub().extract_dns_records(order_details, domain_name)
                     used_fallback = False
                     if not dns_records:
@@ -1809,6 +1816,34 @@ class GoogleSupabaseWorker:
                 "is_admin": str(inbox.get("id") or "").strip() == admin_inbox_id,
             }
         return updates
+
+    @staticmethod
+    def _merge_partnerhub_order_users(
+        requested_users: List[Dict[str, Any]],
+        order_users: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        by_email = {
+            str(user.get("email") or "").strip().lower(): user
+            for user in order_users
+            if str(user.get("email") or "").strip()
+        }
+        if not by_email:
+            return requested_users
+
+        merged: List[Dict[str, Any]] = []
+        for user in requested_users:
+            email = str(user.get("email") or "").strip().lower()
+            order_user = by_email.get(email)
+            if not order_user:
+                merged.append(user)
+                continue
+            next_user = dict(user)
+            for key in ("email", "firstName", "lastName", "userType"):
+                value = order_user.get(key)
+                if value is not None and str(value).strip():
+                    next_user[key] = value
+            merged.append(next_user)
+        return merged
 
     def _build_mfa_users(
         self,
