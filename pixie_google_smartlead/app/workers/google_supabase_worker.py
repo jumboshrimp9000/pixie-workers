@@ -728,7 +728,35 @@ class GoogleSupabaseWorker:
 
             admin_checkpoint = checkpoint("resolve_admin_login")
             if admin_checkpoint:
-                admin_inbox_id = str(admin_checkpoint.get("admin_inbox_id") or "").strip()
+                rows = self.client.get_domain_inboxes_all(domain_id)
+                live_rows = [row for row in rows if str(row.get("status") or "").lower() in LIVE_STATUSES]
+                admin_candidates = [
+                    row
+                    for row in live_rows
+                    if bool(row.get("is_admin"))
+                    and str(row.get("email") or "").strip()
+                    and str(row.get("password") or "").strip()
+                ]
+                if admin_candidates:
+                    admin_row = sorted(
+                        admin_candidates,
+                        key=lambda r: (str(r.get("created_at") or ""), str(r.get("id") or "")),
+                    )[0]
+                    admin_inbox_id = str(admin_row.get("id") or "").strip()
+                    checkpoint_admin_id = str(admin_checkpoint.get("admin_inbox_id") or "").strip()
+                    if checkpoint_admin_id and checkpoint_admin_id != admin_inbox_id:
+                        log_event(
+                            "step_info",
+                            "info",
+                            f"[resolve_admin_login] Refreshed admin inbox from current Google order state for {domain_name}",
+                            {
+                                "checkpoint_admin_inbox_id": checkpoint_admin_id,
+                                "current_admin_inbox_id": admin_inbox_id,
+                                "current_admin_email": str(admin_row.get("email") or "").strip().lower(),
+                            },
+                        )
+                else:
+                    admin_inbox_id = str(admin_checkpoint.get("admin_inbox_id") or "").strip()
             else:
                 step = start_step("resolve_admin_login")
                 rows = self.client.get_domain_inboxes_all(domain_id)
