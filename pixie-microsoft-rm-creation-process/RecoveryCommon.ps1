@@ -1198,7 +1198,8 @@ function Add-RecoveryMailboxToInstantly {
     )
     if (-not $Email) { throw "Recovery mailbox email is required for Instantly upload" }
     if (-not $Password) { throw "Recovery mailbox password is required for Instantly upload" }
-    if (-not $env:CRON_SECRET) { throw "CRON_SECRET is required for Recovery Pool Instantly OAuth upload" }
+    $recoveryUploadSecret = if ($env:RECOVERY_UPLOAD_SECRET) { [string]$env:RECOVERY_UPLOAD_SECRET } elseif ($env:CRON_SECRET) { [string]$env:CRON_SECRET } else { [string]$env:INSTANTLY_RECOVERY_API_KEY }
+    if (-not $recoveryUploadSecret) { throw "RECOVERY_UPLOAD_SECRET, CRON_SECRET, or INSTANTLY_RECOVERY_API_KEY is required for Recovery Pool Instantly OAuth upload" }
 
     $baseUrl = [string]$env:PIXIE_APP_API_BASE_URL
     if (-not $baseUrl) { $baseUrl = "https://app.simpleinboxes.com/api/v1" }
@@ -1215,7 +1216,7 @@ function Add-RecoveryMailboxToInstantly {
     }
 
     try {
-        $response = Invoke-RestMethod -Method POST -Uri $uri -Headers @{ "X-Cron-Secret" = $env:CRON_SECRET } -Body ($body | ConvertTo-Json -Depth 8) -ContentType "application/json" -TimeoutSec 600 -ErrorAction Stop
+        $response = Invoke-RestMethod -Method POST -Uri $uri -Headers @{ "X-Recovery-Upload-Secret" = $recoveryUploadSecret } -Body ($body | ConvertTo-Json -Depth 8) -ContentType "application/json" -TimeoutSec 600 -ErrorAction Stop
     } catch {
         $message = $_.Exception.Message
         if ($_.ErrorDetails.Message) {
