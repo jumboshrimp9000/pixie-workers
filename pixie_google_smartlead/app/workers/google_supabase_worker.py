@@ -1418,7 +1418,19 @@ class GoogleSupabaseWorker:
 
             delivery_upload_details: Optional[Dict[str, Any]] = None
             sending_tool_checkpoint = checkpoint("upload_sending_tool")
-            if sending_tool_checkpoint:
+            sending_tool_requested = self._sending_tool_upload_requested(domain, payload)
+            if not sending_tool_requested:
+                step = start_step("upload_sending_tool")
+                delivery_upload_details = {
+                    "skipped": True,
+                    "upload_not_requested": True,
+                    "reason": "No sending tool was requested for this Google order.",
+                    "uploaded_emails": [],
+                    "total_candidates": 0,
+                    "strict_validation": False,
+                }
+                complete_step(step, delivery_upload_details)
+            elif sending_tool_checkpoint:
                 upload_checkpoint_ok, upload_checkpoint_reason = upload_checkpoint_strictly_valid(sending_tool_checkpoint)
                 if not upload_checkpoint_ok:
                     step = start_step("upload_sending_tool")
@@ -1519,7 +1531,14 @@ class GoogleSupabaseWorker:
                 )
                 return
 
-            final_upload_ok, final_upload_reason = upload_checkpoint_strictly_valid(delivery_upload_details)
+            upload_not_requested = bool(
+                isinstance(delivery_upload_details, dict) and delivery_upload_details.get("upload_not_requested")
+            )
+            final_upload_ok, final_upload_reason = (
+                (True, "sending_tool_upload_not_requested")
+                if upload_not_requested
+                else upload_checkpoint_strictly_valid(delivery_upload_details)
+            )
             if not final_upload_ok:
                 fail_message = f"Final delivery check failed for {domain_name}: {final_upload_reason}"
                 step["details"] = {
@@ -1544,7 +1563,7 @@ class GoogleSupabaseWorker:
                 "uploaded_count": uploaded_count,
                 "total_candidates": int(safe_upload_details.get("total_candidates") or 0),
                 "settings_validated": True,
-                "provider_check": "domain_verified_before_upload",
+                "provider_check": "sending_tool_not_requested" if upload_not_requested else "domain_verified_before_upload",
                 "validated_at": self._iso_now(),
             }
 
@@ -2340,6 +2359,32 @@ class GoogleSupabaseWorker:
                 "challenge in a trusted browser or replace the admin account, then retry provisioning."
             )
         return "Check action_logs metadata for the exact failing step and API response."
+
+    @staticmethod
+    def _sending_tool_upload_requested(domain: Dict[str, Any], payload: Dict[str, Any]) -> bool:
+        explicit_skip = any(
+            bool(value)
+            for value in (
+                payload.get("sending_tool_skipped"),
+                payload.get("sequencer_skipped"),
+                payload.get("skip_sending_tool_upload"),
+                payload.get("skip_sequencer_upload"),
+            )
+        )
+        if explicit_skip:
+            return False
+
+        sending_tool = payload.get("sending_tool")
+        if sending_tool is None:
+            return False
+        if isinstance(sending_tool, str):
+            return bool(sending_tool.strip())
+        if isinstance(sending_tool, dict):
+            return any(
+                str(sending_tool.get(key) or "").strip()
+                for key in ("slug", "id", "name", "provider", "type")
+            )
+        return bool(sending_tool)
 
     def _upload_domain_inboxes_to_sending_tool(
         self,
