@@ -194,47 +194,91 @@ class SupabaseRestClient:
         data = response.json()
         return data if isinstance(data, list) else [data]
 
-    def get_actions(self, action_types: List[str], limit: int = 5) -> List[Dict[str, Any]]:
+    def _list_actions_page(
+        self,
+        action_types: List[str],
+        *,
+        status: str,
+        limit: int,
+        offset: int = 0,
+        reclaim_before: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         if not action_types:
             return []
         encoded_types = ",".join(action_types)
-        pending_rows = self._request(
-            "GET",
-            "actions",
-            params={
-                "select": "*",
-                "status": "eq.pending",
-                "type": f"in.({encoded_types})",
-                "order": "created_at.asc",
-                "limit": str(limit),
-            },
-        )
-        reclaim_before = _to_iso(_utc_now() - timedelta(seconds=self.action_lease_seconds))
-        stale_rows = self._request(
-            "GET",
-            "actions",
-            params={
-                "select": "*",
-                "status": "eq.in_progress",
-                "type": f"in.({encoded_types})",
-                "or": f"(started_at.is.null,started_at.lte.{reclaim_before})",
-                "order": "created_at.asc",
-                "limit": str(limit),
-            },
-        )
+        params: Dict[str, str] = {
+            "select": "*",
+            "status": f"eq.{status}",
+            "type": f"in.({encoded_types})",
+            "order": "created_at.asc",
+            "limit": str(limit),
+            "offset": str(offset),
+        }
+        if status == "in_progress" and reclaim_before:
+            params["or"] = f"(started_at.is.null,started_at.lte.{reclaim_before})"
+        return self._request("GET", "actions", params=params)
 
+    def get_actions(self, action_types: List[str], limit: int = 5) -> List[Dict[str, Any]]:
+        if not action_types:
+            return []
+
+        reclaim_before = _to_iso(_utc_now() - timedelta(seconds=self.action_lease_seconds))
+        page_size = max(limit * 5, 25)
+        pending_offset = 0
+        stale_offset = 0
+        pending_done = False
+        stale_done = False
         now = _utc_now()
         eligible: List[Dict[str, Any]] = []
-        for row in [*pending_rows, *stale_rows]:
-            attempts = int(row.get("attempts") or 0)
-            max_attempts = int(row.get("max_attempts") or 3)
-            if attempts >= max_attempts:
-                continue
-            if str(row.get("status") or "") == "pending":
-                next_retry_at = _parse_ts(row.get("next_retry_at"))
-                if next_retry_at and next_retry_at > now:
+        seen_ids = set()
+
+        while len(eligible) < limit and (not pending_done or not stale_done):
+            pending_rows: List[Dict[str, Any]] = []
+            stale_rows: List[Dict[str, Any]] = []
+
+            if not pending_done:
+                pending_rows = self._list_actions_page(
+                    action_types,
+                    status="pending",
+                    limit=page_size,
+                    offset=pending_offset,
+                )
+                pending_offset += len(pending_rows)
+                if len(pending_rows) < page_size:
+                    pending_done = True
+
+            if not stale_done:
+                stale_rows = self._list_actions_page(
+                    action_types,
+                    status="in_progress",
+                    limit=page_size,
+                    offset=stale_offset,
+                    reclaim_before=reclaim_before,
+                )
+                stale_offset += len(stale_rows)
+                if len(stale_rows) < page_size:
+                    stale_done = True
+
+            if not pending_rows and not stale_rows:
+                break
+
+            for row in [*pending_rows, *stale_rows]:
+                row_id = str(row.get("id") or "")
+                if row_id and row_id in seen_ids:
                     continue
-            eligible.append(row)
+                if row_id:
+                    seen_ids.add(row_id)
+
+                attempts = int(row.get("attempts") or 0)
+                max_attempts = int(row.get("max_attempts") or 3)
+                if attempts >= max_attempts:
+                    continue
+                if str(row.get("status") or "") == "pending":
+                    next_retry_at = _parse_ts(row.get("next_retry_at"))
+                    if next_retry_at and next_retry_at > now:
+                        continue
+                eligible.append(row)
+
         eligible.sort(key=lambda row: str(row.get("created_at") or ""))
         return eligible[:limit]
 
@@ -361,7 +405,14 @@ class SupabaseRestClient:
 
     def fail_action(self, action: Dict[str, Any], error_message: str, max_retries: int = 5) -> bool:
         attempts = int(action.get("attempts") or 1)
-        is_final = attempts >= max_retries
+        row_max_attempts = int(action.get("max_attempts") or 0)
+        effective_max_retries = row_max_attempts if row_max_attempts > 0 else max_retries
+        if max_retries > 0 and row_max_attempts > 0:
+            effective_max_retries = min(max_retries, row_max_attempts)
+        elif max_retries > 0:
+            effective_max_retries = max_retries
+
+        is_final = attempts >= effective_max_retries
         delay_seconds = min(2 ** max(0, attempts - 1), 300)
         next_retry = None if is_final else _to_iso(_utc_now() + timedelta(seconds=delay_seconds))
 
@@ -777,6 +828,7 @@ class SupabaseRestClient:
                 "select": "*",
                 "provider": f"eq.{provider}",
                 "active": "eq.true",
+                **({"status": "eq.Active"} if provider == "microsoft" else {}),
                 "order": "usage_count.asc",
                 "limit": "1",
             },
