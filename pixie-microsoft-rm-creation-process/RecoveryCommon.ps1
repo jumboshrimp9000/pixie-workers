@@ -967,6 +967,53 @@ function Remove-OrphanUsersForEmail {
     return $orphansDeleted
 }
 
+function Ensure-RecoveryMailboxOauthIdentity {
+    param(
+        [string]$Email,
+        [string]$UserId,
+        [string]$Password,
+        [hashtable]$Headers
+    )
+
+    if (-not $Email -or -not $UserId -or -not $Password) { return $false }
+
+    Remove-OrphanUsersForEmail -Email $Email -CorrectUserId $UserId -Headers $Headers | Out-Null
+
+    $body = @{
+        accountEnabled = $true
+        userPrincipalName = $Email
+        passwordProfile = @{
+            forceChangePasswordNextSignIn = $false
+            password = $Password
+        }
+    } | ConvertTo-Json -Depth 5
+
+    try {
+        Invoke-RestMethod -Method PATCH -Uri "https://graph.microsoft.com/v1.0/users/$UserId" -Headers $Headers -Body $body -TimeoutSec 30 -ErrorAction Stop | Out-Null
+    } catch {
+        Write-Log "Failed to align Recovery Pool OAuth identity for ${Email}: $($_.Exception.Message)" -Level Warning
+        return $false
+    }
+
+    try {
+        $user = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/$UserId?`$select=userPrincipalName,mail,accountEnabled" -Headers $Headers -TimeoutSec 30 -ErrorAction Stop
+        $verified = (
+            [string]$user.userPrincipalName -eq $Email -and
+            [string]$user.mail -eq $Email -and
+            $user.accountEnabled -eq $true
+        )
+        if (-not $verified) {
+            Write-Log "Recovery Pool OAuth identity verification failed for ${Email}: UPN=$($user.userPrincipalName), mail=$($user.mail), accountEnabled=$($user.accountEnabled)" -Level Warning
+            return $false
+        }
+        Write-Log "Recovery Pool OAuth identity confirmed: $Email" -Level Success
+        return $true
+    } catch {
+        Write-Log "Failed to verify Recovery Pool OAuth identity for ${Email}: $($_.Exception.Message)" -Level Warning
+        return $false
+    }
+}
+
 function New-RecoveryRoomMailboxBulk {
     param(
         [string]$Domain,
@@ -996,6 +1043,15 @@ function New-RecoveryRoomMailboxBulk {
 
         $existing = Get-Mailbox -Identity $email -ErrorAction SilentlyContinue
         if ($existing) {
+            $externalId = [string]$existing.ExternalDirectoryObjectId
+            $identityReady = $false
+            if ($externalId) {
+                $identityReady = Ensure-RecoveryMailboxOauthIdentity -Email $email -UserId $externalId -Password $Password -Headers $headers
+            }
+            if (-not $identityReady) {
+                $results.Failed += @{ InboxId = $inbox.id; Email = $email; Error = "Recovery mailbox OAuth identity was not confirmed for $email" }
+                continue
+            }
             $results.Created += @{
                 InboxId = $inbox.id
                 Email = $email
@@ -1003,7 +1059,7 @@ function New-RecoveryRoomMailboxBulk {
                 LastName = $lastName
                 DisplayName = $realDisplayName
                 AlreadyExisted = $true
-                ExternalId = [string]$existing.ExternalDirectoryObjectId
+                ExternalId = $externalId
             }
             continue
         }
@@ -1072,6 +1128,15 @@ function New-RecoveryRoomMailboxBulk {
 
         Start-Sleep -Seconds 5
         $mailbox = Get-Mailbox -Identity $email -ErrorAction SilentlyContinue
+        $externalId = if ($mailbox) { [string]$mailbox.ExternalDirectoryObjectId } else { $null }
+        $identityReady = $false
+        if ($externalId) {
+            $identityReady = Ensure-RecoveryMailboxOauthIdentity -Email $email -UserId $externalId -Password $Password -Headers $headers
+        }
+        if (-not $identityReady) {
+            $results.Failed += @{ InboxId = $inbox.id; Email = $email; Error = "Recovery mailbox OAuth identity was not confirmed for $email" }
+            continue
+        }
         $results.Created += @{
             InboxId = $inbox.id
             Email = $email
@@ -1079,7 +1144,7 @@ function New-RecoveryRoomMailboxBulk {
             LastName = $lastName
             DisplayName = $realDisplayName
             AlreadyExisted = $false
-            ExternalId = if ($mailbox) { [string]$mailbox.ExternalDirectoryObjectId } else { $null }
+            ExternalId = $externalId
         }
     }
 

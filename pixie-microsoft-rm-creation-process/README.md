@@ -109,6 +109,10 @@ Endpoint strategy and tradeoff:
 
 Recovery Pool mailbox upload must not use Instantly's SMTP/IMAP account-create API. The worker calls `POST /api/v1/internal/recovery/upload-instantly` with the recovery mailbox and lets the app run the provider OAuth upload path, then apply the Recovery Pool warmup settings.
 
+Recovery Pool room mailboxes keep the room/resource mailbox model, but their Entra sign-in UPN must match the mailbox address (`postmaster@domain`) and the account must be enabled with the recovery mailbox password. Instantly's Microsoft OAuth flow signs in with the mailbox address, so the worker aligns that identity after mailbox creation before calling the app upload endpoint. The fixed Recovery Pool Instantly defaults are warmup enabled, 10 warmup emails per day, slow ramp enabled with +1/day, and 60% reply rate.
+
+Standard Microsoft room and Azure mailbox provisioning follows the same provider-OAuth identity contract before sending-tool upload: the worker removes orphaned conflicting users, sets the mailbox sign-in UPN to the inbox address, enables the account, resets the inbox password, and verifies the values before upload validation can complete.
+
 ## Microsoft Mutation Model
 
 `microsoft_update_inboxes` is the Microsoft-backed equivalent of the Google tracked identity-change flow.

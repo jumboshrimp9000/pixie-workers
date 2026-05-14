@@ -1056,30 +1056,17 @@ function New-RoomMailboxBulk {
     }
 
     # ========================================================================
-    # POST-CREATION STEP 3: Fix UPNs + remove orphans
+    # POST-CREATION STEP 3: Confirm provider OAuth sign-in identity
     # ========================================================================
     if ($results.Created.Count -gt 0) {
-        Write-Log "Fixing UPNs for newly created mailboxes..." -Level Info
+        Write-Log "Confirming provider OAuth sign-in identities for room mailboxes..." -Level Info
         Start-Sleep -Seconds 5
         foreach ($mb in $results.Created) {
-            if ($mb.AlreadyExisted) { continue }
             $email = $mb.Email
-
-            $mbx = Get-Mailbox -Identity $email -ErrorAction SilentlyContinue
-            $correctUserId = if ($mbx) { $mbx.ExternalDirectoryObjectId } else { "NONE" }
-
-            Remove-OrphanUsersForEmail -Email $email -CorrectUserId $correctUserId -Headers $headers
-
-            try { Set-Mailbox -Identity $email -MicrosoftOnlineServicesID $email -ErrorAction SilentlyContinue } catch { }
-
-            try {
-                $user = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/$email" -Headers $headers -ErrorAction SilentlyContinue
-                if ($user -and $user.userPrincipalName -ne $email) {
-                    $upnBody = @{ userPrincipalName = $email } | ConvertTo-Json
-                    Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/$($user.id)" -Method PATCH -Headers $headers -Body $upnBody -ErrorAction SilentlyContinue | Out-Null
-                    Write-Log "Fixed UPN for $email" -Level Success
-                }
-            } catch { }
+            $identityReady = Set-MailboxAccountReady -Email $email -Bearer $Bearer -Password $Password -Headers $headers
+            if (-not $identityReady) {
+                Write-Log "Provider OAuth sign-in identity not confirmed for $email" -Level Warning
+            }
         }
     }
 
@@ -1137,7 +1124,12 @@ function Set-MailboxAccountReady {
         }
         if ($user.userPrincipalName -ne $Email) { $body.userPrincipalName = $Email }
         Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/$userId" -Method PATCH -Headers $Headers -Body ($body | ConvertTo-Json -Depth 4) -ErrorAction Stop | Out-Null
-        Write-Log "Password + unblock confirmed: $Email" -Level Success
+        $verified = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/$userId?`$select=userPrincipalName,accountEnabled" -Headers $Headers -ErrorAction Stop
+        if ([string]$verified.userPrincipalName -ne $Email -or $verified.accountEnabled -ne $true) {
+            Write-Log "Provider OAuth identity verification failed for ${Email}: UPN=$($verified.userPrincipalName), accountEnabled=$($verified.accountEnabled)" -Level Warning
+            return $false
+        }
+        Write-Log "Password + provider OAuth identity confirmed: $Email" -Level Success
         return $true
     } catch {
         Write-Log "Password/unblock failed for ${Email}: $($_.Exception.Message)" -Level Warning
