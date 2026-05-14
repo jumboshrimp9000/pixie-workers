@@ -38,6 +38,8 @@ $script:Summary = [ordered]@{
     mailboxDeleted = 0
     mailboxAlreadyMissing = 0
     recipientCleanupDeleted = 0
+    recipientAliasCleanupRemoved = 0
+    recipientProtectedSkipped = 0
     graphUsersDeleted = 0
     acceptedDomainRemoved = $false
 }
@@ -106,6 +108,76 @@ function Invoke-GraphRequest {
     return Invoke-RestMethod @params
 }
 
+function Normalize-DomainValue {
+    param([string]$Value)
+    return ([string]$Value).Trim().ToLowerInvariant().Replace("https://", "").Replace("http://", "").TrimEnd("/")
+}
+
+function Get-ObjectPropertyValue {
+    param([object]$Object, [string]$Name)
+    if (-not $Object -or -not $Name) { return $null }
+    if ($Object -is [string]) {
+        try { $Object = $Object | ConvertFrom-Json -Depth 20 } catch { return $null }
+    }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($property) { return $property.Value }
+    return $null
+}
+
+function Get-ActionPayloadValue {
+    param([object]$ActionRecord, [string]$Name)
+    return Get-ObjectPropertyValue -Object (Get-ObjectPropertyValue -Object $ActionRecord -Name "payload") -Name $Name
+}
+
+function Get-ReplacementProtectedDomain {
+    $payloadValue = Get-ActionPayloadValue -ActionRecord $script:ActionRecord -Name "replacement_new_domain"
+    if ($payloadValue) { return Normalize-DomainValue ([string]$payloadValue) }
+
+    $settings = Get-ObjectPropertyValue -Object $script:DomainRecord -Name "fulfillment_settings"
+    $replacement = Get-ObjectPropertyValue -Object $settings -Name "replacement"
+    foreach ($key in @("new_domain", "newDomain", "replacement_new_domain")) {
+        $value = Get-ObjectPropertyValue -Object $replacement -Name $key
+        if ($value) { return Normalize-DomainValue ([string]$value) }
+    }
+    return ""
+}
+
+function Get-EmailAddressDomain {
+    param([string]$Address)
+    $value = ([string]$Address).Trim()
+    if ($value -match '^[^:]+:(.+)$') { $value = $matches[1] }
+    $value = $value.Trim().Trim('"').ToLowerInvariant()
+    $at = $value.LastIndexOf("@")
+    if ($at -lt 0 -or $at -eq ($value.Length - 1)) { return "" }
+    return $value.Substring($at + 1)
+}
+
+function Get-RecipientAddressesForDomain {
+    param([object]$Recipient, [string]$Domain)
+    $domainName = Normalize-DomainValue $Domain
+    if (-not $Recipient -or -not $domainName) { return @() }
+
+    $matches = @()
+    foreach ($address in @($Recipient.EmailAddresses)) {
+        if (-not $address) { continue }
+        $raw = [string]$address
+        if ((Get-EmailAddressDomain -Address $raw) -eq $domainName) {
+            $matches += $raw
+        }
+    }
+    return @($matches | Select-Object -Unique)
+}
+
+function Test-RecipientHasDomain {
+    param([object]$Recipient, [string]$Domain)
+    $domainName = Normalize-DomainValue $Domain
+    if (-not $Recipient -or -not $domainName) { return $false }
+
+    $primary = [string]$Recipient.PrimarySmtpAddress
+    if ($primary -and (Get-EmailAddressDomain -Address $primary) -eq $domainName) { return $true }
+    return (@(Get-RecipientAddressesForDomain -Recipient $Recipient -Domain $domainName).Count -gt 0)
+}
+
 function New-Step {
     param([string]$Name)
     $step = [ordered]@{
@@ -114,9 +186,9 @@ function New-Step {
         startedAt = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
         attempt = if ($script:ActionRecord -and $script:ActionRecord.attempts -ne $null) { [int]$script:ActionRecord.attempts } else { 1 }
     }
-    $script:Steps += $step
-    Persist-Progress
-    return $step
+    $script:Steps += ,$step
+    Persist-Progress | Out-Null
+    return ,$step
 }
 
 function Complete-Step {
@@ -124,10 +196,10 @@ function Complete-Step {
         [object]$Step,
         [hashtable]$Details = $null
     )
-    $Step.status = "completed"
-    $Step.completedAt = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
-    if ($Details) { $Step.details = $Details }
-    Persist-Progress
+    $Step["status"] = "completed"
+    $Step["completedAt"] = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
+    if ($Details) { $Step["details"] = $Details }
+    Persist-Progress | Out-Null
 }
 
 function Fail-Step {
@@ -135,10 +207,10 @@ function Fail-Step {
         [object]$Step,
         [string]$ErrorMessage
     )
-    $Step.status = "failed"
-    $Step.completedAt = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
-    $Step.error = $ErrorMessage
-    Persist-Progress
+    $Step["status"] = "failed"
+    $Step["completedAt"] = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $Step["error"] = $ErrorMessage
+    Persist-Progress | Out-Null
 }
 
 function Persist-Progress {
@@ -210,7 +282,9 @@ function Remove-MailboxesByEmail {
                 Write-CancelLog -EventType "microsoft_cancel_dryrun_mailbox" -Severity "info" -Message "[DryRun] Would remove mailbox $email"
                 continue
             }
-            Remove-Mailbox -Identity $mailbox.Identity -Confirm:$false -ErrorAction Stop
+            # Use the exact SMTP address for removal. `$mailbox.Identity` can be
+            # a display name, which is ambiguous in bulk persona-style tenants.
+            Remove-Mailbox -Identity $email -Confirm:$false -ErrorAction Stop
             $deleted += 1
             Write-CancelLog -EventType "microsoft_cancel_mailbox_deleted" -Severity "info" -Message "Removed mailbox $email"
         } catch {
@@ -230,11 +304,34 @@ function Remove-MailboxesByEmail {
     return @{ Deleted = $deleted; Missing = $missing }
 }
 
-function Remove-ExchangeRecipientsByDomain {
-    param([string]$Domain)
+function Get-StableRecipientRemovalIdentity {
+    param([object]$Recipient)
 
-    $suffix = "@$($Domain.ToLower())"
+    if (-not $Recipient) { return "" }
+
+    $primary = [string]$Recipient.PrimarySmtpAddress
+    if ($primary) { return $primary }
+
+    $windowsEmail = [string]$Recipient.WindowsEmailAddress
+    if ($windowsEmail) { return $windowsEmail }
+
+    $externalDirectoryObjectId = [string]$Recipient.ExternalDirectoryObjectId
+    if ($externalDirectoryObjectId) { return $externalDirectoryObjectId }
+
+    $guid = [string]$Recipient.Guid
+    if ($guid) { return $guid }
+
+    return [string]$Recipient.Identity
+}
+
+function Remove-ExchangeRecipientsByDomain {
+    param([string]$Domain, [string]$ProtectedDomain = "")
+
+    $domainName = Normalize-DomainValue $Domain
+    $protectedDomainName = Normalize-DomainValue $ProtectedDomain
     $removed = 0
+    $aliasRemoved = 0
+    $protectedSkipped = 0
 
     $recipientList = @()
     try {
@@ -246,22 +343,48 @@ function Remove-ExchangeRecipientsByDomain {
     foreach ($recipient in $recipientList) {
         if (-not $recipient) { continue }
 
-        $belongsToDomain = $false
+        $oldAliases = @(Get-RecipientAddressesForDomain -Recipient $recipient -Domain $domainName)
         $primary = [string]$recipient.PrimarySmtpAddress
-        if ($primary -and $primary.ToLower().EndsWith($suffix)) {
-            $belongsToDomain = $true
-        } elseif ($recipient.EmailAddresses) {
-            foreach ($addr in @($recipient.EmailAddresses)) {
-                if (-not $addr) { continue }
-                $value = [string]$addr
-                if ($value.ToLower().Contains($suffix)) {
-                    $belongsToDomain = $true
-                    break
+        $primaryBelongsToDomain = ($primary -and (Get-EmailAddressDomain -Address $primary) -eq $domainName)
+        $hasOldDomainAlias = ($oldAliases.Count -gt 0)
+
+        if (-not $primaryBelongsToDomain -and -not $hasOldDomainAlias) { continue }
+
+        $hasProtectedDomain = ($protectedDomainName -and (Test-RecipientHasDomain -Recipient $recipient -Domain $protectedDomainName))
+        if ($hasProtectedDomain) {
+            $protectedSkipped += 1
+            if ($oldAliases.Count -gt 0) {
+                if ($DryRun) {
+                    Write-CancelLog -EventType "microsoft_cancel_dryrun_remove_protected_alias" -Severity "info" -Message "[DryRun] Would remove old-domain alias(es) from protected replacement recipient $($recipient.Identity): $($oldAliases -join ', ')"
+                } else {
+                    try {
+                        Set-Mailbox -Identity $recipient.Identity -EmailAddresses @{Remove=$oldAliases} -Confirm:$false -ErrorAction Stop
+                        $aliasRemoved += $oldAliases.Count
+                        Write-CancelLog -EventType "microsoft_cancel_protected_alias_removed" -Severity "warn" -Message "Removed old-domain alias(es) from protected replacement recipient $($recipient.Identity): $($oldAliases -join ', ')"
+                    } catch {
+                        Write-CancelLog -EventType "microsoft_cancel_protected_alias_remove_error" -Severity "error" -Message "Failed to remove old-domain alias(es) from protected replacement recipient $($recipient.Identity): $($_.Exception.Message)"
+                    }
                 }
             }
+            continue
         }
 
-        if (-not $belongsToDomain) { continue }
+        if (-not $primaryBelongsToDomain) {
+            if ($oldAliases.Count -gt 0) {
+                if ($DryRun) {
+                    Write-CancelLog -EventType "microsoft_cancel_dryrun_remove_alias" -Severity "info" -Message "[DryRun] Would remove old-domain alias(es) from non-domain-primary recipient $($recipient.Identity): $($oldAliases -join ', ')"
+                } else {
+                    try {
+                        Set-Mailbox -Identity $recipient.Identity -EmailAddresses @{Remove=$oldAliases} -Confirm:$false -ErrorAction Stop
+                        $aliasRemoved += $oldAliases.Count
+                        Write-CancelLog -EventType "microsoft_cancel_alias_removed" -Severity "warn" -Message "Removed old-domain alias(es) from non-domain-primary recipient $($recipient.Identity): $($oldAliases -join ', ')"
+                    } catch {
+                        Write-CancelLog -EventType "microsoft_cancel_alias_remove_error" -Severity "warn" -Message "Failed to remove old-domain alias(es) from $($recipient.Identity): $($_.Exception.Message)"
+                    }
+                }
+            }
+            continue
+        }
 
         if ($DryRun) {
             Write-CancelLog -EventType "microsoft_cancel_dryrun_recipient" -Severity "info" -Message "[DryRun] Would remove recipient $($recipient.Identity) [$($recipient.RecipientTypeDetails)]"
@@ -270,37 +393,38 @@ function Remove-ExchangeRecipientsByDomain {
 
         try {
             $recipientType = [string]$recipient.RecipientTypeDetails
+            $removeIdentity = Get-StableRecipientRemovalIdentity -Recipient $recipient
             switch ($recipientType) {
                 "MailUniversalDistributionGroup" {
-                    Remove-DistributionGroup -Identity $recipient.Identity -BypassSecurityGroupManagerCheck -Confirm:$false -ErrorAction Stop
+                    Remove-DistributionGroup -Identity $removeIdentity -BypassSecurityGroupManagerCheck -Confirm:$false -ErrorAction Stop
                     $removed += 1
                 }
                 "MailUniversalSecurityGroup" {
-                    Remove-DistributionGroup -Identity $recipient.Identity -BypassSecurityGroupManagerCheck -Confirm:$false -ErrorAction Stop
+                    Remove-DistributionGroup -Identity $removeIdentity -BypassSecurityGroupManagerCheck -Confirm:$false -ErrorAction Stop
                     $removed += 1
                 }
                 "GroupMailbox" {
-                    Remove-UnifiedGroup -Identity $recipient.Identity -Confirm:$false -ErrorAction Stop
+                    Remove-UnifiedGroup -Identity $removeIdentity -Confirm:$false -ErrorAction Stop
                     $removed += 1
                 }
                 "MailContact" {
-                    Remove-MailContact -Identity $recipient.Identity -Confirm:$false -ErrorAction Stop
+                    Remove-MailContact -Identity $removeIdentity -Confirm:$false -ErrorAction Stop
                     $removed += 1
                 }
                 "MailUser" {
-                    Remove-MailUser -Identity $recipient.Identity -Confirm:$false -ErrorAction Stop
+                    Remove-MailUser -Identity $removeIdentity -Confirm:$false -ErrorAction Stop
                     $removed += 1
                 }
                 "RoomMailbox" {
-                    Remove-Mailbox -Identity $recipient.Identity -Confirm:$false -ErrorAction Stop
+                    Remove-Mailbox -Identity $removeIdentity -Confirm:$false -ErrorAction Stop
                     $removed += 1
                 }
                 "UserMailbox" {
-                    Remove-Mailbox -Identity $recipient.Identity -Confirm:$false -ErrorAction Stop
+                    Remove-Mailbox -Identity $removeIdentity -Confirm:$false -ErrorAction Stop
                     $removed += 1
                 }
                 "SharedMailbox" {
-                    Remove-Mailbox -Identity $recipient.Identity -Confirm:$false -ErrorAction Stop
+                    Remove-Mailbox -Identity $removeIdentity -Confirm:$false -ErrorAction Stop
                     $removed += 1
                 }
                 default {
@@ -313,7 +437,9 @@ function Remove-ExchangeRecipientsByDomain {
     }
 
     $script:Summary.recipientCleanupDeleted = [int]$script:Summary.recipientCleanupDeleted + $removed
-    return @{ Removed = $removed }
+    $script:Summary.recipientAliasCleanupRemoved = [int]$script:Summary.recipientAliasCleanupRemoved + $aliasRemoved
+    $script:Summary.recipientProtectedSkipped = [int]$script:Summary.recipientProtectedSkipped + $protectedSkipped
+    return @{ Removed = $removed; AliasRemoved = $aliasRemoved; ProtectedSkipped = $protectedSkipped }
 }
 
 function Get-GraphUsersByDomain {
@@ -382,6 +508,7 @@ function Remove-AcceptedDomainWithRetry {
         [string]$Domain,
         [string]$Bearer,
         [string]$AdminEmail,
+        [string]$ProtectedDomain = "",
         [int]$MaxAttempts = 6
     )
 
@@ -425,7 +552,7 @@ function Remove-AcceptedDomainWithRetry {
             Write-CancelLog -EventType "microsoft_cancel_domain_remove_retry" -Severity "warn" -Message "Remove accepted domain failed (attempt $attempt/$MaxAttempts): $errorText"
 
             if ($attempt -lt $MaxAttempts) {
-                Remove-ExchangeRecipientsByDomain -Domain $Domain | Out-Null
+                Remove-ExchangeRecipientsByDomain -Domain $Domain -ProtectedDomain $ProtectedDomain | Out-Null
                 Remove-GraphUsersByDomain -Bearer $Bearer -Domain $Domain -AdminEmail $AdminEmail | Out-Null
                 Start-Sleep -Seconds ([Math]::Min(60, 10 * $attempt))
                 continue
@@ -518,6 +645,14 @@ if (-not $script:DomainRecord) {
 
 $script:DomainName = [string]$script:DomainRecord.domain
 $script:CustomerId = [string]$script:DomainRecord.customer_id
+$script:ReplacementProtectedDomain = Get-ReplacementProtectedDomain
+if ($script:ReplacementProtectedDomain) {
+    $script:Summary.replacementProtectedDomain = $script:ReplacementProtectedDomain
+    Write-CancelLog -EventType "microsoft_cancel_replacement_protection_enabled" -Severity "warn" -Message "Replacement cancellation guard enabled: protected new domain $($script:ReplacementProtectedDomain) will not be deleted while cancelling $($script:DomainName)" -Metadata @{
+        old_domain = $script:DomainName
+        protected_domain = $script:ReplacementProtectedDomain
+    }
+}
 
 if ([string]$script:DomainRecord.provider -ne "microsoft" -and [string]$script:DomainRecord.provider -ne "smtp_plus" -and [string]$script:DomainRecord.provider -ne "azure") {
     Update-ActionStatus -ActionId $ActionId -Status "failed" -Error "microsoft_cancel_domain is only valid for Microsoft-backed domains"
@@ -535,7 +670,7 @@ Persist-Progress
 $adminStep = New-Step -Name "resolve_admin"
 $assignedAdminRecord = Get-AssignedAdmin -DomainId $DomainId
 $preferredAdminId = if ($assignedAdminRecord -and $assignedAdminRecord.id) { [string]$assignedAdminRecord.id } else { $null }
-$adminRecord = Acquire-MicrosoftAdminLock -ActionId $ActionId -DomainId $DomainId -PreferredAdminId $preferredAdminId
+$adminRecord = Acquire-MicrosoftAdminLock -ActionId $ActionId -DomainId $DomainId -PreferredAdminId $preferredAdminId -AllowThresholdExceededPreferredAdmin
 if (-not $adminRecord) {
     if (Test-ActiveAdminExists -Provider "microsoft") {
         $waitMessage = if ($preferredAdminId) {
@@ -594,9 +729,11 @@ try {
     }
 
     $recipientStep = New-Step -Name "cleanup_exchange_recipients"
-    $recipientResult = Remove-ExchangeRecipientsByDomain -Domain $script:DomainName
+    $recipientResult = Remove-ExchangeRecipientsByDomain -Domain $script:DomainName -ProtectedDomain $script:ReplacementProtectedDomain
     Complete-Step -Step $recipientStep -Details @{
         removed = $recipientResult.Removed
+        aliases_removed = $recipientResult.AliasRemoved
+        protected_skipped = $recipientResult.ProtectedSkipped
         error = $recipientResult.Error
     }
 
@@ -608,7 +745,7 @@ try {
     }
 
     $removeDomainStep = New-Step -Name "remove_accepted_domain"
-    $removeDomainResult = Remove-AcceptedDomainWithRetry -Domain $script:DomainName -Bearer $bearer -AdminEmail $adminEmail -MaxAttempts 6
+    $removeDomainResult = Remove-AcceptedDomainWithRetry -Domain $script:DomainName -Bearer $bearer -AdminEmail $adminEmail -ProtectedDomain $script:ReplacementProtectedDomain -MaxAttempts 6
     if (-not $removeDomainResult.Success) {
         Fail-CancellationAction -ErrorMessage "Failed to remove accepted domain $($script:DomainName): $($removeDomainResult.Error)" -FailedStep $removeDomainStep
         exit 1

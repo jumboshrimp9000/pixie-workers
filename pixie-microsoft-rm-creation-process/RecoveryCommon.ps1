@@ -1029,20 +1029,41 @@ function Complete-RecoveryDKIMSetup {
 
 function Add-RecoveryMailboxToInstantly {
     param(
+        [string]$RecoveryPoolId,
         [string]$Email,
-        [string]$Password
+        [string]$Password,
+        [string]$Provider = "microsoft"
     )
-    $body = @{
+
+    if (-not $Email) { throw "Recovery mailbox email is required for Instantly upload" }
+    if (-not $Password) { throw "Recovery mailbox password is required for Instantly upload" }
+    if (-not $env:CRON_SECRET) { throw "CRON_SECRET is required for Recovery Pool Instantly OAuth upload" }
+
+    $baseUrl = [string]$env:PIXIE_APP_API_BASE_URL
+    if (-not $baseUrl) { $baseUrl = "https://app.simpleinboxes.com/api/v1" }
+    $uri = "$($baseUrl.TrimEnd('/'))/internal/recovery/upload-instantly"
+
+    $bodyHash = @{
+        recoveryPoolId = $RecoveryPoolId
         email = $Email
         password = $Password
-        smtp_host = "smtp.office365.com"
-        smtp_port = 587
-        imap_host = "outlook.office365.com"
-        imap_port = 993
-        type = "microsoft"
+        provider = $Provider
     }
-    $response = Invoke-RestMethod -Method POST -Uri "https://api.instantly.ai/api/v2/accounts" -Headers @{ Authorization = "Bearer $($env:INSTANTLY_RECOVERY_API_KEY)" } -Body ($body | ConvertTo-Json -Depth 10) -ContentType "application/json" -TimeoutSec 30 -ErrorAction Stop
-    foreach ($candidate in @($response.id, $response.account_id, $response.accountId, $response.email, $Email)) {
+    if ($env:INSTANTLY_RECOVERY_API_KEY) {
+        $bodyHash.apiKey = [string]$env:INSTANTLY_RECOVERY_API_KEY
+    }
+
+    try {
+        $response = Invoke-RestMethod -Method POST -Uri $uri -Headers @{ "X-Cron-Secret" = $env:CRON_SECRET } -Body ($bodyHash | ConvertTo-Json -Depth 8) -ContentType "application/json" -TimeoutSec 600 -ErrorAction Stop
+    } catch {
+        throw "Instantly recovery OAuth upload failed for ${Email}: $($_.Exception.Message)"
+    }
+
+    if (-not $response.success) {
+        throw "Instantly recovery OAuth upload failed for ${Email}: $($response.message)"
+    }
+
+    foreach ($candidate in @($response.data.accountId, $response.data.account_id, $response.data.email, $Email)) {
         if ($null -ne $candidate -and [string]$candidate) { return [string]$candidate }
     }
     return [string]$Email

@@ -2543,19 +2543,43 @@ class GoogleAdminPlaywrightClient:
         # New Google accounts can bounce through multiple interstitial pages
         # (speedbump, terms, promo pages). Handle known safe prompts only.
         for _ in range(6):
-            handled = False
-            if self._dismiss_sign_in_to_chrome_prompt_if_present():
-                handled = True
-            if self._accept_new_account_terms_if_present():
-                handled = True
-            if self._accept_pending_terms_of_service_if_present():
-                handled = True
-            self._maybe_complete_totp_challenge(email, onepassword)
-            if self._dismiss_common_interstitials():
-                handled = True
+            handled = self._handle_google_signin_interstitials_once(email, onepassword)
+            if not handled and self._has_google_sign_in_prompt():
+                self._maybe_complete_totp_challenge(email, onepassword)
             if not handled:
                 break
             time.sleep(0.8)
+
+    def _handle_google_signin_interstitials_once(
+        self,
+        email: str,
+        onepassword: Optional[OnePasswordCliClient],
+    ) -> bool:
+        handled = False
+        if self._dismiss_sign_in_to_chrome_prompt_if_present():
+            handled = True
+        if self._accept_new_account_terms_if_present():
+            handled = True
+        if self._accept_pending_terms_of_service_if_present():
+            handled = True
+        if self._dismiss_common_interstitials():
+            handled = True
+
+        if handled and self._exists(
+            [
+                "input[name='totpPin']",
+                "input[name='Pin']",
+                "input#totpPin",
+                "input[aria-label*='code']",
+                "input[inputmode='numeric']",
+                "input[type='tel'][autocomplete='one-time-code']",
+                "input[type='tel']",
+            ],
+            timeout_ms=1_200,
+        ):
+            self._maybe_complete_totp_challenge(email, onepassword)
+
+        return handled
 
     def _open_2sv_page(
         self,
@@ -2636,6 +2660,9 @@ class GoogleAdminPlaywrightClient:
 
         for _ in range(10):
             self._raise_if_google_signin_rejected(email=email)
+            if self._handle_google_signin_interstitials_once(email, onepassword):
+                time.sleep(1.0)
+                continue
             self._raise_if_google_signin_challenge_blocked(email=email, context=context)
             if not self._has_google_sign_in_prompt():
                 return
@@ -2879,6 +2906,10 @@ class GoogleAdminPlaywrightClient:
                 "//input[@value='I understand']",
                 "//button[.//span[text()='I understand']]",
                 "//span[text()='I understand']",
+                "//button[normalize-space()='I understand']",
+                "//button[.//span[contains(normalize-space(), 'Continue')]]",
+                "//span[contains(normalize-space(), 'Continue')]",
+                "//button[@aria-label='I understand']",
             ],
             timeout_ms=8_000,
             optional=True,
@@ -2914,6 +2945,12 @@ class GoogleAdminPlaywrightClient:
                 "//button[.//span[contains(translate(normalize-space(.), 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'ACCEPT TERMS OF SERVICE')]]",
                 "//span[contains(translate(normalize-space(.), 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'ACCEPT TERMS OF SERVICE')]",
                 "//button[contains(@aria-label, 'Accept Terms of Service')]",
+                "//button[.//span[contains(translate(normalize-space(.), 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'ACCEPT')]]",
+                "//span[contains(translate(normalize-space(.), 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'ACCEPT')]",
+                "//button[.//span[contains(translate(normalize-space(.), 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'I AGREE')]]",
+                "//span[contains(translate(normalize-space(.), 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'I AGREE')]",
+                "//button[.//span[contains(translate(normalize-space(.), 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'CONTINUE')]]",
+                "//span[contains(translate(normalize-space(.), 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'CONTINUE')]",
             ],
             timeout_ms=10_000,
             optional=True,

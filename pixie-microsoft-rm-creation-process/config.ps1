@@ -40,6 +40,26 @@ if (-not $global:ActionLeaseFences) {
     $global:ActionLeaseFences = @{}
 }
 
+function ConvertTo-ActionTimestampString {
+    param([object]$Value)
+
+    if (-not $Value) { return $null }
+    if ($Value -is [DateTimeOffset]) {
+        return $Value.UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ", [Globalization.CultureInfo]::InvariantCulture)
+    }
+    if ($Value -is [DateTime]) {
+        return $Value.ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ", [Globalization.CultureInfo]::InvariantCulture)
+    }
+
+    $text = ([string]$Value).Trim()
+    if (-not $text) { return $null }
+    try {
+        return ([DateTimeOffset]::Parse($text, [Globalization.CultureInfo]::InvariantCulture)).UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ", [Globalization.CultureInfo]::InvariantCulture)
+    } catch {
+        return $text
+    }
+}
+
 # ============================================================================
 # LOGGING
 # ============================================================================
@@ -79,7 +99,7 @@ function Register-ActionLeaseFence {
     $global:ActionLeaseFences[$actionId] = [pscustomobject]@{
         ActionId      = $actionId
         Attempts      = if ($Action.attempts -ne $null) { [int]$Action.attempts } else { 0 }
-        StartedAt     = if ($Action.started_at) { [string]$Action.started_at } else { $null }
+        StartedAt     = ConvertTo-ActionTimestampString $Action.started_at
         Timer         = if ($existing) { $existing.Timer } else { $null }
         Subscription  = if ($existing) { $existing.Subscription } else { $null }
         SourceId      = if ($existing) { $existing.SourceId } else { "action-lease-$actionId" }
@@ -104,7 +124,7 @@ function Get-ActionLeaseFence {
         return [pscustomobject]@{
             ActionId  = $actionKey
             Attempts  = if ($Action.attempts -ne $null) { [int]$Action.attempts } else { 0 }
-            StartedAt = if ($Action.started_at) { [string]$Action.started_at } else { $null }
+            StartedAt = ConvertTo-ActionTimestampString $Action.started_at
         }
     }
 
@@ -127,8 +147,9 @@ function Get-ActionFenceQuery {
     }
 
     $query += "&status=eq.in_progress&attempts=eq.$($fence.Attempts)"
-    if ($fence.StartedAt) {
-        $query += "&started_at=eq.$([uri]::EscapeDataString([string]$fence.StartedAt))"
+    $startedAt = ConvertTo-ActionTimestampString $fence.StartedAt
+    if ($startedAt) {
+        $query += "&started_at=eq.$([uri]::EscapeDataString($startedAt))"
     } else {
         $query += "&started_at=is.null"
     }
@@ -159,7 +180,15 @@ function Start-ActionLeaseHeartbeat {
 
         $fence = $global:ActionLeaseFences[$actionId]
         $nextStartedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-        $startedFilter = if ($fence.StartedAt) { "started_at=eq.$([uri]::EscapeDataString([string]$fence.StartedAt))" } else { "started_at=is.null" }
+        $startedAt = $null
+        if ($fence.StartedAt) {
+            try {
+                $startedAt = ([DateTimeOffset]::Parse(([string]$fence.StartedAt).Trim(), [Globalization.CultureInfo]::InvariantCulture)).UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ", [Globalization.CultureInfo]::InvariantCulture)
+            } catch {
+                $startedAt = [string]$fence.StartedAt
+            }
+        }
+        $startedFilter = if ($startedAt) { "started_at=eq.$([uri]::EscapeDataString($startedAt))" } else { "started_at=is.null" }
         $query = "id=eq.$actionId&status=eq.in_progress&attempts=eq.$($fence.Attempts)&$startedFilter"
         $headers = @{
             "apikey"        = $data.ServiceRoleKey
@@ -169,10 +198,18 @@ function Start-ActionLeaseHeartbeat {
         }
         $body = @{ started_at = $nextStartedAt } | ConvertTo-Json -Depth 4 -Compress
         try {
-            $rows = Invoke-RestMethod -Method PATCH -Uri "$($data.BaseUrl)/rest/v1/actions?$query" -Headers $headers -Body $body -TimeoutSec 60 -ErrorAction Stop
+            $rows = Invoke-RestMethod -Method PATCH -Uri "$($data.BaseUrl)/rest/v1/actions?$query" -Headers $headers -Body $body -UserAgent "pixie-worker/1.0 (PowerShell)" -TimeoutSec 60 -ErrorAction Stop
             $rowList = @($rows)
             if ($rowList.Count -gt 0) {
-                $fence.StartedAt = if ($rowList[0].started_at) { [string]$rowList[0].started_at } else { $nextStartedAt }
+                if ($rowList[0].started_at) {
+                    try {
+                        $fence.StartedAt = ([DateTimeOffset]::Parse(([string]$rowList[0].started_at).Trim(), [Globalization.CultureInfo]::InvariantCulture)).UtcDateTime.ToString("yyyy-MM-ddTHH:mm:ssZ", [Globalization.CultureInfo]::InvariantCulture)
+                    } catch {
+                        $fence.StartedAt = [string]$rowList[0].started_at
+                    }
+                } else {
+                    $fence.StartedAt = $nextStartedAt
+                }
             } else {
                 Write-Host "[WARN] Action lease heartbeat lost fence for $actionId" -ForegroundColor Yellow
                 $Event.Sender.Stop()
@@ -246,17 +283,30 @@ function Invoke-SupabaseApi {
         $params.Body = if ($Body -is [string]) { $Body } else { $Body | ConvertTo-Json -Depth 10 -Compress }
     }
 
-    try {
-        $response = Invoke-RestMethod @params
-        return @{ Success = $true; Data = $response }
-    } catch {
-        $errorMsg = $_.Exception.Message
-        if ($_.ErrorDetails.Message) {
-            try { $errorMsg = ($_.ErrorDetails.Message | ConvertFrom-Json).message } catch { $errorMsg = $_.ErrorDetails.Message }
+    $upperMethod = ([string]$Method).ToUpperInvariant()
+    $maxAttempts = if ($upperMethod -in @("GET", "PATCH", "DELETE") -or [string]$Table -eq "action_logs") { 3 } else { 1 }
+    $lastError = ""
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        try {
+            $response = Invoke-RestMethod @params
+            return @{ Success = $true; Data = $response }
+        } catch {
+            $errorMsg = $_.Exception.Message
+            if ($_.ErrorDetails.Message) {
+                try { $errorMsg = ($_.ErrorDetails.Message | ConvertFrom-Json).message } catch { $errorMsg = $_.ErrorDetails.Message }
+            }
+            if (-not $errorMsg) { $errorMsg = "unknown Supabase API error" }
+            $lastError = $errorMsg
+            if ($attempt -lt $maxAttempts) {
+                $delaySeconds = 2 * $attempt
+                Write-Log "Supabase API retry $attempt/$maxAttempts ($Table): $errorMsg; waiting ${delaySeconds}s" -Level Warning
+                Start-Sleep -Seconds $delaySeconds
+                continue
+            }
         }
-        Write-Log "Supabase API error ($Table): $errorMsg" -Level Error
-        return @{ Success = $false; Error = $errorMsg }
     }
+    Write-Log "Supabase API error ($Table): $lastError" -Level Error
+    return @{ Success = $false; Error = $lastError }
 }
 
 function Invoke-SupabaseRpc {
@@ -308,41 +358,65 @@ function Invoke-SupabaseRpc {
 function Get-PendingActions {
     param(
         [string[]]$ActionTypes = @("provision_inbox"),
+        [string[]]$ActionSources = @(),
         [int]$Limit = 10
     )
 
     $validTypes = @($ActionTypes | Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() })
     if ($validTypes.Count -eq 0) { return @() }
+    $validSources = @($ActionSources | Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() })
+    $fetchLimit = if ($validSources.Count -gt 0) { [Math]::Max($Limit * 20, 100) } else { $Limit }
 
     $encodedTypes = ($validTypes -join ",")
-    $pendingQuery = "type=in.($encodedTypes)&status=eq.pending&order=created_at.asc&limit=$Limit"
+    $nowIso = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $pendingQuery = "type=in.($encodedTypes)&status=eq.pending&or=(next_retry_at.is.null,next_retry_at.lte.$nowIso)&order=created_at.asc&limit=$fetchLimit"
     $pendingResult = Invoke-SupabaseApi -Method GET -Table "actions" -Query $pendingQuery
     if (-not $pendingResult.Success) { return @() }
 
     $leaseSeconds = Get-WorkerActionLeaseSeconds
     $reclaimBefore = (Get-Date).ToUniversalTime().AddSeconds(-$leaseSeconds).ToString("yyyy-MM-ddTHH:mm:ssZ")
-    $staleQuery = "type=in.($encodedTypes)&status=eq.in_progress&or=(started_at.is.null,started_at.lte.$reclaimBefore)&order=created_at.asc&limit=$Limit"
+    $staleQuery = "type=in.($encodedTypes)&status=eq.in_progress&or=(started_at.is.null,started_at.lte.$reclaimBefore)&order=created_at.asc&limit=$fetchLimit"
     $staleResult = Invoke-SupabaseApi -Method GET -Table "actions" -Query $staleQuery
     if (-not $staleResult.Success) { return @() }
 
     $now = Get-Date
+    $pendingMinAgeSeconds = 0
+    if ($env:WORKER_PENDING_MIN_AGE_SECONDS) {
+        try { $pendingMinAgeSeconds = [Math]::Max(0, [int][double]$env:WORKER_PENDING_MIN_AGE_SECONDS) } catch { $pendingMinAgeSeconds = 0 }
+    }
     return @(@($pendingResult.Data) + @($staleResult.Data) | Sort-Object created_at | Where-Object {
         $attempts = if ($_.attempts -ne $null) { [int]$_.attempts } else { 0 }
         $maxAttempts = if ($_.max_attempts -ne $null) { [int]$_.max_attempts } else { 3 }
-        if ($attempts -ge $maxAttempts) { return $false }
+        $includeAction = $true
+        if ($attempts -ge $maxAttempts) { $includeAction = $false }
 
-        if ($_.status -eq "pending") {
+        if ($includeAction -and $_.status -eq "pending") {
             $nextRetryAt = $null
             if ($_.next_retry_at) {
                 try { $nextRetryAt = [DateTime]::Parse($_.next_retry_at).ToUniversalTime() } catch { $nextRetryAt = $null }
             }
 
             if ($nextRetryAt -and $nextRetryAt -gt $now.ToUniversalTime()) {
-                return $false
+                $includeAction = $false
             }
         }
 
-        return $true
+        if ($includeAction -and $pendingMinAgeSeconds -gt 0 -and $_.status -eq "pending" -and $_.updated_at) {
+            try {
+                $updatedAt = [DateTime]::Parse([string]$_.updated_at).ToUniversalTime()
+                if ($updatedAt -gt $now.ToUniversalTime().AddSeconds(-$pendingMinAgeSeconds)) {
+                    $includeAction = $false
+                }
+            } catch { }
+        }
+
+        if ($includeAction -and $validSources.Count -gt 0) {
+            $source = ""
+            if ($_.payload -and $_.payload.source) { $source = [string]$_.payload.source }
+            if ($validSources -notcontains $source) { $includeAction = $false }
+        }
+
+        $includeAction
     } | Select-Object -First $Limit)
 }
 
@@ -395,7 +469,9 @@ function Update-ActionStatus {
     if ($Status -eq "completed") { $body.completed_at = $now }
     if ($Error) { $body.error = $Error }
     if ($Result) { $body.result = $Result }
-    if ($PSBoundParameters.ContainsKey("NextRetryAt")) { $body.next_retry_at = $NextRetryAt }
+    if ($PSBoundParameters.ContainsKey("NextRetryAt")) {
+        $body.next_retry_at = if ([string]::IsNullOrWhiteSpace($NextRetryAt)) { $null } else { $NextRetryAt }
+    }
 
     $query = Get-ActionFenceQuery -ActionId $ActionId -Action $Action -RequireFence
     $result = Invoke-SupabaseApi -Method PATCH -Table "actions" -Query $query -Body $body
@@ -508,7 +584,8 @@ function Get-AvailableAdmin {
     param([string]$Provider = "microsoft")
 
     # Round-robin: pick the admin with lowest usage_count
-    $query = "provider=eq.$Provider&active=eq.true&order=usage_count.asc&limit=1"
+    $statusFilter = if ($Provider -eq "microsoft") { "&status=eq.Active" } else { "" }
+    $query = "provider=eq.$Provider&active=eq.true$statusFilter&order=usage_count.asc&limit=1"
     $result = Invoke-SupabaseApi -Method GET -Table "admin_credentials" -Query $query
     if ($result.Success -and $result.Data -and $result.Data.Count -gt 0) { return $result.Data[0] }
     return $null
@@ -517,9 +594,27 @@ function Get-AvailableAdmin {
 function Test-ActiveAdminExists {
     param([string]$Provider = "microsoft")
 
-    $query = "provider=eq.$Provider&active=eq.true&select=id&limit=1"
+    $statusFilter = if ($Provider -eq "microsoft") { "&status=eq.Active" } else { "" }
+    $query = "provider=eq.$Provider&active=eq.true$statusFilter&select=id&limit=1"
     $result = Invoke-SupabaseApi -Method GET -Table "admin_credentials" -Query $query
     return ($result.Success -and $result.Data -and $result.Data.Count -gt 0)
+}
+
+function Get-AdminCredentialById {
+    param([string]$AdminId)
+
+    if (-not $AdminId) { return $null }
+    $result = Invoke-SupabaseApi -Method GET -Table "admin_credentials" -Query "id=eq.$AdminId&limit=1&select=*"
+    if ($result.Success -and $result.Data -and $result.Data.Count -gt 0) { return $result.Data[0] }
+    return $null
+}
+
+function Test-MicrosoftAdminThresholdExceeded {
+    param([string]$AdminId)
+
+    $admin = Get-AdminCredentialById -AdminId $AdminId
+    if (-not $admin) { return $false }
+    return (([string]$admin.provider) -eq "microsoft" -and ([string]$admin.status) -eq "threshold exceeded")
 }
 
 function Acquire-MicrosoftAdminLock {
@@ -527,8 +622,34 @@ function Acquire-MicrosoftAdminLock {
         [string]$ActionId,
         [string]$DomainId,
         [string]$PreferredAdminId = $null,
-        [int]$LeaseSeconds = 21600
+        [int]$LeaseSeconds = 21600,
+        [switch]$AllowThresholdExceededPreferredAdmin
     )
+
+    if ($PreferredAdminId -and (Test-MicrosoftAdminThresholdExceeded -AdminId $PreferredAdminId)) {
+        if (-not $AllowThresholdExceededPreferredAdmin) {
+            throw "Assigned Microsoft admin $PreferredAdminId is marked threshold exceeded; refusing to use tenant."
+        }
+
+        $nowIso = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $lockExpiresAt = (Get-Date).ToUniversalTime().AddSeconds($LeaseSeconds).ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $encodedNowIso = [uri]::EscapeDataString($nowIso)
+        $query = "id=eq.$PreferredAdminId&provider=eq.microsoft&active=eq.true&or=(locked_by_action_id.eq.$ActionId,locked_by_action_id.is.null,lock_expires_at.is.null,lock_expires_at.lt.$encodedNowIso)"
+        $body = @{
+            lock_type = "microsoft_action"
+            locked_by_action_id = $ActionId
+            locked_domain_id = $DomainId
+            lock_acquired_at = $nowIso
+            lock_expires_at = $lockExpiresAt
+        }
+
+        $result = Invoke-SupabaseApi -Method PATCH -Table "admin_credentials" -Query $query -Body $body
+        if ($result.Success -and $result.Data) {
+            $rows = @($result.Data)
+            if ($rows.Count -gt 0) { return $rows[0] }
+        }
+        return $null
+    }
 
     $body = @{
         p_action_id = $ActionId
@@ -581,8 +702,11 @@ function Ensure-DomainAdminAssignment {
 
     if (-not $DomainId -or -not $AdminCredId) { return }
 
-    $existing = Invoke-SupabaseApi -Method GET -Table "domain_admin_assignments" -Query "domain_id=eq.$DomainId&admin_cred_id=eq.$AdminCredId&order=assigned_at.desc&limit=1&select=id"
-    if ($existing.Success -and $existing.Data -and $existing.Data.Count -gt 0) { return }
+    $current = Invoke-SupabaseApi -Method GET -Table "domain_admin_assignments" -Query "domain_id=eq.$DomainId&order=assigned_at.desc&limit=1&select=id,admin_cred_id,assigned_at"
+    if ($current.Success -and $current.Data -and $current.Data.Count -gt 0) {
+        $currentAdminCredId = [string]$current.Data[0].admin_cred_id
+        if ($currentAdminCredId -eq $AdminCredId) { return }
+    }
 
     New-DomainAdminAssignment -DomainId $DomainId -AdminCredId $AdminCredId
 }

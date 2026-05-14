@@ -466,6 +466,12 @@ try {
             } else {
                 $keepOldAlias = ([string]$mutationItem.keep_old_email_as_alias).Trim().ToLower() -eq "true"
             }
+        } elseif ($null -ne $update.keep_old_email_as_alias) {
+            if ($update.keep_old_email_as_alias -is [bool]) {
+                $keepOldAlias = [bool]$update.keep_old_email_as_alias
+            } else {
+                $keepOldAlias = ([string]$update.keep_old_email_as_alias).Trim().ToLower() -eq "true"
+            }
         }
 
         if (-not $newUsername) { $newUsername = ($newEmail -split '@')[0] }

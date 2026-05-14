@@ -1,6 +1,6 @@
 . (Join-Path $PSScriptRoot "config.ps1")
 
-$admin = (Invoke-SupabaseApi -Method GET -Table "admin_credentials" -Query "active=eq.true&limit=1").Data[0]
+$admin = (Invoke-SupabaseApi -Method GET -Table "admin_credentials" -Query "provider=eq.microsoft&active=eq.true&status=eq.Active&limit=1").Data[0]
 
 # Get Graph token
 $adminDomain = ($admin.email -split "@")[1]

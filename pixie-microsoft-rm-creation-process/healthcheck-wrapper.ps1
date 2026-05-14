@@ -11,6 +11,16 @@ $HeartbeatPath = "/tmp/pixie_microsoft_heartbeat"
 
 Write-Host "[healthcheck-wrapper] Starting heartbeat + run.ps1..." -ForegroundColor Cyan
 
+if (-not $env:WORKER_ACTION_LEASE_SECONDS) {
+    $env:WORKER_ACTION_LEASE_SECONDS = "7200"
+}
+if (-not $env:WORKER_ACTION_HEARTBEAT_SECONDS) {
+    $env:WORKER_ACTION_HEARTBEAT_SECONDS = "120"
+}
+if (-not $env:WORKER_ACTION_TYPES) {
+    $env:WORKER_ACTION_TYPES = "provision_inbox"
+}
+
 # Background job: touch heartbeat file every 30s
 $heartbeatJob = Start-Job -ScriptBlock {
     param($path)

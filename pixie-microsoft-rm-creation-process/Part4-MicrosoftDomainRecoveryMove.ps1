@@ -108,7 +108,7 @@ try {
         } elseif ($provider -eq "microsoft" -or $provider -eq "smtp_plus" -or $provider -eq "azure") {
             $assignedAdmin = if ($domainId) { Get-AssignedAdmin -DomainId $domainId } else { $null }
             $preferredAdminId = if ($assignedAdmin -and $assignedAdmin.id) { [string]$assignedAdmin.id } else { $null }
-            $sourceAdminRecord = Acquire-MicrosoftAdminLock -ActionId $actionId -DomainId $domainId -PreferredAdminId $preferredAdminId
+            $sourceAdminRecord = Acquire-MicrosoftAdminLock -ActionId $actionId -DomainId $domainId -PreferredAdminId $preferredAdminId -AllowThresholdExceededPreferredAdmin
             if (-not $sourceAdminRecord) {
                 if (Test-ActiveAdminExists -Provider "microsoft") {
                     Requeue-ActionWithoutPenalty -Action $actionRecord -Reason "Waiting for source Microsoft admin lock" -DelaySeconds 60
@@ -298,15 +298,12 @@ try {
     $instantlyStep = Start-RecoveryStep -ActionId $actionId -ActionType "microsoft_recovery_move" -Domain $domain -StepName "attach_recovery_mailbox_to_instantly" -StepMap $stepMap -Summary $summary -Attempt ([int]$actionRecord.attempts)
     if ([string]$instantlyStep.status -ne "completed") {
         $recoveryMailbox = if ($recoveryPool.recovery_mailbox) { [string]$recoveryPool.recovery_mailbox } else { "postmaster@$domain" }
-        $instantlyAccountId = if ($DryRun) { $recoveryMailbox } else { Add-RecoveryMailboxToInstantly -Email $recoveryMailbox -Password $env:RECOVERY_MAILBOX_PASSWORD }
-        if (-not $DryRun) {
-            Enable-RecoveryInstantlyWarmup -Email $recoveryMailbox | Out-Null
-        }
+        $instantlyAccountId = if ($DryRun) { $recoveryMailbox } else { Add-RecoveryMailboxToInstantly -RecoveryPoolId $recoveryPoolId -Email $recoveryMailbox -Password $env:RECOVERY_MAILBOX_PASSWORD -Provider "microsoft" }
         Update-RecoveryPool -RecoveryPoolId $recoveryPoolId -Fields @{
             instantly_account_id = $instantlyAccountId
         }
         $summary.instantly_account_id = $instantlyAccountId
-        Complete-RecoveryStep -ActionId $actionId -ActionType "microsoft_recovery_move" -Domain $domain -StepMap $stepMap -Summary $summary -StepName "attach_recovery_mailbox_to_instantly" -Details @{ instantly_account_id = $instantlyAccountId }
+        Complete-RecoveryStep -ActionId $actionId -ActionType "microsoft_recovery_move" -Domain $domain -StepMap $stepMap -Summary $summary -StepName "attach_recovery_mailbox_to_instantly" -Details @{ instantly_account_id = $instantlyAccountId; upload_method = "instantly_microsoft_oauth"; warmup = "10_per_day_slow_ramp_1_reply_60" }
     }
 
     $dnsblStep = Start-RecoveryStep -ActionId $actionId -ActionType "microsoft_recovery_move" -Domain $domain -StepName "dnsbl_check" -StepMap $stepMap -Summary $summary -Attempt ([int]$actionRecord.attempts)

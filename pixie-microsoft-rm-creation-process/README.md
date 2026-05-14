@@ -21,6 +21,12 @@ Part 1: Universal domain setup (TypeScript)
   - move nameservers to Cloudflare
   - wait for nameserver propagation
 
+Nameserver propagation gate:
+- Registrar APIs can accept a nameserver update before public DNS delegation has changed.
+- Part 1 verifies the domain's public NS records against the Cloudflare zone nameservers before Microsoft/Google provider verification begins.
+- If public NS still points elsewhere, the action is requeued without consuming an attempt, the domain stays in `Both - NS Propagation Pending`, and an admin-visible `dns_delegation_not_public` action log explains the hold.
+- This check is TLD-agnostic and uses the domain's assigned Cloudflare nameservers, not a `.info`-specific registry check.
+
 Part 2A: Microsoft provisioning (PowerShell)
   - acquire a lease on one Microsoft admin from Supabase
   - get Graph token + connect Exchange Online
@@ -90,6 +96,20 @@ Important behavior:
 
 For `azure`, this worker uses the same tenant, DNS, DKIM, upload, update, and cancellation lifecycle, but creates shared mailboxes with `New-Mailbox -Shared`. Azure username changes still run through `microsoft_update_inboxes`; cancellation still deletes only recipients/users whose email/UPN belongs to the cancelled domain.
 
+### Azure Accepted-Domain Recovery
+
+Some Microsoft tenants can show a domain as verified with `supportedServices=['Email']`, while Exchange still rejects `New-Mailbox -PrimarySmtpAddress user@domain` with "not an accepted domain" / "can't use the domain". When Azure shared-mailbox creation hits that exact blocker with zero created mailboxes, the worker performs a one-time recovery:
+
+- delete the Microsoft Graph domain object for that domain if it exists
+- rewind the domain to `Both - DNS Zone Created`
+- requeue the same `provision_inbox` action without consuming another attempt
+- let the normal add/verify/email-enable/Exchange-sync path re-add the domain before retrying mailbox creation
+
+Endpoint strategy and tradeoff:
+- The recovery uses Microsoft Graph `GET /domains/{domain}` and `DELETE /domains/{domain}` because Graph owns the tenant domain object and is the least UI-dependent way to force Microsoft to rebuild accepted-domain state.
+- The worker records `accepted_domain_readd_recovery.attempted=true` in `actions.result` and refuses to run the delete/re-add loop more than once for the same action. If the retry still fails, the admin-visible action logs keep the blocker as `azure_accepted_domain_mailbox_creation_blocked` for ops/engineering follow-up.
+- The recovery is scoped to Azure mailbox creation failures matching the accepted-domain text. Generic mailbox errors, parameter-set errors, DNS delays, and DKIM delays stay on their own retry paths.
+
 ## Sending Tool Upload Gate
 
 Microsoft-backed provisioning does not mark a domain `active` immediately after DKIM. After mailboxes are created and active inbox rows are verified, the worker enqueues a Supabase `actions.type='reupload_inboxes'` row with `payload.source='microsoft_provision'`.
@@ -99,6 +119,18 @@ Endpoint strategy and tradeoff:
 - While upload is pending, the domain stays `status='in_progress'` with `interim_status='Both - Sending Tool Upload Pending'`; the `provision_inbox` action is requeued without consuming attempts.
 - The domain is marked `active` only when the upload action is `completed`, has zero failed uploads, and reports `uploaded >= active inbox count`.
 - If no sending-tool credential is assigned, or the upload action fails validation, provisioning stops in an actionable upload-blocked/failed state instead of pretending completion.
+- Provider-side final proof should prefer Instantly API v2 `GET /accounts` domain search plus `GET /custom-tag-mappings` chunk reads, and only fall back to direct `GET /accounts/{email}` when the list response is missing required fields. This keeps verification deterministic while avoiding a full per-email sweep on healthy domains.
+- Treat Instantly warmup `reply_rate` as a human percent contract, not a raw transport value. The verifier must normalize both `0.6` and `60` to `60%` before deciding a mailbox is misconfigured.
+
+## Recovery Pool Instantly Upload
+
+`microsoft_recovery_move` creates the recovery mailbox as `postmaster@domain`, then calls the cron-protected AP endpoint `POST /api/v1/internal/recovery/upload-instantly`.
+
+Endpoint strategy and tradeoff:
+- Recovery Pool upload must use Instantly provider OAuth for Microsoft recovery mailboxes. Do not use the SMTP/IMAP account-create endpoint here.
+- The app backend owns the Playwright/OAuth flow through `SendingToolClient`, so this PowerShell worker does not duplicate browser automation.
+- The endpoint applies the Recovery Pool warmup profile after OAuth upload: warmup enabled, 10/day, slow ramp enabled, +1/day, 60% reply rate.
+- SMTP/IMAP upload remains valid only for true SMTP+ private inboxes, where the app intentionally uses the proxy/custom IMAP path.
 
 ## Microsoft Mutation Model
 
@@ -166,7 +198,8 @@ Practical effect:
 Deployment/config notes:
 - the production compose service is `pixie-microsoft` and should not be co-deployed inside the Google-only compose project
 - one-admin-at-a-time behavior depends on the Supabase RPCs `acquire_microsoft_admin_lock`, `refresh_microsoft_admin_lock`, and `release_microsoft_admin_lock`
-- Microsoft admin rows must exist in `admin_credentials` with `provider=microsoft` and `active=true`
+- Microsoft admin rows must exist in `admin_credentials` with `provider=microsoft`, `active=true`, and `status=Active`
+- `status=threshold exceeded` quarantines a Microsoft tenant; provisioning, mutation, cancellation, recovery move, and recovery reactivation refuse to lease that admin
 - `WORKER_ACTION_LEASE_SECONDS` controls stale action reclaim for crashed workers; it does not disable or replace the per-admin Supabase lock
 - the admin lock lease defaults to 7200 seconds in `Acquire-MicrosoftAdminLock`; actions that cannot obtain the lock are requeued without consuming an attempt
 
@@ -217,6 +250,9 @@ Provisioning resume:
 - `domains.interim_status` tracks the provisioning stage
 - `actions.result.steps[]` tracks step checkpoints
 - set the action back to `pending` to continue from the last good step
+
+Operational note:
+- For large read-only audits or one-off repair sweeps, prefer file-based entrypoints (`pwsh -File script.ps1 -DomainsFile manifest.txt`) over inline `pwsh -Command "..."` invocations. The production worker path is stable because it passes structured arguments to named scripts; ad hoc inline command text is where quoting drift showed up during the Jack/ProfitPath bulk run.
 
 Mutation resume:
 - completed item checkpoints are stored in `actions.result.steps[]`

@@ -8,4 +8,5 @@ debug_screens/
 debug_screens_nonheadless/
 debug_screenshots/
 pixie_google_smartlead/debug_screens_nonprofit/
+pixie-microsoft-rm-creation-process/logs/
 *.pyc

@@ -203,7 +203,7 @@ function Process-SingleAction {
     }
 
     # Determine which parts need to run based on interim_status
-    $part1Statuses = @("", "Both - New Order")  # Part 1 not done yet
+    $part1Statuses = @("", "Both - New Order", "Both - NS Propagation Pending")  # Part 1 not done yet or waiting on public NS
     $part2Statuses = @(
         "Both - DNS Zone Created", "Both - NS Migrated",
         "Microsoft - Added to M365", "Both - Verification TXT Added",
@@ -233,6 +233,15 @@ function Process-SingleAction {
             if ($part1Output -match "PART1_RESULT:FAILED") {
                 Write-Log "Part 1 FAILED — check output above" -Level Error
                 Fail-Action -Action $Action -ErrorMessage "Part 1 (domain setup) failed"
+                return
+            }
+            if ($part1Output -match "PART1_RESULT:DEFERRED:ns_propagation") {
+                $retrySeconds = 900
+                if ($env:WORKER_NS_PROPAGATION_RETRY_SECONDS) {
+                    try { $retrySeconds = [Math]::Max(60, [int][double]$env:WORKER_NS_PROPAGATION_RETRY_SECONDS) } catch { $retrySeconds = 900 }
+                }
+                Write-Log "Part 1 deferred — public nameserver delegation has not propagated yet; retrying in $retrySeconds seconds" -Level Warning
+                Requeue-ActionWithoutPenalty -Action $Action -Reason "DNS delegation not public yet: registrar update submitted, but public NS has not propagated to Cloudflare." -DelaySeconds $retrySeconds | Out-Null
                 return
             }
         } catch {
@@ -281,7 +290,20 @@ function Process-SingleAction {
 # MAIN LOOP
 # ============================================================================
 do {
-    $actions = Get-PendingActions -ActionTypes @("provision_inbox", "microsoft_update_inboxes", "microsoft_cancel_domain", "microsoft_recovery_move", "microsoft_recovery_reactivate", "microsoft_recovery_purge")
+    $defaultActionTypes = @("provision_inbox", "microsoft_update_inboxes", "microsoft_cancel_domain", "microsoft_recovery_move", "microsoft_recovery_reactivate", "microsoft_recovery_purge")
+    $configuredActionTypes = @($defaultActionTypes)
+    if ($env:WORKER_ACTION_TYPES) {
+        $configuredActionTypes = @($env:WORKER_ACTION_TYPES -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    } elseif ($env:WORKER_FILTER) {
+        $configuredActionTypes = @($env:WORKER_FILTER -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    }
+    $configuredActionSources = @()
+    if ($env:WORKER_ACTION_SOURCES) {
+        $configuredActionSources = @($env:WORKER_ACTION_SOURCES -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    } elseif ($env:WORKER_ACTION_SOURCE) {
+        $configuredActionSources = @($env:WORKER_ACTION_SOURCE -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    }
+    $actions = Get-PendingActions -ActionTypes $configuredActionTypes -ActionSources $configuredActionSources
 
     if ($actions -and $actions.Count -gt 0) {
         $toProcess = $actions

@@ -488,6 +488,17 @@ class NonprofitGoogleProvisionWorker:
                 persist_progress(INTERIM_STATUSES["USERS_CREATED"], "in_progress")
 
             app_config_checkpoint = checkpoint("configure_admin_apps")
+            if app_config_checkpoint and not self._admin_apps_checkpoint_satisfies_plan(app_config_checkpoint, app_plan):
+                log_event(
+                    "step_warning",
+                    "warn",
+                    "[configure_admin_apps] Previous checkpoint is missing one or more requested Google app IDs; re-running app allowlist.",
+                    {
+                        "requested": app_plan.get("all") or [],
+                        "checkpoint": app_config_checkpoint,
+                    },
+                )
+                app_config_checkpoint = None
             if not app_config_checkpoint:
                 step = start_step("configure_admin_apps")
                 try:
@@ -1312,7 +1323,16 @@ class NonprofitGoogleProvisionWorker:
             ],
             provider="google",
             credential={"api_key": api_key},
-            settings={"enableWarmup": True, "instantlyWarmup": {"enabled": True}},
+            settings={
+                "enableWarmup": True,
+                "enableSlowRamp": True,
+                "instantlyWarmup": {
+                    "enabled": True,
+                    "limit": 10,
+                    "increment": "1",
+                    "reply_rate": 60,
+                },
+            },
             onepassword=onepassword,
             headless=self.playwright_headless,
             use_playwright_oauth=True,
@@ -1740,6 +1760,31 @@ class NonprofitGoogleProvisionWorker:
             "all": merged,
         }
 
+    def _admin_apps_checkpoint_satisfies_plan(
+        self,
+        checkpoint: Dict[str, Any],
+        app_plan: Dict[str, List[str]],
+    ) -> bool:
+        planned = {
+            str(value or "").strip()
+            for value in (app_plan.get("all") or [])
+            if str(value or "").strip()
+        }
+        if not planned:
+            return True
+        if not isinstance(checkpoint, dict):
+            return False
+
+        requested = set(self._flatten_google_app_id_input(checkpoint.get("requested")))
+        if not requested:
+            requested = set(self._flatten_google_app_id_input(checkpoint.get("required_app_ids")))
+            requested.update(self._flatten_google_app_id_input(checkpoint.get("optional_app_ids")))
+
+        configured = set(self._flatten_google_app_id_input(checkpoint.get("added")))
+        configured.update(self._flatten_google_app_id_input(checkpoint.get("already_configured")))
+
+        return planned.issubset(requested) and planned.issubset(configured)
+
     def _parse_google_app_ids(self, value: Any) -> List[str]:
         parsed: List[str] = []
         seen = set()
@@ -1852,10 +1897,11 @@ class NonprofitGoogleProvisionWorker:
                 global_api_key=global_key,
                 global_email=global_email,
             )
+            auth_mode = "global" if global_key and global_email else "token"
             logger.info(
-                "Cloudflare auth configured for nonprofit worker (mode=%s, global_fallback=%s, account_id_set=%s)",
-                "token" if api_token else "global",
-                bool(api_token and global_key and global_email),
+                "Cloudflare auth configured for nonprofit worker (mode=%s, token_fallback=%s, account_id_set=%s)",
+                auth_mode,
+                bool(api_token and auth_mode == "global"),
                 bool(os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()),
             )
         return self._cloudflare

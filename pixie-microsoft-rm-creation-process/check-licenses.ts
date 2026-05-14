@@ -30,7 +30,13 @@ async function getToken(tenantId: string, username: string, password: string) {
 }
 
 async function main() {
-  const { data: admin } = await sb.from("admin_credentials").select("*").eq("active", true).single();
+  const { data: admin } = await sb
+    .from("admin_credentials")
+    .select("*")
+    .eq("provider", "microsoft")
+    .eq("active", true)
+    .eq("status", "Active")
+    .single();
   if (!admin) { console.error("No admin"); process.exit(1); }
 
   const domain = admin.email.split("@")[1];
