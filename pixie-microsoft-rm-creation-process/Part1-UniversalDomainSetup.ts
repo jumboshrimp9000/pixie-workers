@@ -5,7 +5,7 @@
  *   1. Domain purchase via Dynadot (if source = 'buy')
  *   2. Cloudflare zone creation
  *   3. Nameserver migration to Cloudflare (purchased domains)
- *   4. NS propagation check (informational)
+ *   4. Public NS propagation gate before provider verification
  *
  * This runs as a standalone TypeScript script called by the orchestrator (run.ps1).
  * It takes a domain_id as argument, processes that domain, and exits.
@@ -16,6 +16,7 @@
 import { createClient } from "@supabase/supabase-js";
 import axios from "axios";
 import dotenv from "dotenv";
+import { resolveNs } from "dns/promises";
 import { resolve, dirname } from "path";
 import { fileURLToPath } from "url";
 
@@ -131,6 +132,59 @@ async function isCloudflareZoneActive(zoneId: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+function normalizeNs(value: string): string {
+  return value.trim().toLowerCase().replace(/\.$/, "");
+}
+
+function nameserversMatchExpected(actual: string[], expected: string[]): boolean {
+  if (actual.length === 0 || expected.length === 0) return false;
+  const actualSet = new Set(actual.map(normalizeNs));
+  return expected.map(normalizeNs).every(ns => actualSet.has(ns));
+}
+
+async function getPublicNameservers(domain: string): Promise<string[]> {
+  try {
+    return await resolveNs(domain);
+  } catch {
+    return [];
+  }
+}
+
+async function deferForNameserverPropagation(
+  actionId: string,
+  domainId: string,
+  customerId: string,
+  domain: string,
+  history: string,
+  expectedNameservers: string[],
+  actualNameservers: string[]
+): Promise<string> {
+  const nextHistory = addHistory(
+    history,
+    "OPS HOLD: dns_delegation_not_public. Registrar nameserver update is submitted, but public NS has not delegated to Cloudflare yet; Microsoft verification will retry after propagation."
+  );
+  await updateDomain(domainId, {
+    status: "in_progress",
+    interim_status: "Both - NS Propagation Pending",
+    action_history: nextHistory,
+    nameserver_automation_status: "pending_ns_propagation",
+    nameserver_automation_error: "Public nameservers have not propagated to Cloudflare yet",
+    nameserver_automation_checked_at: new Date().toISOString(),
+  });
+  await addActionLog(
+    actionId,
+    domainId,
+    customerId,
+    "dns_delegation_not_public",
+    "warn",
+    "DNS delegation is not publicly on Cloudflare yet; Microsoft domain verification is paused until propagation completes.",
+    { expectedNameservers, actualNameservers }
+  );
+  log("warn", `Public NS not on Cloudflare yet for ${domain}. Expected ${expectedNameservers.join(", ")}; actual ${actualNameservers.join(", ") || "none"}`);
+  console.log("PART1_RESULT:DEFERRED:ns_propagation");
+  return nextHistory;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -287,17 +341,49 @@ async function processDomain(domainId: string, actionId: string) {
   }
 
   // ────────────────────────────────────────────────────────────────
-  // Step 3: Wait for Cloudflare zone to become active
+  // Step 3: Confirm public NS delegation before provider verification
+  // ────────────────────────────────────────────────────────────────
+  const expectedNameservers = (await getCloudflareNameservers(zoneId)) || [];
+  if (expectedNameservers.length >= 2) {
+    const actualNameservers = await getPublicNameservers(domain.domain);
+    if (nameserversMatchExpected(actualNameservers, expectedNameservers)) {
+      log("ok", `Step 3: Public NS delegated to Cloudflare: ${actualNameservers.join(", ")}`);
+      await updateDomain(domainId, {
+        nameservers_moved: true,
+        nameserver_automation_status: "verified",
+        nameserver_automation_error: null,
+        nameserver_automation_checked_at: new Date().toISOString(),
+      });
+    } else {
+      history = await deferForNameserverPropagation(
+        actionId,
+        domainId,
+        customerId,
+        domain.domain,
+        history,
+        expectedNameservers,
+        actualNameservers
+      );
+      process.exit(0);
+    }
+  } else {
+    log("warn", "Step 3: Cloudflare zone has no nameservers assigned yet; deferring provider verification");
+    history = await deferForNameserverPropagation(actionId, domainId, customerId, domain.domain, history, [], []);
+    process.exit(0);
+  }
+
+  // ────────────────────────────────────────────────────────────────
+  // Step 4: Wait for Cloudflare zone to become active
   // ────────────────────────────────────────────────────────────────
   if (domain.source === "buy") {
-    log("info", "Step 3: Waiting for Cloudflare zone to become active...");
+    log("info", "Step 4: Waiting for Cloudflare zone to become active...");
     const maxWait = 600; // 10 minutes max
     const interval = 20;
     let active = false;
     for (let elapsed = 0; elapsed < maxWait; elapsed += interval) {
       active = await isCloudflareZoneActive(zoneId);
       if (active) {
-        log("ok", `Step 3: Cloudflare zone is active (took ${elapsed}s)`);
+        log("ok", `Step 4: Cloudflare zone is active (took ${elapsed}s)`);
         history = addHistory(history, "Cloudflare zone is active");
         break;
       }
@@ -305,15 +391,15 @@ async function processDomain(domainId: string, actionId: string) {
       await new Promise(r => setTimeout(r, interval * 1000));
     }
     if (!active) {
-      log("warn", "Step 3: CF zone still pending after 10 min. Part 2 will need to wait.");
+      log("warn", "Step 4: CF zone still pending after 10 min. Part 2 will need to wait.");
       history = addHistory(history, "WARNING: CF zone still pending after 10 min wait");
     }
   } else {
     const active = await isCloudflareZoneActive(zoneId);
     if (active) {
-      log("ok", "Step 3: Cloudflare zone is active");
+      log("ok", "Step 4: Cloudflare zone is active");
     } else {
-      log("warn", "Step 3: Cloudflare zone not active — BYOD user needs to update NS");
+      log("warn", "Step 4: Cloudflare zone not active — BYOD user needs to update NS");
     }
   }
 

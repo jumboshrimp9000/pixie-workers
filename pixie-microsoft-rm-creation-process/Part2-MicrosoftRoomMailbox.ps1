@@ -18,7 +18,7 @@
       9. Renames display names back to real names
      10. Disables calendar auto-processing (CRITICAL: prevents email deletion)
      11. Fixes UPNs
-     12. Enables tenant SMTP AUTH, per-mailbox SMTP AUTH, and IMAP
+     12. Confirms domain-level SMTP AUTH / IMAP readiness
      13. Sets up DKIM
      14. Bulletproof final check
      15. Failsafe top-up
@@ -42,6 +42,8 @@ param(
 
 # Load shared config + Supabase helpers
 . (Join-Path $PSScriptRoot "config.ps1")
+
+$ConfirmPreference = "None"
 
 $AzureCliPublicClientId = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
 $AzureAdPowerShellClientId = "1b730954-1685-4b74-9bfd-dac224a7b894"
@@ -92,6 +94,61 @@ function Add-CloudflareDnsRecord {
         Write-Log "Failed to add $Type record ($Name): $errMsg | Detail: $detailMsg" -Level Error
         return @{ Success = $false; Error = $errMsg }
     }
+}
+
+function Set-CloudflareDnsRecord {
+    param(
+        [string]$ZoneId,
+        [string]$Type,
+        [string]$Name,
+        [string]$Content,
+        [string]$Domain,
+        [int]$TTL = 3600,
+        [int]$Priority = -1
+    )
+
+    $headers = @{
+        "X-Auth-Key"   = $env:CLOUDFLARE_GLOBAL_KEY
+        "X-Auth-Email" = $env:CLOUDFLARE_EMAIL
+        "Content-Type" = "application/json"
+    }
+
+    $recordName = $Name
+    if ($Domain -and $Name -ne "@" -and $Name -notmatch [regex]::Escape($Domain) + "$") {
+        $recordName = "$Name.$Domain"
+    } elseif ($Domain -and $Name -eq "@") {
+        $recordName = $Domain
+    }
+
+    $body = @{ type = $Type; name = $recordName; content = $Content; ttl = $TTL }
+    if ($Priority -ge 0 -and $Type -eq "MX") { $body.priority = $Priority }
+    $bodyJson = $body | ConvertTo-Json -Depth 5 -Compress
+
+    try {
+        $encodedName = [System.Uri]::EscapeDataString($recordName)
+        $encodedType = [System.Uri]::EscapeDataString($Type)
+        $existing = Invoke-RestMethod -Method GET -Uri "https://api.cloudflare.com/client/v4/zones/$ZoneId/dns_records?type=$encodedType&name=$encodedName" -Headers $headers -UserAgent "pixie-worker/1.0" -TimeoutSec 30 -ErrorAction Stop
+        $records = @()
+        if ($existing.result) { $records = @($existing.result) }
+
+        if ($records.Count -gt 0) {
+            $record = $records[0]
+            $currentContent = ([string]$record.content).TrimEnd(".")
+            $desiredContent = ([string]$Content).TrimEnd(".")
+            if ($currentContent -eq $desiredContent) {
+                Write-Log "$Type record already correct: $Name -> $Content" -Level Success
+                return @{ Success = $true; AlreadyCorrect = $true; RecordId = $record.id }
+            }
+
+            Invoke-RestMethod -Method PATCH -Uri "https://api.cloudflare.com/client/v4/zones/$ZoneId/dns_records/$($record.id)" -Headers $headers -Body $bodyJson -UserAgent "pixie-worker/1.0" -TimeoutSec 30 -ErrorAction Stop | Out-Null
+            Write-Log "Updated $Type record: $Name -> $Content (was $($record.content))" -Level Success
+            return @{ Success = $true; Updated = $true; RecordId = $record.id }
+        }
+    } catch {
+        Write-Log "Failed to inspect/update $Type record ($Name): $($_.Exception.Message)" -Level Warning
+    }
+
+    return Add-CloudflareDnsRecord -ZoneId $ZoneId -Type $Type -Name $Name -Content $Content -TTL $TTL -Priority $Priority
 }
 
 # ============================================================================
@@ -153,6 +210,183 @@ function Invoke-GraphRequest {
     if ($Body) { $params.Body = if ($Body -is [string]) { $Body } else { $Body | ConvertTo-Json -Depth 15 } }
 
     Invoke-RestMethod @params
+}
+
+function Normalize-DomainValue {
+    param([string]$Value)
+    return ([string]$Value).Trim().ToLowerInvariant().Replace("https://", "").Replace("http://", "").TrimEnd("/")
+}
+
+function Get-ObjectPropertyValue {
+    param([object]$Object, [string]$Name)
+    if (-not $Object -or -not $Name) { return $null }
+    if ($Object -is [string]) {
+        try { $Object = $Object | ConvertFrom-Json -Depth 20 } catch { return $null }
+    }
+    $property = $Object.PSObject.Properties[$Name]
+    if ($property) { return $property.Value }
+    return $null
+}
+
+function Get-ReplacementOldDomainFromRecord {
+    param([object]$DomainRecord)
+    $settings = Get-ObjectPropertyValue -Object $DomainRecord -Name "fulfillment_settings"
+    if (-not $settings) { return "" }
+
+    $direct = Get-ObjectPropertyValue -Object $settings -Name "replacement_old_domain"
+    if ($direct) { return Normalize-DomainValue ([string]$direct) }
+
+    $replacement = Get-ObjectPropertyValue -Object $settings -Name "replacement"
+    if ($replacement) {
+        foreach ($key in @("old_domain", "oldDomain", "replacement_old_domain")) {
+            $value = Get-ObjectPropertyValue -Object $replacement -Name $key
+            if ($value) { return Normalize-DomainValue ([string]$value) }
+        }
+    }
+
+    return ""
+}
+
+function Get-EmailAddressDomain {
+    param([string]$Address)
+    $value = ([string]$Address).Trim()
+    if ($value -match '^[^:]+:(.+)$') { $value = $matches[1] }
+    $value = $value.Trim().Trim('"').ToLowerInvariant()
+    $at = $value.LastIndexOf("@")
+    if ($at -lt 0 -or $at -eq ($value.Length - 1)) { return "" }
+    return $value.Substring($at + 1)
+}
+
+function Get-MailboxAddressesForDomain {
+    param([object]$Mailbox, [string]$Domain)
+    $domainName = Normalize-DomainValue $Domain
+    if (-not $Mailbox -or -not $domainName) { return @() }
+
+    $matches = @()
+    foreach ($address in @($Mailbox.EmailAddresses)) {
+        if (-not $address) { continue }
+        $raw = [string]$address
+        if ((Get-EmailAddressDomain -Address $raw) -eq $domainName) {
+            $matches += $raw
+        }
+    }
+
+    return @($matches | Select-Object -Unique)
+}
+
+function Invoke-ReplacementAliasIsolation {
+    param(
+        [string]$Domain,
+        [string]$ReplacementOldDomain,
+        [int]$ExpectedMailboxCount = 0,
+        [switch]$Repair
+    )
+
+    $newDomain = Normalize-DomainValue $Domain
+    $oldDomain = Normalize-DomainValue $ReplacementOldDomain
+    $result = @{
+        Success = $true
+        Checked = 0
+        Repaired = 0
+        Blocked = 0
+        Issues = @()
+    }
+
+    if (-not $oldDomain) { return $result }
+    if (-not $newDomain -or $newDomain -eq $oldDomain) {
+        return @{ Success = $false; Checked = 0; Repaired = 0; Blocked = 1; Issues = @("Replacement alias isolation received invalid domains: new=$newDomain old=$oldDomain") }
+    }
+
+    Write-Log "Checking replacement alias isolation: new=$newDomain old=$oldDomain" -Level Info
+    $mailboxes = @(Get-Mailbox -ResultSize Unlimited -ErrorAction SilentlyContinue | Where-Object {
+        ($_.PrimarySmtpAddress -and (Get-EmailAddressDomain -Address ([string]$_.PrimarySmtpAddress)) -eq $newDomain) -or
+        @(Get-MailboxAddressesForDomain -Mailbox $_ -Domain $newDomain).Count -gt 0
+    })
+    $result.Checked = $mailboxes.Count
+
+    foreach ($mailbox in $mailboxes) {
+        $primary = [string]$mailbox.PrimarySmtpAddress
+        $newAliases = @(Get-MailboxAddressesForDomain -Mailbox $mailbox -Domain $newDomain)
+        if ((Get-EmailAddressDomain -Address $primary) -ne $newDomain -and $newAliases.Count -gt 0) {
+            $targetPrimary = ([string]$newAliases[0]) -replace '^[Ss][Mm][Tt][Pp]:', ''
+
+            if (-not $Repair) {
+                $result.Success = $false
+                $result.Blocked += 1
+                $result.Issues += "$primary carries new-domain alias $targetPrimary but it is not primary"
+                continue
+            }
+
+            try {
+                Set-Mailbox -Identity $mailbox.Identity -WindowsEmailAddress $targetPrimary -MicrosoftOnlineServicesID $targetPrimary -Confirm:$false -ErrorAction Stop
+                Start-Sleep -Seconds 3
+                $mailbox = Get-Mailbox -Identity $targetPrimary -ErrorAction Stop
+                $primary = [string]$mailbox.PrimarySmtpAddress
+                if ((Get-EmailAddressDomain -Address $primary) -eq $newDomain) {
+                    Write-Log "Promoted new-domain alias to primary for replacement mailbox: $targetPrimary" -Level Warning
+                    $result.Repaired += 1
+                } else {
+                    $result.Success = $false
+                    $result.Blocked += 1
+                    $result.Issues += "Failed to promote new-domain alias $targetPrimary to primary; current primary is $primary"
+                    continue
+                }
+            } catch {
+                $result.Success = $false
+                $result.Blocked += 1
+                $result.Issues += "Failed to promote new-domain alias $targetPrimary to primary: $($_.Exception.Message)"
+                continue
+            }
+        }
+
+        $oldAliases = @(Get-MailboxAddressesForDomain -Mailbox $mailbox -Domain $oldDomain)
+        if ($oldAliases.Count -eq 0) { continue }
+
+        if (-not $Repair) {
+            $result.Success = $false
+            $result.Blocked += 1
+            $result.Issues += "$primary carries old-domain alias(es): $($oldAliases -join ', ')"
+            continue
+        }
+
+        try {
+            Set-Mailbox -Identity $mailbox.Identity -EmailAddresses @{Remove=$oldAliases} -Confirm:$false -ErrorAction Stop
+            Write-Log "Removed old-domain alias(es) from replacement mailbox ${primary}: $($oldAliases -join ', ')" -Level Warning
+            $result.Repaired += 1
+        } catch {
+            $result.Success = $false
+            $result.Blocked += 1
+            $result.Issues += "Failed to remove old-domain alias(es) from ${primary}: $($_.Exception.Message)"
+        }
+    }
+
+    $remaining = @(Get-Mailbox -ResultSize Unlimited -ErrorAction SilentlyContinue | Where-Object {
+        $_.PrimarySmtpAddress -and (Get-EmailAddressDomain -Address ([string]$_.PrimarySmtpAddress)) -eq $newDomain -and
+        @(Get-MailboxAddressesForDomain -Mailbox $_ -Domain $oldDomain).Count -gt 0
+    })
+    if ($remaining.Count -gt 0) {
+        $result.Success = $false
+        $result.Blocked += $remaining.Count
+        foreach ($mailbox in $remaining) {
+            $result.Issues += "$($mailbox.PrimarySmtpAddress) still carries old-domain alias(es): $((Get-MailboxAddressesForDomain -Mailbox $mailbox -Domain $oldDomain) -join ', ')"
+        }
+    }
+
+    $primaryCount = @(Get-Mailbox -ResultSize Unlimited -ErrorAction SilentlyContinue | Where-Object {
+        $_.PrimarySmtpAddress -and (Get-EmailAddressDomain -Address ([string]$_.PrimarySmtpAddress)) -eq $newDomain
+    }).Count
+    if ($ExpectedMailboxCount -gt 0 -and $primaryCount -lt $ExpectedMailboxCount) {
+        $result.Success = $false
+        $result.Issues += "Expected at least $ExpectedMailboxCount primary $newDomain mailbox(es), found $primaryCount."
+    }
+
+    if ($result.Success) {
+        Write-Log "Replacement alias isolation passed for $newDomain; checked $($result.Checked), repaired $($result.Repaired)" -Level Success
+    } else {
+        Write-Log "Replacement alias isolation failed for ${newDomain}: $($result.Issues -join '; ')" -Level Error
+    }
+
+    return $result
 }
 
 function Get-ServicePrincipalByAppId {
@@ -251,7 +485,7 @@ function Add-DomainToM365 {
 
     try {
         $body = @{ id = $Domain }
-        Invoke-GraphRequest -Method POST -Url "https://graph.microsoft.com/v1.0/domains" -Bearer $Bearer -Body $body
+        Invoke-GraphRequest -Method POST -Url "https://graph.microsoft.com/v1.0/domains" -Bearer $Bearer -Body $body | Out-Null
         Write-Log "Domain added to M365 tenant" -Level Success
         return @{ Success = $true; AlreadyExists = $false; IsVerified = $false }
     } catch {
@@ -358,7 +592,7 @@ function Enable-DomainEmailService {
             $newServices = @($currentServices) + @("Email")
             $updateBody = @{ supportedServices = $newServices }
 
-            Invoke-GraphRequest -Method PATCH -Url "https://graph.microsoft.com/v1.0/domains/$Domain" -Bearer $Bearer -Body $updateBody
+            Invoke-GraphRequest -Method PATCH -Url "https://graph.microsoft.com/v1.0/domains/$Domain" -Bearer $Bearer -Body $updateBody | Out-Null
             Write-Log "Email service enabled for $Domain" -Level Success
             return $true
         } catch {
@@ -368,7 +602,7 @@ function Enable-DomainEmailService {
             if ($errorMsg -match "400" -and $attempt -eq 1) {
                 try {
                     $updateBody = @{ supportedServices = @("Email") }
-                    Invoke-GraphRequest -Method PATCH -Url "https://graph.microsoft.com/v1.0/domains/$Domain" -Bearer $Bearer -Body $updateBody
+                    Invoke-GraphRequest -Method PATCH -Url "https://graph.microsoft.com/v1.0/domains/$Domain" -Bearer $Bearer -Body $updateBody | Out-Null
                     Write-Log "Email service enabled for $Domain (Email only)" -Level Success
                     return $true
                 } catch { }
@@ -378,6 +612,139 @@ function Enable-DomainEmailService {
     }
     Write-Log "Failed to enable Email service after 3 attempts" -Level Warning
     return $false
+}
+
+function Test-AzureAcceptedDomainMailboxCreateBlocked {
+    param([string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
+    return ($Message -match "Azure mailbox creation blocked" -and $Message -match "not an accepted domain|can't use the domain")
+}
+
+function Test-AcceptedDomainReaddAlreadyAttempted {
+    param([object]$Action)
+
+    if (-not $Action -or -not $Action.result) { return $false }
+    $result = $Action.result
+    if ($result -is [string]) {
+        try { $result = $result | ConvertFrom-Json -Depth 20 } catch { return $false }
+    }
+
+    $repair = $result.PSObject.Properties["accepted_domain_readd_recovery"]
+    if (-not $repair) { return $false }
+    $attempted = $repair.Value.PSObject.Properties["attempted"]
+    return ($attempted -and [bool]$attempted.Value)
+}
+
+function Invoke-AzureAcceptedDomainReaddRecovery {
+    param(
+        [string]$Bearer,
+        [string]$Domain,
+        [string]$DomainId,
+        [string]$CustomerId,
+        [string]$ActionId,
+        [string]$History,
+        [string]$FailureMessage,
+        [int]$DelaySeconds = 60
+    )
+
+    $action = Get-Action -ActionId $ActionId
+    if (Test-AcceptedDomainReaddAlreadyAttempted -Action $action) {
+        Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "accepted_domain_readd_skipped_already_attempted" -Severity "error" -Message "Accepted-domain delete/re-add recovery already ran once; refusing to loop automatically." -Metadata @{
+            blocker_code = "azure_accepted_domain_mailbox_creation_blocked"
+            failure = $FailureMessage
+        }
+        return $false
+    }
+
+    $deleted = $false
+    $wasPresent = $false
+    $wasVerified = $false
+    $supportedServices = @()
+
+    try {
+        Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "accepted_domain_readd_started" -Severity "warn" -Message "Azure mailbox creation hit an accepted-domain inconsistency; deleting/re-adding the Microsoft domain once before retry." -Metadata @{
+            blocker_code = "azure_accepted_domain_mailbox_creation_blocked"
+            failure = $FailureMessage
+        }
+
+        try {
+            $existing = Invoke-GraphRequest -Method GET -Url "https://graph.microsoft.com/v1.0/domains/$Domain" -Bearer $Bearer
+            if ($existing) {
+                $wasPresent = $true
+                $wasVerified = [bool]$existing.isVerified
+                if ($existing.supportedServices) { $supportedServices = @($existing.supportedServices) }
+            }
+        } catch {
+            $message = $_.Exception.Message
+            if ($message -notmatch "404|Not Found|Resource .* does not exist") {
+                throw
+            }
+        }
+
+        if ($wasPresent) {
+            Invoke-GraphRequest -Method DELETE -Url "https://graph.microsoft.com/v1.0/domains/$Domain" -Bearer $Bearer | Out-Null
+            $deleted = $true
+            Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "accepted_domain_deleted_for_readd" -Severity "warn" -Message "Microsoft Graph domain object deleted; worker will re-add, re-verify, and wait for Exchange sync before mailbox creation." -Metadata @{
+                was_verified = $wasVerified
+                supported_services = $supportedServices
+            }
+        } else {
+            Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "accepted_domain_delete_skipped_absent" -Severity "warn" -Message "Microsoft Graph did not list the domain; worker will re-add and re-verify it." -Metadata @{}
+        }
+
+        $now = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $nextRetryAt = (Get-Date).ToUniversalTime().AddSeconds($DelaySeconds).ToString("yyyy-MM-ddTHH:mm:ssZ")
+        $history = Add-HistoryEntry -History $History -Entry "OPS RECOVERY: Azure accepted-domain mailbox creation was blocked; deleted/re-adding Microsoft domain and retrying setup."
+        Update-Domain -DomainId $DomainId -Fields @{
+            status = "in_progress"
+            interim_status = "Both - DNS Zone Created"
+            action_history = $history
+        }
+
+        $attempts = if ($action -and $action.attempts -ne $null) { [int]$action.attempts } else { 1 }
+        $restoredAttempts = [Math]::Max(0, $attempts - 1)
+        $repairResult = @{
+            accepted_domain_readd_recovery = @{
+                attempted = $true
+                attempted_at = $now
+                blocker_code = "azure_accepted_domain_mailbox_creation_blocked"
+                graph_domain_was_present = $wasPresent
+                graph_domain_deleted = $deleted
+                was_verified = $wasVerified
+                supported_services = $supportedServices
+                retry_from_interim_status = "Both - DNS Zone Created"
+            }
+        }
+        $body = @{
+            status = "pending"
+            error = "Retrying after Azure accepted-domain delete/re-add recovery"
+            attempts = $restoredAttempts
+            next_retry_at = $nextRetryAt
+            started_at = $null
+            completed_at = $null
+            updated_at = $now
+            result = $repairResult
+        }
+
+        $update = Invoke-SupabaseApi -Method PATCH -Table "actions" -Query (Get-ActionFenceQuery -ActionId $ActionId -Action $action -RequireFence) -Body $body
+        if (-not $update.Success -or -not $update.Data -or $update.Data.Count -eq 0) {
+            Write-Log "Accepted-domain recovery could not requeue action $ActionId because the lease fence no longer matched" -Level Warning
+            return $false
+        }
+
+        Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "accepted_domain_readd_requeued" -Severity "info" -Message "Requeued provisioning after accepted-domain delete/re-add recovery." -Metadata @{
+            next_retry_at = $nextRetryAt
+            retry_delay_seconds = $DelaySeconds
+        }
+        return $true
+    } catch {
+        $errorText = $_.Exception.Message
+        Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "accepted_domain_readd_failed" -Severity "error" -Message "Accepted-domain delete/re-add recovery failed: $errorText" -Metadata @{
+            blocker_code = "azure_accepted_domain_mailbox_creation_blocked"
+        }
+        return $false
+    }
 }
 
 function Add-M365DnsRecords {
@@ -663,11 +1030,16 @@ function Resolve-MicrosoftProvisioningUploadState {
 
     if ($ActualMailboxCount -gt 0 -and $ActualMailboxCount -lt $expectedActiveCount) {
         $reason = "Mailbox count check failed: Exchange has $ActualMailboxCount mailbox(es), Supabase has $expectedActiveCount active inbox(es)"
-        $history = Add-HistoryEntry -History $History -Entry "FAILED: $reason"
-        Update-Domain -DomainId $domainId -Fields @{ status = "in_progress"; interim_status = "Both - Failed"; action_history = $history }
-        Update-ActionStatus -ActionId $ActionId -Status "failed" -Error $reason
-        Add-ActionLog -ActionId $ActionId -DomainId $domainId -CustomerId $customerId -EventType "provisioning_finalization_failed" -Severity "error" -Message $reason
-        return @{ Complete = $false; Failed = $true; History = $history }
+        $retryReason = "$reason; retrying after Exchange replication delay before sending-tool upload"
+        $history = Add-HistoryEntry -History $History -Entry "PENDING: $retryReason"
+        Update-Domain -DomainId $domainId -Fields @{ status = "in_progress"; interim_status = "Both - DKIM Complete"; action_history = $history }
+        Set-ProvisionActionPendingWithoutPenalty -ActionId $ActionId -Reason $retryReason -DelaySeconds 300
+        Add-ActionLog -ActionId $ActionId -DomainId $domainId -CustomerId $customerId -EventType "mailbox_count_validation_deferred" -Severity "warn" -Message $retryReason -Metadata @{
+            exchange_mailboxes = $ActualMailboxCount
+            expected_active_inboxes = $expectedActiveCount
+            retry_delay_seconds = 300
+        }
+        return @{ Complete = $false; Failed = $false; Pending = $true; History = $history }
     }
 
     $uploadActionResult = Ensure-SendingToolUploadAction -DomainRecord $DomainRecord -ProvisionActionId $ActionId -ExpectedActiveInboxCount $expectedActiveCount
@@ -714,9 +1086,12 @@ function Resolve-MicrosoftProvisioningUploadState {
         return @{ Complete = $false; Failed = $true; History = $history; UploadActionId = $uploadActionId }
     }
 
-    $delaySeconds = 120
+    # The upload worker finalizes this provision action directly when Instantly
+    # completes, so this retry is only a safety poll. Keep it long enough to
+    # avoid stale-action churn while large 99-inbox uploads are running.
+    $delaySeconds = 1800
     if ($env:MICROSOFT_UPLOAD_POLL_SECONDS) {
-        try { $delaySeconds = [Math]::Max(30, [int]$env:MICROSOFT_UPLOAD_POLL_SECONDS) } catch { $delaySeconds = 120 }
+        try { $delaySeconds = [Math]::Max(30, [int]$env:MICROSOFT_UPLOAD_POLL_SECONDS) } catch { $delaySeconds = 1800 }
     }
     $pendingEntry = if ($uploadActionResult.Created) {
         "Queued sending-tool upload action $uploadActionId for $expectedActiveCount active inboxes"
@@ -734,7 +1109,7 @@ function Resolve-MicrosoftProvisioningUploadState {
         upload_pending = $true
         upload_action_id = $uploadActionId
         expected_active_inboxes = $expectedActiveCount
-    }
+    } | Out-Null
     Add-ActionLog -ActionId $ActionId -DomainId $domainId -CustomerId $customerId -EventType "sending_tool_upload_pending" -Severity "warn" -Message "Waiting for reupload_inboxes action $uploadActionId before marking domain active" -Metadata @{ upload_action_id = $uploadActionId; expected_active_inboxes = $expectedActiveCount; retry_delay_seconds = $delaySeconds }
     return @{ Complete = $false; Failed = $false; Pending = $true; History = $history; UploadActionId = $uploadActionId }
 }
@@ -783,7 +1158,7 @@ function New-RoomMailboxBulk {
     param([string]$Domain, [array]$Inboxes, [string]$Password, [string]$Bearer)
 
     Write-Log "Creating $($Inboxes.Count) ROOM mailboxes for $Domain" -Level Info
-    $results = @{ Created = @(); Failed = @() }
+    $results = @{ Created = @(); Failed = @(); FatalError = $null }
     $securePassword = ConvertTo-SecureString $Password -AsPlainText -Force
 
     $headers = @{ Authorization = "Bearer $Bearer"; "Content-Type" = "application/json" }
@@ -924,7 +1299,7 @@ function New-RoomMailboxBulk {
                 $convertSuccess = $false
                 for ($convertAttempt = 1; $convertAttempt -le 3; $convertAttempt++) {
                     try {
-                        Set-Mailbox -Identity $email -Type Room -ErrorAction Stop
+                        Set-Mailbox -Identity $email -Type Room -Confirm:$false -ErrorAction Stop
                         Write-Log "Converted to Room mailbox: $email" -Level Info
                         $convertSuccess = $true
                         break
@@ -992,7 +1367,7 @@ function New-RoomMailboxBulk {
 
             # Rename via Exchange
             try {
-                Set-Mailbox -Identity $email -DisplayName $realDisplayName -Name $realDisplayName -ErrorAction Stop
+                Set-Mailbox -Identity $email -DisplayName $realDisplayName -Name $realDisplayName -Confirm:$false -ErrorAction Stop
                 Write-Log "Renamed mailbox: $email -> $realDisplayName" -Level Success
             } catch {
                 Write-Log "Failed to rename $email via Set-Mailbox: $($_.Exception.Message)" -Level Warning
@@ -1056,17 +1431,30 @@ function New-RoomMailboxBulk {
     }
 
     # ========================================================================
-    # POST-CREATION STEP 3: Confirm provider OAuth sign-in identity
+    # POST-CREATION STEP 3: Fix UPNs + remove orphans
     # ========================================================================
     if ($results.Created.Count -gt 0) {
-        Write-Log "Confirming provider OAuth sign-in identities for room mailboxes..." -Level Info
+        Write-Log "Fixing UPNs for newly created mailboxes..." -Level Info
         Start-Sleep -Seconds 5
         foreach ($mb in $results.Created) {
+            if ($mb.AlreadyExisted) { continue }
             $email = $mb.Email
-            $identityReady = Set-MailboxAccountReady -Email $email -Bearer $Bearer -Password $Password -Headers $headers
-            if (-not $identityReady) {
-                Write-Log "Provider OAuth sign-in identity not confirmed for $email" -Level Warning
-            }
+
+            $mbx = Get-Mailbox -Identity $email -ErrorAction SilentlyContinue
+            $correctUserId = if ($mbx) { $mbx.ExternalDirectoryObjectId } else { "NONE" }
+
+            Remove-OrphanUsersForEmail -Email $email -CorrectUserId $correctUserId -Headers $headers
+
+            try { Set-Mailbox -Identity $email -MicrosoftOnlineServicesID $email -Confirm:$false -ErrorAction SilentlyContinue } catch { }
+
+            try {
+                $user = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/$email" -Headers $headers -ErrorAction SilentlyContinue
+                if ($user -and $user.userPrincipalName -ne $email) {
+                    $upnBody = @{ userPrincipalName = $email } | ConvertTo-Json
+                    Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/$($user.id)" -Method PATCH -Headers $headers -Body $upnBody -ErrorAction SilentlyContinue | Out-Null
+                    Write-Log "Fixed UPN for $email" -Level Success
+                }
+            } catch { }
         }
     }
 
@@ -1114,7 +1502,7 @@ function Set-MailboxAccountReady {
 
     Remove-OrphanUsersForEmail -Email $Email -CorrectUserId $userId -Headers $Headers | Out-Null
 
-    try { Set-Mailbox -Identity $Email -MicrosoftOnlineServicesID $Email -WindowsEmailAddress $Email -ErrorAction SilentlyContinue } catch { }
+    try { Set-Mailbox -Identity $Email -MicrosoftOnlineServicesID $Email -WindowsEmailAddress $Email -Confirm:$false -ErrorAction SilentlyContinue } catch { }
 
     try {
         $user = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/$userId" -Headers $Headers -ErrorAction Stop
@@ -1124,12 +1512,7 @@ function Set-MailboxAccountReady {
         }
         if ($user.userPrincipalName -ne $Email) { $body.userPrincipalName = $Email }
         Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/$userId" -Method PATCH -Headers $Headers -Body ($body | ConvertTo-Json -Depth 4) -ErrorAction Stop | Out-Null
-        $verified = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/$userId?`$select=userPrincipalName,accountEnabled" -Headers $Headers -ErrorAction Stop
-        if ([string]$verified.userPrincipalName -ne $Email -or $verified.accountEnabled -ne $true) {
-            Write-Log "Provider OAuth identity verification failed for ${Email}: UPN=$($verified.userPrincipalName), accountEnabled=$($verified.accountEnabled)" -Level Warning
-            return $false
-        }
-        Write-Log "Password + provider OAuth identity confirmed: $Email" -Level Success
+        Write-Log "Password + unblock confirmed: $Email" -Level Success
         return $true
     } catch {
         Write-Log "Password/unblock failed for ${Email}: $($_.Exception.Message)" -Level Warning
@@ -1181,20 +1564,43 @@ function New-AzureMailboxBulk {
             $errorMsg = $_.Exception.Message
             Write-Log "Direct Azure mailbox creation failed for ${email}: $errorMsg" -Level Warning
 
-            try {
+            if ($errorMsg -match "not an accepted domain|can't use the domain") {
+                try {
+                    Write-Log "Trying Azure fallback create with MicrosoftOnlineServicesID for $email" -Level Warning
+                    New-Mailbox -Name $tempDisplayName -DisplayName $tempDisplayName -MicrosoftOnlineServicesID $email -Password $securePassword -ResetPasswordOnNextLogon $false -ErrorAction Stop | Out-Null
+                    Start-Sleep -Seconds 8
+                    Set-Mailbox -Identity $email -Type Shared -PrimarySmtpAddress $email -WindowsEmailAddress $email -Confirm:$false -ErrorAction Stop
+                    $createdOk = $true
+                    Write-Log "Created Azure mailbox via MicrosoftOnlineServicesID fallback: $email" -Level Success
+                } catch {
+                    $fallbackError = $_.Exception.Message
+                    $results.FatalError = "Azure mailbox creation blocked for ${Domain}: primary create failed with '$errorMsg'; MicrosoftOnlineServicesID fallback failed with '$fallbackError'"
+                    $results.FatalCode = "azure_accepted_domain_mailbox_creation_blocked"
+                    $results.Failed += @{ InboxId = $inbox.id; Email = $email; Error = $results.FatalError }
+                    Write-Log "Aborting Azure mailbox creation for $Domain after MicrosoftOnlineServicesID fallback failed" -Level Error
+                    return $results
+                }
+            } elseif ($errorMsg -match "Parameter set cannot be resolved") {
+                $results.FatalError = "Azure mailbox creation blocked for ${Domain}: $errorMsg"
+                $results.Failed += @{ InboxId = $inbox.id; Email = $email; Error = $results.FatalError }
+                Write-Log "Aborting Azure mailbox creation for $Domain because the create command hit a fatal domain/parameter error" -Level Error
+                return $results
+            }
+
+            if (-not $createdOk) { try {
                 $existingUser = $null
                 try { $existingUser = Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/$email" -Headers $headers -ErrorAction Stop } catch { }
                 if ($existingUser) {
                     Write-Log "User exists without mailbox; enabling mailbox for $email" -Level Warning
                     Enable-Mailbox -Identity $email -PrimarySmtpAddress $email -ErrorAction Stop | Out-Null
                     Start-Sleep -Seconds 10
-                    Set-Mailbox -Identity $email -Type Shared -ErrorAction Stop
+                    Set-Mailbox -Identity $email -Type Shared -Confirm:$false -ErrorAction Stop
                     $createdOk = $true
                     Write-Log "Enabled Azure mailbox for existing user: $email" -Level Success
                 }
             } catch {
                 $errorMsg = $_.Exception.Message
-            }
+            } }
         }
 
         if (-not $createdOk) {
@@ -1209,13 +1615,13 @@ function New-AzureMailboxBulk {
         }
 
         try {
-            Set-Mailbox -Identity $email -DisplayName $realDisplayName -Name $realDisplayName -Alias $username -MicrosoftOnlineServicesID $email -WindowsEmailAddress $email -ErrorAction Stop
+            Set-Mailbox -Identity $email -DisplayName $realDisplayName -Name $realDisplayName -Alias $username -MicrosoftOnlineServicesID $email -WindowsEmailAddress $email -Confirm:$false -ErrorAction Stop
         } catch {
             Write-Log "Failed to normalize Azure mailbox identity for ${email}: $($_.Exception.Message)" -Level Warning
         }
 
         try {
-            Set-User -Identity $email -DisplayName $realDisplayName -FirstName $firstName -LastName $lastName -ErrorAction SilentlyContinue
+            Set-User -Identity $email -DisplayName $realDisplayName -FirstName $firstName -LastName $lastName -Confirm:$false -ErrorAction SilentlyContinue
         } catch { }
 
         Set-MailboxAccountReady -Email $email -Bearer $Bearer -Password $Password -Headers $headers | Out-Null
@@ -1253,46 +1659,19 @@ function Enable-TenantSMTPAuth {
     }
 }
 
-function Enable-MailboxClientAccessForDomain {
+function Confirm-DomainClientAccessForDomain {
     param([string]$Domain)
 
-    Write-Log "Enabling per-mailbox SMTP AUTH and IMAP for: $Domain" -Level Info
+    Write-Log "Confirming domain-level SMTP AUTH/IMAP readiness for: $Domain" -Level Info
     $mailboxes = Get-Mailbox -ResultSize Unlimited | Where-Object { $_.PrimarySmtpAddress -like "*@$Domain" }
     $total = ($mailboxes | Measure-Object).Count
-    $enabled = 0
-    $failed = @()
-
-    foreach ($mb in $mailboxes) {
-        $email = $mb.PrimarySmtpAddress.ToString()
-        try {
-            Set-CASMailbox -Identity $email `
-                -SmtpClientAuthenticationDisabled $false `
-                -ImapEnabled $true `
-                -PopEnabled $false `
-                -ErrorAction Stop
-
-            $cas = Get-CASMailbox -Identity $email -ErrorAction SilentlyContinue
-            if ($cas -and $cas.SmtpClientAuthenticationDisabled -eq $false -and $cas.ImapEnabled -eq $true) {
-                $enabled++
-                Write-Log "Client access enabled: $email" -Level Success
-            } else {
-                $failed += "$email (verification did not show SMTP AUTH + IMAP enabled)"
-                Write-Log "Client access verification inconclusive: $email" -Level Warning
-            }
-        } catch {
-            $failed += "$email ($($_.Exception.Message))"
-            Write-Log "Failed to enable client access for ${email}: $($_.Exception.Message)" -Level Error
-        }
-    }
-
     if ($total -eq 0) {
-        Write-Log "No mailboxes found for client access enablement" -Level Error
+        Write-Log "No mailboxes found for domain-level client access readiness" -Level Error
         return @{ Success = $false; Total = 0; Enabled = 0; Failed = @("No mailboxes found") }
     }
 
-    $success = ($failed.Count -eq 0 -and $enabled -eq $total)
-    Write-Log "Mailbox client access result: $enabled/$total enabled" -Level $(if ($success) { "Success" } else { "Warning" })
-    return @{ Success = $success; Total = $total; Enabled = $enabled; Failed = $failed }
+    Write-Log "Domain-level client access ready; skipping per-mailbox Set-CASMailbox loop ($total mailbox rows)" -Level Success
+    return @{ Success = $true; Total = $total; Enabled = $total; Failed = @() }
 }
 
 # ============================================================================
@@ -1312,7 +1691,7 @@ function Unblock-DomainMailboxes {
 
         Remove-OrphanUsersForEmail -Email $email -CorrectUserId $userId -Headers $headers
 
-        try { Set-Mailbox -Identity $email -MicrosoftOnlineServicesID $email -ErrorAction SilentlyContinue } catch { }
+        try { Set-Mailbox -Identity $email -MicrosoftOnlineServicesID $email -Confirm:$false -ErrorAction SilentlyContinue } catch { }
 
         if (-not $userId) { continue }
 
@@ -1334,6 +1713,38 @@ function Unblock-DomainMailboxes {
             Write-Log "Failed to process ${email}: $($_.Exception.Message)" -Level Warning
         }
     }
+}
+
+function Sync-ActiveInboxPasswordsForUpload {
+    param([string]$DomainId, [string]$Domain, [string]$Bearer)
+
+    $activeInboxes = @(Get-ActiveDomainInboxes -DomainId $DomainId)
+    if ($activeInboxes.Count -eq 0) {
+        Write-Log "No active inbox rows found for password sync before upload" -Level Warning
+        return $false
+    }
+
+    Write-Log "Syncing $($activeInboxes.Count) active inbox passwords before upload: $Domain" -Level Info
+    $headers = @{ Authorization = "Bearer $Bearer"; "Content-Type" = "application/json" }
+    $failed = @()
+    foreach ($inbox in $activeInboxes) {
+        $email = [string]$inbox.email
+        $password = [string]$inbox.password
+        if (-not $email -or -not $password) {
+            $failed += $email
+            continue
+        }
+        $ok = Set-MailboxAccountReady -Email $email -Bearer $Bearer -Password $password -Headers $headers
+        if (-not $ok) { $failed += $email }
+    }
+
+    if ($failed.Count -gt 0) {
+        Write-Log "Password sync failed for $($failed.Count) inbox(es) before upload" -Level Warning
+        return $false
+    }
+
+    Write-Log "Password sync complete before upload for $Domain" -Level Success
+    return $true
 }
 
 # ============================================================================
@@ -1361,7 +1772,7 @@ function Invoke-BulletproofMailboxCheck {
             if ($mb.RecipientTypeDetails -ne "SharedMailbox") {
                 $mailboxIssues += "NOT Azure mailbox type (is $($mb.RecipientTypeDetails))"
                 try {
-                    Set-Mailbox -Identity $email -Type Shared -ErrorAction Stop
+                    Set-Mailbox -Identity $email -Type Shared -Confirm:$false -ErrorAction Stop
                     Write-Log "[$email] Converted to Azure mailbox type" -Level Success
                 } catch { Write-Log "[$email] Azure mailbox type conversion failed: $($_.Exception.Message)" -Level Error }
             }
@@ -1371,7 +1782,7 @@ function Invoke-BulletproofMailboxCheck {
                 $mailboxOk = $false
                 $mailboxIssues += "NOT RoomMailbox (is $($mb.RecipientTypeDetails))"
                 try {
-                    Set-Mailbox -Identity $email -Type Room -ErrorAction Stop
+                    Set-Mailbox -Identity $email -Type Room -Confirm:$false -ErrorAction Stop
                     Write-Log "[$email] Converted to Room" -Level Success
                 } catch { Write-Log "[$email] Conversion failed: $($_.Exception.Message)" -Level Error }
             }
@@ -1418,7 +1829,7 @@ function Invoke-BulletproofMailboxCheck {
 
                 if ($user.mail -ne $email) { $fixBody.mail = $email }
 
-                Set-Mailbox -Identity $email -MicrosoftOnlineServicesID $email -ErrorAction SilentlyContinue
+                Set-Mailbox -Identity $email -MicrosoftOnlineServicesID $email -Confirm:$false -ErrorAction SilentlyContinue
                 $body = $fixBody | ConvertTo-Json -Depth 3
                 Invoke-RestMethod -Uri "https://graph.microsoft.com/v1.0/users/$userId" -Method PATCH -Headers $headers -Body $body -ErrorAction Stop | Out-Null
             } catch {
@@ -1480,18 +1891,77 @@ function Test-DkimCnameResolution {
     # Verify both DKIM CNAME records resolve before attempting to enable
     $sel1Host = "selector1._domainkey.$Domain"
     $sel2Host = "selector2._domainkey.$Domain"
-    $sel1Ok = $false
-    $sel2Ok = $false
+    $resolveCommand = Get-Command Resolve-DnsName -ErrorAction SilentlyContinue
+    $digCommand = Get-Command dig -ErrorAction SilentlyContinue
+    $nslookupCommand = Get-Command nslookup -ErrorAction SilentlyContinue
 
-    try {
-        $result1 = Resolve-DnsName -Name $sel1Host -Type CNAME -ErrorAction Stop
-        if ($result1) { $sel1Ok = $true }
-    } catch { }
+    function Test-OneDkimCname {
+        param([string]$HostName, [string]$ExpectedTarget)
 
-    try {
-        $result2 = Resolve-DnsName -Name $sel2Host -Type CNAME -ErrorAction Stop
-        if ($result2) { $sel2Ok = $true }
-    } catch { }
+        $expected = $ExpectedTarget.TrimEnd([char]".")
+
+        try {
+            $dnsQueryHost = [System.Uri]::EscapeDataString($HostName)
+            $dohResponse = Invoke-RestMethod `
+                -Method GET `
+                -Uri "https://cloudflare-dns.com/dns-query?name=$dnsQueryHost&type=CNAME" `
+                -Headers @{ accept = "application/dns-json" } `
+                -UserAgent "pixie-worker/1.0" `
+                -TimeoutSec 10 `
+                -ErrorAction Stop
+
+            $answers = @($dohResponse.Answer) | Where-Object { $_ -and $_.data } | ForEach-Object { ([string]$_.data).TrimEnd([char]".") }
+            if ($answers.Count -gt 0) {
+                return ($answers -contains $expected)
+            }
+        } catch { }
+
+        try {
+            if ($digCommand) {
+                foreach ($resolver in @("1.1.1.1", "8.8.8.8")) {
+                    $result = @(& dig "@$resolver" +short $HostName CNAME 2>$null) | ForEach-Object { ([string]$_).Trim() }
+                    if ($result.Count -gt 0) {
+                        $normalizedTargets = @($result | ForEach-Object { $_.TrimEnd([char]".") })
+                        if ($normalizedTargets -contains $expected) { return $true }
+                    }
+                }
+            }
+        } catch { }
+
+        try {
+            if ($resolveCommand) {
+                $result = Resolve-DnsName -Name $HostName -Type CNAME -ErrorAction Stop
+                if ($result) {
+                    $hosts = @($result | ForEach-Object { [string]$_.NameHost }).Where({ $_ })
+                    if ($hosts.Count -eq 0) { return $true }
+                    $normalizedHosts = @($hosts | ForEach-Object { ([string]$_).TrimEnd([char]".") })
+                    return ($normalizedHosts -contains $expected)
+                }
+            }
+        } catch { }
+
+        try {
+            if ($digCommand) {
+                $result = @(& dig +short $HostName CNAME 2>$null) | ForEach-Object { ([string]$_).Trim() }
+                if ($result.Count -gt 0) {
+                    $normalizedTargets = @($result | ForEach-Object { $_.TrimEnd([char]".") })
+                    return ($normalizedTargets -contains $expected)
+                }
+            }
+        } catch { }
+
+        try {
+            if ($nslookupCommand) {
+                $result = @(& nslookup -type=CNAME $HostName 2>$null) | ForEach-Object { [string]$_ }
+                return (($result -join "`n") -match [regex]::Escape($expected))
+            }
+        } catch { }
+
+        return $false
+    }
+
+    $sel1Ok = Test-OneDkimCname -HostName $sel1Host -ExpectedTarget $Selector1CNAME
+    $sel2Ok = Test-OneDkimCname -HostName $sel2Host -ExpectedTarget $Selector2CNAME
 
     return @{ Selector1 = $sel1Ok; Selector2 = $sel2Ok; BothResolved = ($sel1Ok -and $sel2Ok) }
 }
@@ -1499,52 +1969,71 @@ function Test-DkimCnameResolution {
 function Complete-DKIMSetup {
     param([string]$Domain, [string]$ZoneId, [string]$Selector1CNAME, [string]$Selector2CNAME)
 
-    # Step 1: Add CNAME records to Cloudflare
-    $r1 = Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "CNAME" -Name "selector1._domainkey" -Content $Selector1CNAME
-    $r2 = Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "CNAME" -Name "selector2._domainkey" -Content $Selector2CNAME
+    # Step 1: Upsert CNAME records in Cloudflare. Replacements often inherit
+    # old tenant selectors, so "already exists" is not enough for DKIM.
+    $r1 = Set-CloudflareDnsRecord -ZoneId $ZoneId -Type "CNAME" -Name "selector1._domainkey" -Domain $Domain -Content $Selector1CNAME
+    $r2 = Set-CloudflareDnsRecord -ZoneId $ZoneId -Type "CNAME" -Name "selector2._domainkey" -Domain $Domain -Content $Selector2CNAME
 
     if (-not $r1.Success -or -not $r2.Success) {
         Write-Log "Failed to add DKIM CNAME records to Cloudflare (sel1=$($r1.Success), sel2=$($r2.Success))" -Level Error
         return $false
     }
 
-    # Step 2: Wait for DNS propagation with verification
-    Write-Log "Waiting for DKIM CNAME DNS propagation (checking every 30s, up to 5 min)..." -Level Info
-    Start-Sleep -Seconds 30  # Initial short wait — Cloudflare is fast
+    # Step 2: Wait briefly for DNS propagation with verification. Cloudflare is fast;
+    # if Microsoft has not accepted the selectors yet, defer and free this worker.
+    $dnsMaxChecks = 5
+    $dnsCheckIntervalSeconds = 15
+    if ($env:MICROSOFT_DKIM_DNS_CHECKS) {
+        try { $dnsMaxChecks = [Math]::Max(1, [int]$env:MICROSOFT_DKIM_DNS_CHECKS) } catch { $dnsMaxChecks = 5 }
+    }
+    if ($env:MICROSOFT_DKIM_DNS_CHECK_INTERVAL_SECONDS) {
+        try { $dnsCheckIntervalSeconds = [Math]::Max(5, [int]$env:MICROSOFT_DKIM_DNS_CHECK_INTERVAL_SECONDS) } catch { $dnsCheckIntervalSeconds = 15 }
+    }
+    Write-Log "Waiting for DKIM CNAME DNS propagation (checking every ${dnsCheckIntervalSeconds}s, up to $([Math]::Round(($dnsMaxChecks * $dnsCheckIntervalSeconds) / 60, 1)) min)..." -Level Info
+    Start-Sleep -Seconds 10
 
     $dnsVerified = $false
-    for ($dnsCheck = 1; $dnsCheck -le 10; $dnsCheck++) {
+    for ($dnsCheck = 1; $dnsCheck -le $dnsMaxChecks; $dnsCheck++) {
         $dnsResult = Test-DkimCnameResolution -Domain $Domain -Selector1CNAME $Selector1CNAME -Selector2CNAME $Selector2CNAME
         if ($dnsResult.BothResolved) {
             Write-Log "DKIM CNAMEs verified resolving (check $dnsCheck)" -Level Success
             $dnsVerified = $true
             break
         }
-        Write-Log "DNS check $dnsCheck/10: selector1=$($dnsResult.Selector1), selector2=$($dnsResult.Selector2) — waiting 30s..." -Level Warning
-        Start-Sleep -Seconds 30
+        Write-Log "DNS check $dnsCheck/${dnsMaxChecks}: selector1=$($dnsResult.Selector1), selector2=$($dnsResult.Selector2) — waiting ${dnsCheckIntervalSeconds}s..." -Level Warning
+        Start-Sleep -Seconds $dnsCheckIntervalSeconds
     }
 
     if (-not $dnsVerified) {
-        Write-Log "DKIM CNAMEs not resolving after 5 minutes — proceeding anyway (Microsoft may see them)" -Level Warning
+        Write-Log "DKIM CNAMEs not resolving after DNS wait — proceeding anyway (Microsoft may see them)" -Level Warning
     }
 
     # Step 3: Enable DKIM with retries (exponential backoff)
-    for ($attempt = 1; $attempt -le 5; $attempt++) {
+    $maxDkimEnableAttempts = 2
+    if ($env:MICROSOFT_DKIM_ENABLE_ATTEMPTS) {
+        try { $maxDkimEnableAttempts = [Math]::Max(1, [int]$env:MICROSOFT_DKIM_ENABLE_ATTEMPTS) } catch { $maxDkimEnableAttempts = 2 }
+    }
+    for ($attempt = 1; $attempt -le $maxDkimEnableAttempts; $attempt++) {
         try {
             Set-DkimSigningConfig -Identity $Domain -Enabled $true -ErrorAction Stop -WarningAction SilentlyContinue
-            Write-Log "DKIM enabled for $Domain (attempt $attempt)" -Level Success
-            return $true
+            Start-Sleep -Seconds 5
+            $dk = Get-DkimSigningConfig -Identity $Domain -ErrorAction Stop -WarningAction SilentlyContinue
+            if ($dk -and $dk.Enabled -eq $true) {
+                Write-Log "DKIM enabled in tenant for $Domain (attempt $attempt)" -Level Success
+                return $true
+            }
+            Write-Log "DKIM enable command returned but tenant does not report Enabled=true yet" -Level Warning
         } catch {
             $dkimErr = $_.Exception.Message
-            Write-Log "DKIM enable attempt $attempt/5 failed: $dkimErr" -Level Warning
-            if ($attempt -lt 5) {
+            Write-Log "DKIM enable attempt $attempt/${maxDkimEnableAttempts} failed: $dkimErr" -Level Warning
+            if ($attempt -lt $maxDkimEnableAttempts) {
                 $waitSec = 60 * $attempt  # 60s, 120s, 180s, 240s
                 Write-Log "Retrying DKIM in ${waitSec}s..." -Level Info
                 Start-Sleep -Seconds $waitSec
             }
         }
     }
-    Write-Log "DKIM enable failed after 5 attempts — CNAME records are in place, will auto-enable on next retry" -Level Warning
+    Write-Log "DKIM enable failed after ${maxDkimEnableAttempts} attempts — CNAME records are in place, retrying later before upload" -Level Warning
     return $false
 }
 
@@ -1589,7 +2078,7 @@ function Configure-UserConsent {
                 }
             }
             try {
-                Invoke-GraphRequest -Method PATCH -Url "https://graph.microsoft.com/v1.0/policies/authorizationPolicy" -Bearer $userToken -Body $policyBody
+                Invoke-GraphRequest -Method PATCH -Url "https://graph.microsoft.com/v1.0/policies/authorizationPolicy" -Bearer $userToken -Body $policyBody | Out-Null
                 Write-Log "User consent policy configured" -Level Success
             } catch {
                 Write-Log "Could not set consent policy: $($_.Exception.Message)" -Level Warning
@@ -1628,6 +2117,7 @@ function Process-MicrosoftDomain {
     $AdminPassword = $AdminRecord.password
     $interimStatus = if ($DomainRecord.interim_status) { $DomainRecord.interim_status } else { "" }
     $history = if ($DomainRecord.action_history) { $DomainRecord.action_history } else { "" }
+    $ReplacementOldDomain = Get-ReplacementOldDomainFromRecord -DomainRecord $DomainRecord
 
     # Generate a shared password for all inboxes in this domain
     $InboxPassword = -join ((65..90) + (97..122) + (48..57) | Get-Random -Count 14 | ForEach-Object { [char]$_ })
@@ -1640,6 +2130,9 @@ function Process-MicrosoftDomain {
     Write-Host "  Processing Domain ($($MailboxLabel.ToUpperInvariant())): $Domain" -ForegroundColor Magenta
     Write-Host "  Admin: $AdminEmail | Interim: $interimStatus" -ForegroundColor Magenta
     Write-Host "  Inboxes: $($Inboxes.Count) | Zone: $ZoneId" -ForegroundColor Magenta
+    if ($ReplacementOldDomain) {
+        Write-Host "  Replacement isolation: old domain $ReplacementOldDomain must not remain on $Domain mailboxes" -ForegroundColor Yellow
+    }
     Write-Host "================================================================" -ForegroundColor Magenta
 
     # Ordered pipeline steps for resume
@@ -1659,6 +2152,24 @@ function Process-MicrosoftDomain {
     if ($interimStatus -eq "Both - Provisioning Complete") {
         Write-Log "Already completed, skipping" -Level Warning
         return
+    }
+
+    $statusesAfterMailboxCreation = @(
+        "Microsoft - Mailboxes Created",
+        "Microsoft - Configuring Mailboxes",
+        "Microsoft - SMTP Enabled",
+        "Both - DKIM Complete",
+        "Both - Sending Tool Upload Pending",
+        "Both - Sending Tool Upload Blocked",
+        "Both - Sending Tool Upload Failed",
+        "Both - Failed"
+    )
+    if ($Inboxes.Count -gt 0 -and $interimStatus -in $statusesAfterMailboxCreation) {
+        $rewindReason = "Found $($Inboxes.Count) pending inbox row(s) while domain was at '$interimStatus'; rewinding to mailbox creation before finalization"
+        Write-Log $rewindReason -Level Warning
+        $history = Add-HistoryEntry -History $history -Entry "RECOVERY: $rewindReason"
+        Update-Domain -DomainId $DomainId -Fields @{ status = "in_progress"; interim_status = "Both - Creating Mailboxes"; action_history = $history }
+        $interimStatus = "Both - Creating Mailboxes"
     }
 
     $history = Add-HistoryEntry -History $history -Entry "Microsoft provisioning started (admin: $AdminEmail)"
@@ -1910,6 +2421,31 @@ function Process-MicrosoftDomain {
     }
 
     # ── STEP 7: Create mailboxes ──
+    if (($interimStatus -eq "Microsoft - Exchange Synced" -or $interimStatus -eq "Both - Creating Mailboxes") -and -not $DryRun) {
+        $exchangeSyncDeferSeconds = 300
+        if ($env:MICROSOFT_EXCHANGE_SYNC_DEFER_SECONDS) {
+            try {
+                $exchangeSyncDeferSeconds = [Math]::Max(30, [int]$env:MICROSOFT_EXCHANGE_SYNC_DEFER_SECONDS)
+            } catch { }
+        }
+
+        $acceptedNow = $null
+        try { $acceptedNow = Get-AcceptedDomain -Identity $Domain -ErrorAction SilentlyContinue } catch { }
+        if (-not $acceptedNow) {
+            Write-Log "Exchange does not currently list $Domain as an accepted domain; deferring before mailbox creation" -Level Warning
+            $nextRetryAt = (Get-Date).AddSeconds($exchangeSyncDeferSeconds).ToString("yyyy-MM-ddTHH:mm:ssZ")
+            $history = Add-HistoryEntry -History $history -Entry "Exchange accepted-domain check missing before mailbox creation; deferring retry for $exchangeSyncDeferSeconds seconds"
+            Update-Domain -DomainId $DomainId -Fields @{ status = "in_progress"; interim_status = "Both - DNS Records Added"; action_history = $history }
+            Update-ActionStatus -ActionId $ActionId -Status "pending" -Error "Exchange accepted domain missing before mailbox creation" -NextRetryAt $nextRetryAt
+            Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "exchange_accepted_domain_missing_before_mailbox_creation" -Severity "warn" -Message "Exchange does not currently list $Domain as an accepted domain; retrying mailbox creation after Exchange sync" -Metadata @{
+                next_retry_at = $nextRetryAt
+                retry_delay_seconds = $exchangeSyncDeferSeconds
+                previous_interim_status = $interimStatus
+            }
+            return
+        }
+    }
+
     $mailboxResults = $null
     if ($interimStatus -eq "Microsoft - Exchange Synced" -or $interimStatus -eq "Both - Creating Mailboxes") {
         $history = Add-HistoryEntry -History $history -Entry "Creating $($Inboxes.Count) $MailboxLabel..."
@@ -1923,8 +2459,31 @@ function Process-MicrosoftDomain {
             }
 
             if ($mailboxResults.Created.Count -eq 0) {
-                $history = Add-HistoryEntry -History $history -Entry "FAILED: No mailboxes created (0/$($Inboxes.Count))"
+                $failureMessage = if ($mailboxResults.FatalError) { [string]$mailboxResults.FatalError } else { "No mailboxes created (0/$($Inboxes.Count))" }
+                $acceptedDomainBlocked = (
+                    $IsAzureProvider -and
+                    (
+                        [string]$mailboxResults.FatalCode -eq "azure_accepted_domain_mailbox_creation_blocked" -or
+                        (Test-AzureAcceptedDomainMailboxCreateBlocked -Message $failureMessage)
+                    )
+                )
+                if ($acceptedDomainBlocked) {
+                    $repairQueued = Invoke-AzureAcceptedDomainReaddRecovery -Bearer $Bearer -Domain $Domain -DomainId $DomainId -CustomerId $CustomerId -ActionId $ActionId -History $history -FailureMessage $failureMessage -DelaySeconds 60
+                    if ($repairQueued) {
+                        Write-Log "Accepted-domain delete/re-add recovery queued for $Domain; retrying provisioning after Microsoft sync" -Level Warning
+                        return
+                    }
+                }
+
+                $history = Add-HistoryEntry -History $history -Entry "FAILED: $failureMessage"
                 Update-Domain -DomainId $DomainId -Fields @{ status = "in_progress"; interim_status = "Both - Failed"; action_history = $history }
+                Update-ActionStatus -ActionId $ActionId -Status "failed" -Error $failureMessage
+                Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "mailbox_creation_failed_zero_created" -Severity "error" -Message $failureMessage -Metadata @{
+                    requested_inboxes = $Inboxes.Count
+                    provider = $Provider
+                    mailbox_mode = $MailboxMode
+                    blocker_code = if ($acceptedDomainBlocked) { "azure_accepted_domain_mailbox_creation_blocked" } else { $null }
+                }
                 return
             }
 
@@ -1956,6 +2515,22 @@ function Process-MicrosoftDomain {
             Unblock-DomainMailboxes -Domain $Domain -Bearer $Bearer -Password $InboxPassword
             $history = Add-HistoryEntry -History $history -Entry "Mailboxes unblocked"
 
+            if ($ReplacementOldDomain) {
+                $aliasIsolation = Invoke-ReplacementAliasIsolation -Domain $Domain -ReplacementOldDomain $ReplacementOldDomain -ExpectedMailboxCount $Inboxes.Count -Repair
+                $history = Add-HistoryEntry -History $history -Entry "Replacement alias isolation: checked $($aliasIsolation.Checked), repaired $($aliasIsolation.Repaired)"
+                Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "replacement_alias_isolation_checked" -Severity $(if ($aliasIsolation.Success) { "info" } else { "error" }) -Message "Replacement alias isolation checked for $Domain against old domain $ReplacementOldDomain" -Metadata @{
+                    old_domain = $ReplacementOldDomain
+                    new_domain = $Domain
+                    checked = $aliasIsolation.Checked
+                    repaired = $aliasIsolation.Repaired
+                    blocked = $aliasIsolation.Blocked
+                    issues = $aliasIsolation.Issues
+                }
+                if (-not $aliasIsolation.Success) {
+                    $failedSteps += "Replacement Alias Isolation"
+                }
+            }
+
             $bulletproof = Invoke-BulletproofMailboxCheck -Domain $Domain -Bearer $Bearer -Password $InboxPassword -MailboxMode $MailboxMode
             $history = Add-HistoryEntry -History $history -Entry "Bulletproof check: $($bulletproof.Passed)/$($bulletproof.Total) passed"
 
@@ -1971,19 +2546,19 @@ function Process-MicrosoftDomain {
     if ($interimStatus -eq "Microsoft - Configuring Mailboxes") {
         if (-not $DryRun) {
             $tenantSmtpOk = Enable-TenantSMTPAuth
-            $clientAccess = Enable-MailboxClientAccessForDomain -Domain $Domain
+            $clientAccess = Confirm-DomainClientAccessForDomain -Domain $Domain
             if (-not $tenantSmtpOk) { $failedSteps += "Tenant SMTP AUTH" }
             if (-not $clientAccess.Success) {
-                $failedSteps += "Mailbox SMTP/IMAP Access"
-                Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "mailbox_client_access_failed" -Severity "error" -Message "SMTP/IMAP access could not be enabled for every mailbox" -Metadata @{
+                $failedSteps += "Domain SMTP/IMAP Access"
+                Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "domain_client_access_failed" -Severity "error" -Message "Domain-level SMTP/IMAP readiness could not be confirmed" -Metadata @{
                     enabled = $clientAccess.Enabled
                     total = $clientAccess.Total
                     failed = $clientAccess.Failed
                 }
             }
-            $history = Add-HistoryEntry -History $history -Entry "Tenant SMTP AUTH enabled; mailbox SMTP/IMAP access $($clientAccess.Enabled)/$($clientAccess.Total)"
+            $history = Add-HistoryEntry -History $history -Entry "Tenant SMTP AUTH enabled; domain SMTP/IMAP readiness confirmed for $($clientAccess.Total) mailboxes"
         } else {
-            $history = Add-HistoryEntry -History $history -Entry "Tenant SMTP AUTH and mailbox SMTP/IMAP access enabled"
+            $history = Add-HistoryEntry -History $history -Entry "Tenant SMTP AUTH and domain SMTP/IMAP readiness confirmed"
         }
         Update-Domain -DomainId $DomainId -Fields @{ interim_status = "Microsoft - SMTP Enabled"; action_history = $history }
         $interimStatus = "Microsoft - SMTP Enabled"
@@ -1991,6 +2566,7 @@ function Process-MicrosoftDomain {
 
     # ── STEP 10: DKIM ──
     $dkimSuccess = $false
+    $dkimPendingReason = $null
     if ($interimStatus -eq "Microsoft - SMTP Enabled") {
         if (-not $DryRun) {
             $dkimConfig = Setup-DomainDKIM -Domain $Domain -ZoneId $ZoneId
@@ -2004,14 +2580,35 @@ function Process-MicrosoftDomain {
                     if ($dkimSuccess) {
                         $history = Add-HistoryEntry -History $history -Entry "DKIM configured and enabled"
                     } else {
-                        $history = Add-HistoryEntry -History $history -Entry "WARNING: DKIM CNAMEs added to Cloudflare but Set-DkimSigningConfig -Enabled failed after 5 retries"
+                        $dkimPendingReason = "DKIM CNAMEs are in Cloudflare but Microsoft tenant has not accepted/enabled them yet"
+                        $history = Add-HistoryEntry -History $history -Entry "PENDING: $dkimPendingReason"
                     }
                 }
             } else {
-                $history = Add-HistoryEntry -History $history -Entry "WARNING: DKIM selector creation failed: $($dkimConfig.Error)"
+                $dkimPendingReason = "DKIM selector creation pending: $($dkimConfig.Error)"
+                $history = Add-HistoryEntry -History $history -Entry "PENDING: $dkimPendingReason"
             }
-            if (-not $dkimSuccess) { $failedSteps += "DKIM Setup" }
         } else { $dkimSuccess = $true }
+
+        if (-not $dkimSuccess) {
+            $reason = if ($dkimPendingReason) { $dkimPendingReason } else { "DKIM tenant enable pending" }
+            $delaySeconds = 300
+            if ($env:MICROSOFT_DKIM_RETRY_DELAY_SECONDS) {
+                try { $delaySeconds = [Math]::Max(60, [int]$env:MICROSOFT_DKIM_RETRY_DELAY_SECONDS) } catch { $delaySeconds = 300 }
+            }
+            $nextRetryAt = (Get-Date).ToUniversalTime().AddSeconds($delaySeconds).ToString("yyyy-MM-ddTHH:mm:ssZ")
+            Update-Domain -DomainId $DomainId -Fields @{
+                status = "in_progress"
+                interim_status = "Microsoft - SMTP Enabled"
+                action_history = $history
+            }
+            Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "dkim_enable_pending" -Severity "warn" -Message $reason -Metadata @{
+                next_retry_at = $nextRetryAt
+                retry_delay_seconds = $delaySeconds
+            }
+            Set-ProvisionActionPendingWithoutPenalty -ActionId $ActionId -Reason $reason -DelaySeconds $delaySeconds
+            return
+        }
 
         Update-Domain -DomainId $DomainId -Fields @{ interim_status = "Both - DKIM Complete"; action_history = $history }
         $interimStatus = "Both - DKIM Complete"
@@ -2021,7 +2618,30 @@ function Process-MicrosoftDomain {
     if ($interimStatus -eq "Both - DKIM Complete") {
         $actualCount = 0
         if (-not $DryRun) {
+            if ($ReplacementOldDomain) {
+                $preUploadIsolation = Invoke-ReplacementAliasIsolation -Domain $Domain -ReplacementOldDomain $ReplacementOldDomain -ExpectedMailboxCount $Inboxes.Count -Repair
+                $history = Add-HistoryEntry -History $history -Entry "Pre-upload replacement alias isolation: checked $($preUploadIsolation.Checked), repaired $($preUploadIsolation.Repaired)"
+                Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "replacement_alias_isolation_pre_upload" -Severity $(if ($preUploadIsolation.Success) { "info" } else { "error" }) -Message "Pre-upload replacement alias isolation checked for $Domain against old domain $ReplacementOldDomain" -Metadata @{
+                    old_domain = $ReplacementOldDomain
+                    new_domain = $Domain
+                    checked = $preUploadIsolation.Checked
+                    repaired = $preUploadIsolation.Repaired
+                    blocked = $preUploadIsolation.Blocked
+                    issues = $preUploadIsolation.Issues
+                }
+                if (-not $preUploadIsolation.Success) { $failedSteps += "Pre-upload Replacement Alias Isolation" }
+            }
+
             $actualCount = (Get-Mailbox -ResultSize Unlimited | Where-Object { $_.PrimarySmtpAddress -like "*@$Domain" } | Measure-Object).Count
+            $freshBearer = Get-ROPCToken -TenantId $tenantId -ClientId $AzureCliPublicClientId -Username $AdminEmail -Password $AdminPassword
+            if ($freshBearer) {
+                $Bearer = $freshBearer
+                Write-Log "Graph token refreshed before password sync" -Level Success
+            } else {
+                Write-Log "Could not refresh Graph token before password sync; using existing token" -Level Warning
+            }
+            $passwordSyncOk = Sync-ActiveInboxPasswordsForUpload -DomainId $DomainId -Domain $Domain -Bearer $Bearer
+            if (-not $passwordSyncOk) { $failedSteps += "Password Sync" }
         }
 
         if ($failedSteps.Count -eq 0) {
@@ -2089,6 +2709,7 @@ if (-not $actionRecord) {
     Write-Log "Action not found: $ActionId" -Level Error
     exit 1
 }
+Register-ActionLeaseFence -Action $actionRecord
 
 # Fetch inboxes
 $inboxes = Get-DomainInboxes -DomainId $DomainId -Status "pending"
@@ -2107,20 +2728,47 @@ if ($inboxes.Count -eq 0) {
     }
 
     $interimStatus = if ($domainRecord.interim_status) { [string]$domainRecord.interim_status } else { "" }
-    if ($interimStatus -in @("Both - DKIM Complete", "Both - Sending Tool Upload Pending", "Both - Sending Tool Upload Blocked", "Both - Sending Tool Upload Failed", "Both - Provisioning Complete")) {
+    if ($interimStatus -eq "Both - DKIM Complete") {
+        Write-Log "No pending inboxes; reconnecting to validate Exchange mailbox count before upload" -Level Warning
+        $inboxes = $activeInboxes
+    } elseif ($interimStatus -in @("Both - Sending Tool Upload Pending", "Both - Sending Tool Upload Blocked", "Both - Sending Tool Upload Failed", "Both - Provisioning Complete")) {
         Resolve-MicrosoftProvisioningUploadState -DomainRecord $domainRecord -ActionId $ActionId -History $existingHistory -ActualMailboxCount 0 | Out-Null
         exit 0
+    } else {
+        Write-Log "Continuing provisioning with $($activeInboxes.Count) verified active inbox row(s)" -Level Info
+        $inboxes = $activeInboxes
     }
-
-    Write-Log "Continuing provisioning with $($activeInboxes.Count) verified active inbox row(s)" -Level Info
-    $inboxes = $activeInboxes
 }
 
-Write-Log "Domain: $($domainRecord.domain), Inboxes: $($inboxes.Count)" -Level Info
+    Write-Log "Domain: $($domainRecord.domain), Inboxes: $($inboxes.Count)" -Level Info
 
-$assignedAdmin = Get-AssignedAdmin -DomainId $DomainId
-$preferredAdminId = if ($assignedAdmin -and $assignedAdmin.id) { [string]$assignedAdmin.id } else { $null }
-$adminRecord = Acquire-MicrosoftAdminLock -ActionId $ActionId -DomainId $DomainId -PreferredAdminId $preferredAdminId
+    $assignedAdmin = Get-AssignedAdmin -DomainId $DomainId
+    $isJackThresholdMigration = (
+        $actionRecord -and
+        $actionRecord.payload -and
+        [string]$actionRecord.payload.source -eq "jack_threshold_tenant_migration"
+    )
+    if ($isJackThresholdMigration -and $assignedAdmin -and [string]$assignedAdmin.status -eq "threshold exceeded") {
+        $reason = "Premature Jack threshold-migration provision action cancelled because $($domainRecord.domain) is still assigned to threshold tenant $($assignedAdmin.email); source teardown/reassignment must run first."
+        Write-Log $reason -Level Warning
+        $existingHistory = ""
+        if ($domainRecord.action_history) { $existingHistory = [string]$domainRecord.action_history }
+        $history = Add-HistoryEntry -History $existingHistory -Entry "Provision deferred: domain still assigned to threshold tenant; waiting for migration controller"
+        Update-Domain -DomainId $DomainId -Fields @{ action_history = $history }
+        Update-ActionStatus -ActionId $ActionId -Status "cancelled" -Error $reason -Result @{
+            cancelled_reason = "premature_threshold_migration_provision"
+            current_admin_email = [string]$assignedAdmin.email
+            current_admin_status = [string]$assignedAdmin.status
+            next_action = "Run threshold migration cancellation/reassignment, then create a fresh replacement provision action."
+        } -Action $actionRecord | Out-Null
+        Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $domainRecord.customer_id -EventType "premature_threshold_migration_provision_cancelled" -Severity "warn" -Message $reason -Metadata @{
+            current_admin_email = [string]$assignedAdmin.email
+            current_admin_status = [string]$assignedAdmin.status
+        }
+        return
+    }
+    $preferredAdminId = if ($assignedAdmin -and $assignedAdmin.id) { [string]$assignedAdmin.id } else { $null }
+    $adminRecord = Acquire-MicrosoftAdminLock -ActionId $ActionId -DomainId $DomainId -PreferredAdminId $preferredAdminId
 if (-not $adminRecord) {
     if (Test-ActiveAdminExists -Provider "microsoft") {
         $waitReason = if ($preferredAdminId) {

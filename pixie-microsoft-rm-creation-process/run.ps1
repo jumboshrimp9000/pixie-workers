@@ -42,7 +42,7 @@ Write-Host ""
 $nodeVersion = $null
 try { $nodeVersion = node --version 2>$null } catch { }
 if (-not $nodeVersion) {
-    Write-Log "Node.js not found - Part 1 (TypeScript) will be skipped" -Level Warning
+    Write-Log "Node.js not found — Part 1 (TypeScript) will be skipped" -Level Warning
     Write-Log "Install Node.js 20+ to enable domain setup automation" -Level Warning
 }
 
@@ -106,77 +106,7 @@ function Reset-SmtpPlusUnknownProviderFailures {
     }
 }
 
-function Get-RecoveryPoolIdFromActionPayload {
-    param([object]$Payload)
-
-    if ($Payload -is [string]) {
-        try { $Payload = $Payload | ConvertFrom-Json -Depth 20 } catch { $Payload = $null }
-    }
-    if (-not $Payload) { return "" }
-    return [string]$Payload.recovery_pool_id
-}
-
-function Reset-RecoveryInstantlyTimeoutFailures {
-    if ($DryRun) {
-        Write-Log "Dry run: skipping Recovery Instantly timeout self-heal" -Level Info
-        return
-    }
-
-    $query = "type=eq.microsoft_recovery_move&status=eq.failed&order=updated_at.desc&limit=100&select=id,domain_id,customer_id,type,status,error,attempts,max_attempts,payload"
-    $result = Invoke-SupabaseApi -Method GET -Table "actions" -Query $query
-    if (-not $result.Success) {
-        Write-Log "Recovery Instantly timeout self-heal could not load failed actions" -Level Warning
-        return
-    }
-
-    $actions = @($result.Data)
-    if ($actions.Count -eq 0) { return }
-
-    $resetCount = 0
-    foreach ($failedAction in $actions) {
-        $errorText = [string]$failedAction.error
-        if (-not $errorText) { continue }
-        if ($errorText -notmatch "Instantly") { continue }
-        if ($errorText -notmatch "504|Gateway Time-out|Gateway Timeout|timed out|operation has timed out|request.*aborted|request.*canceled|account did not appear") { continue }
-
-        $recoveryPoolId = Get-RecoveryPoolIdFromActionPayload -Payload $failedAction.payload
-        $now = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-        $update = Invoke-SupabaseApi -Method PATCH -Table "actions" -Query "id=eq.$($failedAction.id)&status=eq.failed" -Body @{
-            status = "pending"
-            error = $null
-            attempts = 0
-            next_retry_at = $null
-            started_at = $null
-            completed_at = $null
-            updated_at = $now
-        }
-
-        if ($update.Success -and @($update.Data).Count -gt 0) {
-            $resetCount += 1
-            if ($recoveryPoolId) {
-                Invoke-SupabaseApi -Method PATCH -Table "recovery_pool" -Query "id=eq.$recoveryPoolId&recovery_status=eq.failed" -Body @{
-                    recovery_status = "queued_for_recovery"
-                    last_error = $null
-                    updated_at = $now
-                } | Out-Null
-            }
-            $domainIdForLog = if ($failedAction.domain_id) { [string]$failedAction.domain_id } else { $null }
-            $customerIdForLog = if ($failedAction.customer_id) { [string]$failedAction.customer_id } else { $null }
-            Add-ActionLog -ActionId ([string]$failedAction.id) -DomainId $domainIdForLog -CustomerId $customerIdForLog -EventType "recovery_instantly_timeout_self_heal_queued" -Severity "info" -Message "Re-queued Recovery Pool move after Instantly timeout handling fix" -Metadata @{
-                recovery_pool_id = $recoveryPoolId
-                previous_error = $errorText.Substring(0, [Math]::Min(1000, $errorText.Length))
-                reset_at = $now
-            }
-        }
-    }
-
-    if ($resetCount -gt 0) {
-        Write-Log "Re-queued $resetCount Microsoft recovery move action(s) that failed during Instantly timeout/upload." -Level Success
-    }
-}
-
 Reset-SmtpPlusUnknownProviderFailures
-Reset-RecoveryInstantlyTimeoutFailures
 
 function Process-SingleAction {
     param([object]$Action)
@@ -273,7 +203,7 @@ function Process-SingleAction {
     }
 
     # Determine which parts need to run based on interim_status
-    $part1Statuses = @("", "Both - New Order")  # Part 1 not done yet
+    $part1Statuses = @("", "Both - New Order", "Both - NS Propagation Pending")  # Part 1 not done yet or waiting on public NS
     $part2Statuses = @(
         "Both - DNS Zone Created", "Both - NS Migrated",
         "Microsoft - Added to M365", "Both - Verification TXT Added",
@@ -301,8 +231,17 @@ function Process-SingleAction {
             Write-Host $part1Output
 
             if ($part1Output -match "PART1_RESULT:FAILED") {
-                Write-Log "Part 1 FAILED - check output above" -Level Error
+                Write-Log "Part 1 FAILED — check output above" -Level Error
                 Fail-Action -Action $Action -ErrorMessage "Part 1 (domain setup) failed"
+                return
+            }
+            if ($part1Output -match "PART1_RESULT:DEFERRED:ns_propagation") {
+                $retrySeconds = 900
+                if ($env:WORKER_NS_PROPAGATION_RETRY_SECONDS) {
+                    try { $retrySeconds = [Math]::Max(60, [int][double]$env:WORKER_NS_PROPAGATION_RETRY_SECONDS) } catch { $retrySeconds = 900 }
+                }
+                Write-Log "Part 1 deferred — public nameserver delegation has not propagated yet; retrying in $retrySeconds seconds" -Level Warning
+                Requeue-ActionWithoutPenalty -Action $Action -Reason "DNS delegation not public yet: registrar update submitted, but public NS has not propagated to Cloudflare." -DelaySeconds $retrySeconds | Out-Null
                 return
             }
         } catch {
@@ -315,7 +254,7 @@ function Process-SingleAction {
     } elseif ($needsPart1) {
         Write-Log "Part 1 skipped (Node.js not available). Checking if CF zone exists..." -Level Warning
         if (-not $domain.cloudflare_zone_id) {
-            Write-Log "No Cloudflare zone ID - cannot proceed without Part 1" -Level Error
+            Write-Log "No Cloudflare zone ID — cannot proceed without Part 1" -Level Error
             Fail-Action -Action $Action -ErrorMessage "No Cloudflare zone ID and Node.js not available"
             return
         }
@@ -351,7 +290,20 @@ function Process-SingleAction {
 # MAIN LOOP
 # ============================================================================
 do {
-    $actions = Get-PendingActions -ActionTypes @("provision_inbox", "microsoft_update_inboxes", "microsoft_cancel_domain", "microsoft_recovery_move", "microsoft_recovery_reactivate", "microsoft_recovery_purge")
+    $defaultActionTypes = @("provision_inbox", "microsoft_update_inboxes", "microsoft_cancel_domain", "microsoft_recovery_move", "microsoft_recovery_reactivate", "microsoft_recovery_purge")
+    $configuredActionTypes = @($defaultActionTypes)
+    if ($env:WORKER_ACTION_TYPES) {
+        $configuredActionTypes = @($env:WORKER_ACTION_TYPES -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    } elseif ($env:WORKER_FILTER) {
+        $configuredActionTypes = @($env:WORKER_FILTER -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    }
+    $configuredActionSources = @()
+    if ($env:WORKER_ACTION_SOURCES) {
+        $configuredActionSources = @($env:WORKER_ACTION_SOURCES -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    } elseif ($env:WORKER_ACTION_SOURCE) {
+        $configuredActionSources = @($env:WORKER_ACTION_SOURCE -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    }
+    $actions = Get-PendingActions -ActionTypes $configuredActionTypes -ActionSources $configuredActionSources
 
     if ($actions -and $actions.Count -gt 0) {
         $toProcess = $actions
