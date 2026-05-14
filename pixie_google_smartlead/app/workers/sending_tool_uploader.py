@@ -56,7 +56,7 @@ class SendingToolUploader:
         use_oauth_browser = (
             use_playwright_oauth
             and provider_name == "google"
-            and normalized_tool in {"instantly.ai", "smartlead.ai", "amplemarket"}
+            and normalized_tool in {"instantly.ai", "smartlead.ai", "amplemarket", "email-bison"}
         )
         resolved_headless = self._as_bool(
             os.getenv("GOOGLE_PLAYWRIGHT_HEADLESS", "true"),
@@ -115,6 +115,31 @@ class SendingToolUploader:
                 headless=resolved_headless,
                 use_browser=use_playwright_oauth,
             )
+
+        if normalized_tool == "email-bison":
+            if provider_name == "google" and use_playwright_oauth:
+                return self._upload_email_bison_google_via_oauth(
+                    credential=cred,
+                    inboxes=inboxes,
+                    onepassword=onepassword,
+                    headless=resolved_headless,
+                    api_key=api_key,
+                    settings=self._normalize_settings(settings),
+                )
+            return {
+                "tool": "email-bison",
+                "total_candidates": len(inboxes),
+                "uploaded_emails": [],
+                "failed_uploads": [
+                    {
+                        "email": str(row.get("email") or "").strip().lower(),
+                        "error": "Email Bison automated upload currently supports Google OAuth inboxes only",
+                    }
+                    for row in inboxes
+                    if str(row.get("email") or "").strip()
+                ],
+                "skipped_already_uploaded": 0,
+            }
 
         return {
             "tool": normalized_tool or str(tool or ""),
@@ -642,6 +667,768 @@ class SendingToolUploader:
             missing_error_prefix="Smartlead account not found after validation",
             total_candidates=len(target_set),
         )
+
+    def _upload_email_bison_google_via_oauth(
+        self,
+        *,
+        credential: Dict[str, Any],
+        inboxes: List[Dict[str, Any]],
+        onepassword: Any,
+        headless: bool,
+        api_key: str,
+        settings: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        targets = [self._normalize_email(row.get("email")) for row in inboxes]
+        targets = [email for email in targets if email]
+        target_set = set(targets)
+        present: Set[str] = set()
+        provisional_errors: Dict[str, str] = {}
+        skipped_already_uploaded = 0
+
+        base_url = self._normalize_email_bison_base_url(credential.get("tool_url") or credential.get("url"))
+        workspace_name = str(
+            credential.get("workspace_name")
+            or credential.get("workspace")
+            or (credential.get("extra_fields") or {}).get("workspace")
+            or ""
+        ).strip()
+        bison_username = str(credential.get("username") or "").strip()
+        bison_password = str(credential.get("password") or "").strip()
+
+        if not target_set:
+            return {
+                "tool": "email-bison",
+                "total_candidates": 0,
+                "uploaded_emails": [],
+                "failed_uploads": [],
+                "skipped_already_uploaded": 0,
+            }
+        if not base_url:
+            return self._failed_result("email-bison", target_set, "Missing Email Bison instance URL")
+        if not bison_username or not bison_password:
+            return self._failed_result("email-bison", target_set, "Missing Email Bison username/password")
+
+        logger.info(
+            "[SendingToolUploader:EmailBison] Using Playwright Google OAuth upload for %s inbox(es) (headless=%s)",
+            len(target_set),
+            headless,
+        )
+
+        browser = None
+        context = None
+        page = None
+        playwright = None
+        try:
+            from playwright.sync_api import sync_playwright
+
+            playwright = sync_playwright().start()
+            browser = self._launch_playwright_browser(playwright, headless=headless)
+            context, page = self._create_oauth_context_page(browser)
+            self._email_bison_login(
+                page=page,
+                base_url=base_url,
+                username=bison_username,
+                password=bison_password,
+            )
+            self._ensure_email_bison_workspace(page=page, expected_workspace=workspace_name)
+
+            total_inboxes = len(inboxes)
+            for index, inbox in enumerate(inboxes, start=1):
+                email = self._normalize_email(inbox.get("email"))
+                password = str(inbox.get("password") or "").strip()
+                otp_secret = str(inbox.get("otp_secret") or "").strip()
+                if not email:
+                    continue
+                if not password:
+                    provisional_errors[email] = "Missing inbox password"
+                    continue
+
+                started_at = time.time()
+                logger.info(
+                    "[SendingToolUploader:EmailBison] [%s/%s] Starting Google OAuth for %s",
+                    index,
+                    total_inboxes,
+                    email,
+                )
+                try:
+                    self._ensure_email_bison_workspace(page=page, expected_workspace=workspace_name)
+                    if self._email_bison_sender_visible(page=page, base_url=base_url, email=email):
+                        present.add(email)
+                        skipped_already_uploaded += 1
+                        logger.info(
+                            "[SendingToolUploader:EmailBison] [%s/%s] Already connected: %s",
+                            index,
+                            total_inboxes,
+                            email,
+                        )
+                        continue
+
+                    # Keep the Email Bison session, but remove Google cookies/storage before
+                    # every account so a prior inbox cannot be silently reused on the same IP.
+                    self._clear_google_session_state(context)
+                    self._start_email_bison_google_oauth(
+                        page=page,
+                        base_url=base_url,
+                        inbox=inbox,
+                    )
+                    self._email_bison_capture(page=page, email=email, label="oauth-started")
+                    self._complete_google_signin_and_consent(
+                        page=page,
+                        context=context,
+                        email=email,
+                        password=password,
+                        onepassword=onepassword,
+                        otp_secret=otp_secret,
+                    )
+                    self._wait_for_url_contains(page, ["/sender-emails"], timeout_seconds=35)
+                    self._email_bison_capture(page=page, email=email, label="after-oauth-callback")
+                    self._ensure_email_bison_workspace(page=page, expected_workspace=workspace_name)
+                    if self._email_bison_oauth_success_for_email(page_url=str(getattr(page, "url", "") or ""), email=email):
+                        present.add(email)
+                        logger.info(
+                            "[SendingToolUploader:EmailBison] [%s/%s] OAuth callback confirmed %s (%.1fs)",
+                            index,
+                            total_inboxes,
+                            email,
+                            time.time() - started_at,
+                        )
+                    elif self._email_bison_sender_visible(page=page, base_url=base_url, email=email):
+                        present.add(email)
+                        logger.info(
+                            "[SendingToolUploader:EmailBison] [%s/%s] OAuth complete for %s (%.1fs)",
+                            index,
+                            total_inboxes,
+                            email,
+                            time.time() - started_at,
+                        )
+                    else:
+                        provisional_errors[email] = "Email Bison did not show the inbox after OAuth callback"
+                except Exception as exc:
+                    try:
+                        self._email_bison_capture(page=page, email=email, label="failure")
+                    except Exception:
+                        pass
+                    provisional_errors[email] = str(exc)
+                    logger.warning(
+                        "[SendingToolUploader:EmailBison] [%s/%s] OAuth failed for %s (%.1fs): %s",
+                        index,
+                        total_inboxes,
+                        email,
+                        time.time() - started_at,
+                        exc,
+                    )
+                finally:
+                    try:
+                        self._clear_google_session_state(context)
+                    except Exception:
+                        pass
+                    try:
+                        page.bring_to_front()
+                    except Exception:
+                        pass
+        except Exception as exc:
+            message = f"Playwright Email Bison Google OAuth upload failed: {exc}"
+            logger.warning("[SendingToolUploader:EmailBison] %s", message)
+            for email in target_set:
+                provisional_errors.setdefault(email, message)
+        finally:
+            self._close_oauth_context_page(context=context, page=page)
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+            if playwright is not None:
+                try:
+                    playwright.stop()
+                except Exception:
+                    pass
+
+        result = self._build_result(
+            tool="email-bison",
+            inboxes=inboxes,
+            present=present,
+            provisional_errors=provisional_errors,
+            missing_error_prefix="Email Bison account not found after validation",
+            total_candidates=len(target_set),
+        )
+        result["skipped_already_uploaded"] = skipped_already_uploaded
+        result = self._apply_email_bison_settings(
+            api_key=api_key,
+            base_url=base_url,
+            result=result,
+            settings=settings,
+        )
+        return result
+
+    def _apply_email_bison_settings(
+        self,
+        *,
+        api_key: str,
+        base_url: str,
+        result: Dict[str, Any],
+        settings: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        uploaded = [
+            self._normalize_email(email)
+            for email in (result.get("uploaded_emails") or [])
+            if self._normalize_email(email)
+        ]
+        if not uploaded:
+            return result
+        if not self._has_email_bison_settings_to_apply(settings):
+            result["settings_required"] = False
+            result["settings_skipped"] = True
+            return result
+
+        result["settings_required"] = True
+        if not str(api_key or "").strip():
+            failed = list(result.get("failed_uploads") or [])
+            for email in uploaded:
+                failed.append({
+                    "email": email,
+                    "error": "Email Bison Workspace API key is required to apply requested sending settings",
+                })
+            result["failed_uploads"] = failed
+            result["uploaded_emails"] = []
+            result["settings_validated"] = False
+            return result
+
+        account_by_email: Dict[str, Dict[str, Any]] = {}
+        failed = list(result.get("failed_uploads") or [])
+        failed_emails: Set[str] = set()
+        for email in uploaded:
+            try:
+                account = self._fetch_email_bison_sender_email(api_key=api_key, base_url=base_url, email=email)
+                if not account:
+                    failed.append({"email": email, "error": "Email Bison sender email was not found after OAuth upload"})
+                    failed_emails.add(email)
+                    continue
+                if not self._email_bison_sender_ready(account):
+                    failed.append({
+                        "email": email,
+                        "error": f"Email Bison sender email is {account.get('status') or 'not connected'} after upload",
+                    })
+                    failed_emails.add(email)
+                    continue
+                account_by_email[email] = account
+            except Exception as exc:
+                failed.append({"email": email, "error": f"Email Bison sender lookup failed: {exc}"})
+                failed_emails.add(email)
+
+        if account_by_email:
+            setting_failures = self._patch_email_bison_settings(
+                api_key=api_key,
+                base_url=base_url,
+                account_by_email=account_by_email,
+                settings=settings,
+            )
+            for email, error in setting_failures.items():
+                failed.append({"email": email, "error": error})
+                failed_emails.add(email)
+
+        result["failed_uploads"] = failed
+        result["uploaded_emails"] = [email for email in uploaded if email not in failed_emails]
+        result["settings_validated"] = not failed_emails and len(account_by_email) == len(uploaded)
+        if result["settings_validated"]:
+            result["applied_settings"] = self._email_bison_applied_settings_summary(settings)
+        return result
+
+    def _email_bison_login(self, *, page: Any, base_url: str, username: str, password: str) -> None:
+        page.goto(f"{base_url}/login", wait_until="domcontentloaded", timeout=60_000)
+        if not self._exists(page, ["input[name='email']", "input[type='email']"], timeout_ms=3_000):
+            if "/dashboard" in str(getattr(page, "url", "") or "") or self._exists(page, ["text='Sender Emails'"], timeout_ms=2_000):
+                return
+        self._fill_any(page, ["input[name='email']", "input[type='email']"], username, timeout_ms=15_000)
+        self._fill_any(page, ["input[name='password']", "input[type='password']"], password, timeout_ms=15_000)
+        clicked = self._click_any(
+            page,
+            [
+                "button[type='submit']",
+                "button:has-text('Login')",
+                "button:has-text('Log in')",
+                "xpath=//button[contains(.,'Login')]",
+            ],
+            timeout_ms=10_000,
+            optional=True,
+        )
+        if not clicked:
+            raise RuntimeError("Email Bison login button was not found")
+        if not self._wait_for_url_contains(page, ["/dashboard", "/sender-emails"], timeout_seconds=60):
+            body = self._safe_body_excerpt(page, limit=500)
+            raise RuntimeError(f"Email Bison login did not reach the app. url={getattr(page, 'url', '')} body={body}")
+
+    def _ensure_email_bison_workspace(self, *, page: Any, expected_workspace: str) -> None:
+        expected = str(expected_workspace or "").strip()
+        if not expected:
+            return
+        body = self._safe_body_excerpt(page, limit=8_000)
+        if self._contains_normalized(body, expected):
+            return
+
+        workspace_xpath = self._xpath_literal(expected)
+        opened = self._click_any(
+            page,
+            [
+                f"button:has-text('{expected}')",
+                "button.group\\/select-button",
+                "xpath=//button[contains(@class,'select-button')]",
+            ],
+            timeout_ms=5_000,
+            optional=True,
+        )
+        if not opened:
+            raise RuntimeError(f"Email Bison workspace selector was not found; expected workspace: {expected}")
+
+        try:
+            self._fill_any(
+                page,
+                [
+                    "input[placeholder*='Search workspaces' i]",
+                    "input[type='search']",
+                    "input[placeholder*='Search' i]",
+                ],
+                expected,
+                timeout_ms=3_000,
+            )
+            time.sleep(0.5)
+        except Exception:
+            pass
+
+        clicked = self._click_any(
+            page,
+            [
+                f"xpath=//*[@role='option' and contains(normalize-space(), {workspace_xpath})]",
+                f"xpath=//*[@role='menuitem' and contains(normalize-space(), {workspace_xpath})]",
+                f"xpath=//button[contains(normalize-space(), {workspace_xpath})]",
+                f"xpath=//a[contains(normalize-space(), {workspace_xpath})]",
+                f"xpath=//div[contains(normalize-space(), {workspace_xpath})]",
+            ],
+            timeout_ms=5_000,
+            optional=True,
+        )
+        if clicked:
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=8_000)
+            except Exception:
+                pass
+            time.sleep(1.0)
+
+        body = self._safe_body_excerpt(page, limit=8_000)
+        if not self._contains_normalized(body, expected):
+            raise RuntimeError(f"Email Bison is not in the expected workspace: {expected}")
+
+    def _start_email_bison_google_oauth(self, *, page: Any, base_url: str, inbox: Dict[str, Any]) -> None:
+        email = self._normalize_email(inbox.get("email"))
+        display_name = self._display_name_for_inbox(inbox)
+        page.goto(f"{base_url}/sender-email-connect/google/oauth", wait_until="domcontentloaded", timeout=60_000)
+        self._fill_any(
+            page,
+            ["input[name='name']"],
+            display_name,
+            timeout_ms=15_000,
+        )
+        self._fill_any(
+            page,
+            ["input[name='email']"],
+            email,
+            timeout_ms=15_000,
+        )
+        clicked = False
+        for selector in (
+            "a[wire\\:click\\.prevent='submit']",
+            "a:has-text('Sign in with Google')",
+            "button:has-text('Sign in with Google')",
+            "xpath=//a[contains(normalize-space(),'Sign in with Google')]",
+            "xpath=//button[contains(normalize-space(),'Sign in with Google')]",
+        ):
+            try:
+                loc = page.locator(self._selector(selector)).first
+                loc.wait_for(state="visible", timeout=5_000)
+                loc.click(timeout=8_000, force=True)
+                clicked = True
+                break
+            except Exception:
+                continue
+        if not clicked:
+            raise RuntimeError("Email Bison Google sign-in button was not found")
+        end_at = time.time() + 20
+        while time.time() < end_at:
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=3_000)
+            except Exception:
+                pass
+            url = str(getattr(page, "url", "") or "").lower()
+            if "accounts.google.com" in url or self._is_sending_tool_oauth_callback_url(url):
+                return
+            if "/sender-emails" in url and "sender-email-connect/google/oauth" not in url:
+                return
+            time.sleep(0.75)
+        body = self._safe_body_excerpt(page, limit=1_000)
+        raise RuntimeError(
+            "Email Bison did not open Google OAuth after clicking Sign in with Google. "
+            f"url={str(getattr(page, 'url', '') or '')} body={body}"
+        )
+
+    def _email_bison_sender_visible(self, *, page: Any, base_url: str, email: str) -> bool:
+        clean_email = self._normalize_email(email)
+        if not clean_email:
+            return False
+        try:
+            page.goto(f"{base_url}/sender-emails", wait_until="domcontentloaded", timeout=60_000)
+        except Exception:
+            return False
+        time.sleep(1.5)
+        if clean_email in self._safe_body_excerpt(page, limit=10_000).lower():
+            return True
+
+        # Best-effort search/filter support. Email Bison has changed this surface
+        # a few times, so try generic visible search/email inputs without making
+        # validation depend on any single selector.
+        try:
+            self._click_any(
+                page,
+                ["button:has-text('Toggle Filters')", "xpath=//*[contains(normalize-space(),'Toggle Filters')]"],
+                timeout_ms=2_500,
+                optional=True,
+            )
+            filled = False
+            for selector in (
+                "input[type='search']",
+                "input[placeholder*='Search' i]",
+                "input[placeholder*='Email' i]",
+                "xpath=//label[contains(.,'Email')]/following::input[1]",
+            ):
+                try:
+                    loc = page.locator(selector).first
+                    loc.wait_for(state="visible", timeout=2_500)
+                    loc.fill(clean_email)
+                    filled = True
+                    break
+                except Exception:
+                    continue
+            if filled:
+                try:
+                    page.keyboard.press("Enter")
+                except Exception:
+                    pass
+                time.sleep(2.0)
+                return clean_email in self._safe_body_excerpt(page, limit=10_000).lower()
+        except Exception:
+            pass
+        return False
+
+    @staticmethod
+    def _email_bison_oauth_success_for_email(*, page_url: str, email: str) -> bool:
+        clean_email = SendingToolUploader._normalize_email(email)
+        if not clean_email:
+            return False
+        try:
+            from urllib.parse import parse_qs, unquote, urlparse
+
+            parsed = urlparse(str(page_url or ""))
+            if not str(parsed.path or "").rstrip("/").endswith("/sender-emails"):
+                return False
+            query = parse_qs(parsed.query or "")
+            success = str((query.get("success") or [""])[0]).strip().lower()
+            callback_email = SendingToolUploader._normalize_email(unquote(str((query.get("email") or [""])[0])))
+            account_type = str((query.get("account_type") or [""])[0]).strip().lower()
+            return success in {"1", "true", "yes"} and callback_email == clean_email and account_type == "google"
+        except Exception:
+            return False
+
+    def _email_bison_capture(self, *, page: Any, email: str, label: str) -> None:
+        debug_dir = str(os.getenv("EMAIL_BISON_DEBUG_DIR") or "/tmp/email-bison-uploader").strip()
+        if not debug_dir:
+            return
+        safe_email = re.sub(r"[^a-z0-9_.@-]+", "_", self._normalize_email(email), flags=re.I).strip("_") or "unknown"
+        safe_label = re.sub(r"[^a-z0-9_.-]+", "_", str(label or "checkpoint"), flags=re.I).strip("_")
+        timestamp = time.strftime("%Y%m%d%H%M%S")
+        folder = os.path.join(debug_dir, safe_email)
+        try:
+            os.makedirs(folder, exist_ok=True)
+            page.screenshot(path=os.path.join(folder, f"{timestamp}-{safe_label}.png"), full_page=True)
+            with open(os.path.join(folder, f"{timestamp}-{safe_label}.txt"), "w", encoding="utf-8") as handle:
+                handle.write(f"url={str(getattr(page, 'url', '') or '')}\n\n")
+                handle.write(self._safe_body_excerpt(page, limit=30_000))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _normalize_email_bison_base_url(raw_url: Any) -> str:
+        text = str(raw_url or "").strip()
+        if not text:
+            return ""
+        if not re.match(r"^[a-z][a-z0-9+.-]*://", text, re.I):
+            text = f"https://{text}"
+        return text.rstrip("/")
+
+    @staticmethod
+    def _display_name_for_inbox(inbox: Dict[str, Any]) -> str:
+        first = str(inbox.get("first_name") or "").strip()
+        last = str(inbox.get("last_name") or "").strip()
+        display = f"{first} {last}".strip()
+        email = str(inbox.get("email") or "").strip()
+        return display or email.split("@", 1)[0].replace(".", " ").title() or email
+
+    @staticmethod
+    def _failed_result(tool: str, targets: Set[str], message: str) -> Dict[str, Any]:
+        return {
+            "tool": tool,
+            "total_candidates": len(targets),
+            "uploaded_emails": [],
+            "failed_uploads": [
+                {"email": email, "error": message}
+                for email in sorted(targets)
+            ],
+            "skipped_already_uploaded": 0,
+        }
+
+    def _fetch_email_bison_sender_email(self, *, api_key: str, base_url: str, email: str) -> Optional[Dict[str, Any]]:
+        normalized = self._normalize_email(email)
+        if not normalized:
+            return None
+        headers = self._email_bison_headers(api_key)
+        try:
+            response = requests.get(
+                f"{base_url}/api/sender-emails/{requests.utils.quote(normalized, safe='')}",
+                headers=headers,
+                timeout=self.timeout_seconds,
+            )
+            if response.status_code and response.status_code != 404:
+                response.raise_for_status()
+            if response.status_code != 404:
+                for row in self._email_bison_sender_rows(self._json_or_empty(response)):
+                    account = self._normalize_email_bison_sender(row, fallback_email=normalized)
+                    if account and self._normalize_email(account.get("email")) == normalized:
+                        return account
+        except requests.HTTPError:
+            raise
+        except Exception:
+            pass
+
+        response = requests.get(
+            f"{base_url}/api/sender-emails",
+            headers=headers,
+            params={"search": normalized},
+            timeout=self.timeout_seconds,
+        )
+        response.raise_for_status()
+        for row in self._email_bison_sender_rows(self._json_or_empty(response)):
+            account = self._normalize_email_bison_sender(row)
+            if account and self._normalize_email(account.get("email")) == normalized:
+                return account
+        return None
+
+    def _patch_email_bison_settings(
+        self,
+        *,
+        api_key: str,
+        base_url: str,
+        account_by_email: Dict[str, Dict[str, Any]],
+        settings: Dict[str, Any],
+    ) -> Dict[str, str]:
+        failures: Dict[str, str] = {}
+        entries = list(account_by_email.items())
+        ids: List[int] = []
+        for email, account in entries:
+            try:
+                account_id = int(account.get("id") or 0)
+            except Exception:
+                account_id = 0
+            if account_id <= 0:
+                failures[email] = "Email Bison sender email ID was missing from the API response"
+            else:
+                ids.append(account_id)
+        if not ids:
+            return failures
+
+        headers = self._email_bison_headers(api_key)
+
+        def fail_all(message: str) -> None:
+            for email, _account in entries:
+                failures.setdefault(email, message)
+
+        try:
+            if settings.get("dailyLimit") is not None:
+                response = requests.patch(
+                    f"{base_url}/api/sender-emails/daily-limits/bulk",
+                    headers=headers,
+                    json={
+                        "sender_email_ids": ids,
+                        "daily_limit": max(0, int(round(float(settings.get("dailyLimit"))))),
+                    },
+                    timeout=self.timeout_seconds,
+                )
+                response.raise_for_status()
+
+            if settings.get("signature") is not None:
+                response = requests.patch(
+                    f"{base_url}/api/sender-emails/signatures/bulk",
+                    headers=headers,
+                    json={
+                        "sender_email_ids": ids,
+                        "email_signature": str(settings.get("signature") or ""),
+                    },
+                    timeout=self.timeout_seconds,
+                )
+                response.raise_for_status()
+
+            if settings.get("enableWarmup") is not None:
+                action = "enable" if bool(settings.get("enableWarmup")) else "disable"
+                response = requests.patch(
+                    f"{base_url}/api/warmup/sender-emails/{action}",
+                    headers=headers,
+                    json={"sender_email_ids": ids},
+                    timeout=self.timeout_seconds,
+                )
+                response.raise_for_status()
+
+            if settings.get("bisonWarmupDailyLimit") is not None:
+                response = requests.patch(
+                    f"{base_url}/api/warmup/sender-emails/update-daily-warmup-limits",
+                    headers=headers,
+                    json={
+                        "sender_email_ids": ids,
+                        "daily_limit": max(0, int(round(float(settings.get("bisonWarmupDailyLimit"))))),
+                    },
+                    timeout=self.timeout_seconds,
+                )
+                response.raise_for_status()
+
+            tags = self._unique_tags(settings)
+            if tags:
+                tag_ids = self._resolve_email_bison_tag_ids(api_key=api_key, base_url=base_url, tag_names=tags)
+                if tag_ids:
+                    response = requests.post(
+                        f"{base_url}/api/tags/attach-to-sender-emails",
+                        headers=headers,
+                        json={"tag_ids": tag_ids, "sender_email_ids": ids, "skip_webhooks": True},
+                        timeout=self.timeout_seconds,
+                    )
+                    response.raise_for_status()
+        except Exception as exc:
+            fail_all(f"Email Bison settings update failed: {exc}")
+        return failures
+
+    def _resolve_email_bison_tag_ids(self, *, api_key: str, base_url: str, tag_names: List[str]) -> List[int]:
+        ids: List[int] = []
+        headers = self._email_bison_headers(api_key)
+        for tag_name in tag_names:
+            clean_name = str(tag_name or "").strip()
+            if not clean_name:
+                continue
+            found_id = 0
+            try:
+                response = requests.get(
+                    f"{base_url}/api/tags",
+                    headers=headers,
+                    params={"search": clean_name},
+                    timeout=self.timeout_seconds,
+                )
+                response.raise_for_status()
+                for row in self._email_bison_sender_rows(self._json_or_empty(response)):
+                    name = str(row.get("name") or row.get("label") or "").strip()
+                    if name.lower() == clean_name.lower():
+                        tag_id = int(row.get("id") or 0)
+                        if tag_id > 0:
+                            found_id = tag_id
+                            break
+                if found_id > 0:
+                    ids.append(found_id)
+                    continue
+            except Exception:
+                pass
+            response = requests.post(
+                f"{base_url}/api/tags",
+                headers=headers,
+                json={"name": clean_name},
+                timeout=self.timeout_seconds,
+            )
+            response.raise_for_status()
+            payload = self._json_or_empty(response)
+            rows = self._email_bison_sender_rows(payload)
+            tag_id = 0
+            if rows:
+                tag_id = int(rows[0].get("id") or 0)
+            elif isinstance(payload, dict):
+                tag_id = int(payload.get("id") or payload.get("tag_id") or 0)
+            if tag_id <= 0:
+                raise RuntimeError(f"Email Bison tag creation did not return an id for {clean_name}")
+            ids.append(tag_id)
+        return ids
+
+    @staticmethod
+    def _email_bison_headers(api_key: str) -> Dict[str, str]:
+        return {
+            "Authorization": f"Bearer {str(api_key or '').strip()}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+
+    @staticmethod
+    def _email_bison_sender_rows(data: Any) -> List[Dict[str, Any]]:
+        if isinstance(data, list):
+            return [row for row in data if isinstance(row, dict)]
+        if isinstance(data, dict):
+            for key in ("data", "sender_emails", "senderEmails", "tags"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    return [row for row in value if isinstance(row, dict)]
+                if isinstance(value, dict):
+                    return [value]
+            return [data]
+        return []
+
+    def _normalize_email_bison_sender(self, row: Any, *, fallback_email: str = "") -> Optional[Dict[str, Any]]:
+        if not isinstance(row, dict):
+            return None
+        email = self._normalize_email(
+            row.get("email") or row.get("sender_email") or row.get("senderEmail") or row.get("username") or fallback_email
+        )
+        if not email:
+            return None
+        return {
+            "id": str(row.get("id") or row.get("sender_email_id") or row.get("senderEmailId") or "").strip(),
+            "email": email,
+            "status": str(row.get("status") or "").strip(),
+            "raw": row,
+        }
+
+    @staticmethod
+    def _email_bison_sender_ready(account: Dict[str, Any]) -> bool:
+        status = str(account.get("status") or "").strip().lower()
+        return not status or status in {"connected", "active", "ready", "enabled"}
+
+    @staticmethod
+    def _has_email_bison_settings_to_apply(settings: Dict[str, Any]) -> bool:
+        if not settings.get("applyRequested"):
+            return False
+        return any(
+            [
+                settings.get("dailyLimit") is not None,
+                settings.get("enableWarmup") is not None,
+                settings.get("bisonWarmupDailyLimit") is not None,
+                settings.get("signature") is not None,
+                bool(settings.get("tag")),
+                bool(settings.get("tags")),
+            ]
+        )
+
+    @staticmethod
+    def _email_bison_applied_settings_summary(settings: Dict[str, Any]) -> List[str]:
+        labels: List[str] = []
+        if settings.get("dailyLimit") is not None:
+            labels.append("dailyLimit")
+        if settings.get("enableWarmup") is not None:
+            labels.append("warmup")
+        if settings.get("bisonWarmupDailyLimit") is not None:
+            labels.append("bisonWarmupDailyLimit")
+        if settings.get("signature") is not None:
+            labels.append("signature")
+        if settings.get("tag") or settings.get("tags"):
+            labels.append("tags")
+        return labels
 
     def _upload_amplemarket(
         self,
@@ -1209,7 +1996,12 @@ class SendingToolUploader:
 
     def _normalize_settings(self, settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         source = settings if isinstance(settings, dict) else {}
-        apply_requested = isinstance(settings, dict) and len(settings) > 0
+        if isinstance(settings, dict) and "postUploadEnabled" in settings:
+            apply_requested = settings.get("postUploadEnabled") is True
+        elif isinstance(settings, dict) and "applyRequested" in settings:
+            apply_requested = settings.get("applyRequested") is True
+        else:
+            apply_requested = isinstance(settings, dict) and len(settings) > 0
 
         def as_number(value: Any, default: Optional[int] = None) -> Optional[int]:
             if value in (None, ""):
@@ -1251,6 +2043,23 @@ class SendingToolUploader:
                 parsed.append(tag)
             return parsed
 
+        def normalize_instantly_reply_rate(value: Any) -> Any:
+            if value in (None, ""):
+                return value
+            try:
+                numeric = float(value)
+            except Exception:
+                return value
+            return numeric * 100 if 0 < numeric <= 1 else numeric
+
+        def instantly_warmup(value: Any) -> Dict[str, Any]:
+            payload = as_dict(value)
+            if "reply_rate" not in payload and "warmup_reply_rate" in payload:
+                payload["reply_rate"] = payload.pop("warmup_reply_rate")
+            if "reply_rate" in payload:
+                payload["reply_rate"] = normalize_instantly_reply_rate(payload.get("reply_rate"))
+            return payload
+
         tags = as_tags(source.get("tags"), source.get("tag"))
 
         return {
@@ -1264,9 +2073,14 @@ class SendingToolUploader:
             "signature": as_signature(source.get("signature")),
             "tag": tags[0] if tags else str(source.get("tag") or "").strip(),
             "tags": tags,
-            "instantlyWarmup": as_dict(source.get("instantlyWarmup")),
+            "instantlyWarmup": instantly_warmup(source.get("instantlyWarmup")),
             "smartleadWarmup": as_dict(source.get("smartleadWarmup")),
             "smartleadAccount": as_dict(source.get("smartleadAccount")),
+            "bisonWarmupDailyLimit": as_number(
+                source.get("bisonWarmupDailyLimit")
+                or as_dict(source.get("bisonWarmup")).get("dailyLimit")
+                or as_dict(source.get("bisonWarmup")).get("daily_limit")
+            ),
         }
 
     @staticmethod
@@ -1394,6 +2208,14 @@ class SendingToolUploader:
             warmup_payload["limit"] = warmup_payload.pop("warmup_daily_limit")
         if "increment" not in warmup_payload and "warmup_rampup_increment" in warmup_payload:
             warmup_payload["increment"] = warmup_payload.pop("warmup_rampup_increment")
+        if "reply_rate" not in warmup_payload and "warmup_reply_rate" in warmup_payload:
+            warmup_payload["reply_rate"] = warmup_payload.pop("warmup_reply_rate")
+        if "reply_rate" in warmup_payload:
+            try:
+                reply_rate = float(warmup_payload["reply_rate"])
+                warmup_payload["reply_rate"] = reply_rate * 100 if 0 < reply_rate <= 1 else reply_rate
+            except Exception:
+                pass
         if settings.get("enableWarmup") is not None:
             warmup_payload["enabled"] = bool(settings.get("enableWarmup"))
         if "advanced" in warmup_payload and not isinstance(warmup_payload.get("advanced"), dict):
@@ -1537,26 +2359,44 @@ class SendingToolUploader:
         raise RuntimeError(last_error or "Instantly tag assignment failed")
 
     def _instantly_has_tag_mapping(self, *, api_key: str, email: str, tag_id: str) -> bool:
-        response = requests.get(
-            "https://api.instantly.ai/api/v2/custom-tag-mappings",
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            params={"limit": 100},
-            timeout=self.timeout_seconds,
-        )
-        if not response.ok:
-            return False
-        data = self._json_or_empty(response)
-        rows = []
-        if isinstance(data, dict) and isinstance(data.get("items"), list):
-            rows = data.get("items") or []
-        elif isinstance(data, list):
-            rows = data
         normalized = self._normalize_email(email)
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            if self._normalize_email(row.get("resource_id")) == normalized and str(row.get("tag_id") or "") == str(tag_id):
-                return True
+        variants = [
+            {"limit": 100, "tag_ids": str(tag_id), "resource_ids": normalized},
+            {"limit": 100, "tag_id": str(tag_id), "resource_id": normalized},
+        ]
+        for attempt in range(3):
+            for base_params in variants:
+                params = dict(base_params)
+                for _ in range(20):
+                    response = requests.get(
+                        "https://api.instantly.ai/api/v2/custom-tag-mappings",
+                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                        params=params,
+                        timeout=self.timeout_seconds,
+                    )
+                    if not response.ok:
+                        break
+                    data = self._json_or_empty(response)
+                    rows = []
+                    if isinstance(data, dict) and isinstance(data.get("items"), list):
+                        rows = data.get("items") or []
+                    elif isinstance(data, dict) and isinstance(data.get("data"), list):
+                        rows = data.get("data") or []
+                    elif isinstance(data, list):
+                        rows = data
+                    for row in rows:
+                        if not isinstance(row, dict):
+                            continue
+                        mapped_email = self._normalize_email(row.get("resource_id") or row.get("email") or row.get("account_email"))
+                        mapped_tag_id = str(row.get("tag_id") or row.get("custom_tag_id") or "")
+                        if mapped_email == normalized and (not mapped_tag_id or mapped_tag_id == str(tag_id)):
+                            return True
+                    next_after = str(data.get("next_starting_after") or "").strip() if isinstance(data, dict) else ""
+                    if not next_after:
+                        break
+                    params["starting_after"] = next_after
+            if attempt < 2:
+                time.sleep(3)
         return False
 
     def _apply_smartlead_settings(
@@ -2301,6 +3141,7 @@ class SendingToolUploader:
         email: str,
         password: str,
         onepassword: Any,
+        otp_secret: str = "",
     ) -> None:
         clean_email = self._normalize_email(email)
         max_password_submissions = max(
@@ -2308,8 +3149,19 @@ class SendingToolUploader:
             int(os.getenv("GOOGLE_OAUTH_MAX_PASSWORD_SUBMISSIONS", "2")),
         )
         password_submissions = 0
-        for _ in range(14):
+        self._wait_for_google_oauth_state(page)
+        for _ in range(24):
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=2_000)
+            except Exception:
+                pass
+
+            if self._is_google_consent_page(page, expected_email=clean_email):
+                break
             if not self._is_google_signin_prompt(page):
+                self._wait_for_google_oauth_state(page, timeout_seconds=2)
+                if self._is_google_signin_prompt(page) or self._is_google_consent_page(page, expected_email=clean_email):
+                    continue
                 break
 
             # TOTP field FIRST — Google reuses account-identifier containers on
@@ -2320,11 +3172,12 @@ class SendingToolUploader:
                 "input[inputmode='numeric']",
                 "input[autocomplete='one-time-code']",
                 "input[aria-label*='code']",
+                "input[aria-label*='Code']",
             ]
             if self._exists(page, totp_selectors, timeout_ms=2_500):
-                code = self._get_totp_code(onepassword, clean_email)
+                code = self._get_totp_code(onepassword, clean_email) or self._totp_from_secret(otp_secret)
                 if not code:
-                    raise RuntimeError(f"Google requested TOTP for {clean_email} but no 1Password code was available")
+                    raise RuntimeError(f"Google requested TOTP for {clean_email} but no 2FA code was available")
                 self._fill_any(page, totp_selectors, code, timeout_ms=15_000)
                 self._click_any(
                     page,
@@ -2341,7 +3194,11 @@ class SendingToolUploader:
             if self._exists(page, ["input[name='Passwd']", "input[type='password']"], timeout_ms=2_500):
                 self._fill_any(
                     page,
-                    ["input[name='Passwd']", "input[type='password']"],
+                    [
+                        "input[name='Passwd']",
+                        "input[type='password']",
+                        "input[aria-label*='password' i]",
+                    ],
                     password,
                     timeout_ms=20_000,
                 )
@@ -2436,7 +3293,7 @@ class SendingToolUploader:
             pass
         time.sleep(1.5)
 
-        self._complete_google_consent(page)
+        self._complete_google_consent(page, expected_email=clean_email)
 
         # Give the redirect back to the sending tool time to complete.
         try:
@@ -2449,6 +3306,34 @@ class SendingToolUploader:
                 f"Google OAuth sign-in did not complete for {clean_email}. Current URL: {str(getattr(page, 'url', '') or '')}"
             )
         self._close_non_primary_pages(context, page)
+
+    def _wait_for_google_oauth_state(self, page: Any, *, timeout_seconds: float = 25) -> None:
+        end_at = time.time() + max(1.0, timeout_seconds)
+        while time.time() < end_at:
+            url = str(getattr(page, "url", "") or "").lower()
+            if self._is_sending_tool_oauth_callback_url(url):
+                return
+            if "accounts.google.com" in url and (
+                self._exists(
+                    page,
+                    [
+                        "input[name='totpPin']",
+                        "input[type='tel']",
+                        "input[autocomplete='one-time-code']",
+                        "input[name='Passwd']",
+                        "input[type='password']",
+                        "input#identifierId",
+                        "input[type='email']",
+                        "button:has-text('Continue')",
+                        "button:has-text('Allow')",
+                        "//*[contains(normalize-space(),'Choose an account')]",
+                    ],
+                    timeout_ms=800,
+                )
+                or self._is_google_consent_page(page)
+            ):
+                return
+            time.sleep(0.4)
 
     def _read_google_password_challenge_error(self, page: Any) -> str:
         checks = [
@@ -2472,12 +3357,14 @@ class SendingToolUploader:
                 return label
         return ""
 
-    def _complete_google_consent(self, page: Any) -> None:
-        for attempt in range(6):
+    def _complete_google_consent(self, page: Any, *, expected_email: str = "") -> None:
+        for attempt in range(8):
             clicked = False
 
+            self._assert_google_oauth_account(page, expected_email=expected_email)
+
             # Use Playwright role/text selectors first (most reliable), then XPath fallbacks.
-            for label in ("Continue", "Allow", "I understand"):
+            for label in ("Select all", "Continue", "Allow", "I understand"):
                 try:
                     btn = page.get_by_role("button", name=label, exact=True)
                     if btn.count() > 0:
@@ -2501,6 +3388,70 @@ class SendingToolUploader:
                 break
             time.sleep(0.8)
 
+    def _is_google_consent_page(self, page: Any, *, expected_email: str = "") -> bool:
+        url = str(getattr(page, "url", "") or "").lower()
+        if "accounts.google.com" not in url:
+            return False
+        path = self._url_path(url)
+        if "/consent" in path or "/signin/oauth" in path:
+            if self._exists(page, ["input#identifierId", "input[name='Passwd']"], timeout_ms=500):
+                return False
+            if self._exists(
+                page,
+                [
+                    "button:has-text('Continue')",
+                    "button:has-text('Allow')",
+                    "//*[contains(normalize-space(),'Select all')]",
+                    "//*[contains(normalize-space(),'Google will allow')]",
+                    "//*[contains(normalize-space(),'wants access')]",
+                    "//*[contains(normalize-space(),'Sign in to')]",
+                ],
+                timeout_ms=1_000,
+            ):
+                if expected_email:
+                    self._assert_google_oauth_account(page, expected_email=expected_email)
+                return True
+        return False
+
+    def _assert_google_oauth_account(self, page: Any, *, expected_email: str = "") -> None:
+        clean_email = self._normalize_email(expected_email)
+        if not clean_email:
+            return
+        body = self._safe_body_excerpt(page, limit=20_000).lower()
+        if not body:
+            return
+        if clean_email in body:
+            return
+        if "accounts.google.com" not in str(getattr(page, "url", "") or "").lower():
+            return
+        consent_markers = (
+            "google will allow",
+            "wants access",
+            "sign in to",
+            "choose an account",
+            "continue to",
+        )
+        if not any(marker in body for marker in consent_markers):
+            return
+        visible_emails = sorted(set(re.findall(r"[\w.+%-]+@[\w.-]+\.[a-z]{2,}", body, flags=re.I)))
+        if visible_emails:
+            raise RuntimeError(
+                f"Google OAuth is showing a different account. Expected {clean_email}; visible accounts: {', '.join(visible_emails[:5])}"
+            )
+
+    @staticmethod
+    def _totp_from_secret(secret: str) -> str:
+        clean_secret = str(secret or "").strip().replace(" ", "")
+        if not clean_secret:
+            return ""
+        try:
+            import pyotp
+
+            return str(pyotp.TOTP(clean_secret).now() or "").strip()
+        except Exception as exc:
+            logger.warning("[SendingToolUploader] Failed to generate TOTP from stored secret: %s", exc)
+            return ""
+
     def _get_totp_code(self, onepassword: Any, email: str) -> str:
         if onepassword is None:
             return ""
@@ -2520,12 +3471,14 @@ class SendingToolUploader:
         url = str(getattr(page, "url", "") or "").lower()
         if self._is_sending_tool_oauth_callback_url(url):
             return False
+        if self._is_google_consent_page(page):
+            return False
         if "accounts.google.com" in url:
             # The consent page is handled by _complete_google_consent, not the signin loop.
             # Check only the path (before '?') — the query string often contains a
             # "continue=…/consent…" parameter that would cause a false match.
             path = self._url_path(url)
-            if "/consent" in path:
+            if "/consent" in path or "/signin/oauth" in path:
                 return False
             return True
         return self._exists(
@@ -2544,13 +3497,16 @@ class SendingToolUploader:
     @staticmethod
     def _is_sending_tool_oauth_callback_url(url: str) -> bool:
         lowered = str(url or "").lower()
+        actual_page = SendingToolUploader._url_path(lowered)
         callback_markers = [
             "iapi.instantly.ai/oauth/google/redirect",
             "app.instantly.ai/oauth",
             "api.instantly.ai/oauth",
             "smartlead.ai/oauth",
+            "sender-email-connect/google-callback",
+            "sender-emails",
         ]
-        return any(marker in lowered for marker in callback_markers)
+        return any(marker in actual_page for marker in callback_markers)
 
     @staticmethod
     def _url_path(url: str) -> str:
@@ -2773,6 +3729,31 @@ class SendingToolUploader:
             loc.fill(value, timeout=timeout_ms)
         except Exception:
             raise RuntimeError(f"Could not fill any selector: {list(selectors)}")
+
+    @staticmethod
+    def _safe_body_excerpt(page: Any, *, limit: int = 1000) -> str:
+        try:
+            text = page.locator("body").inner_text(timeout=2_000)
+            return str(text or "")[: max(0, limit)]
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _contains_normalized(haystack: str, needle: str) -> bool:
+        def norm(value: str) -> str:
+            return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+        return norm(needle) in norm(haystack)
+
+    @staticmethod
+    def _xpath_literal(value: str) -> str:
+        text = str(value or "")
+        if "'" not in text:
+            return f"'{text}'"
+        if '"' not in text:
+            return f'"{text}"'
+        parts = text.split("'")
+        return "concat(" + ", \"'\", ".join(f"'{part}'" for part in parts) + ")"
 
     def _build_result(
         self,
@@ -3149,6 +4130,8 @@ class SendingToolUploader:
             return "smartlead.ai"
         if "amplemarket" in text or "ample market" in text:
             return "amplemarket"
+        if "bison" in text:
+            return "email-bison"
         return text
 
     @staticmethod

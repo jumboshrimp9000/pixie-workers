@@ -137,9 +137,17 @@ For each Google action:
 13. Upload inboxes to sending tool when configured:
    - fetch `domain_credentials` + `sending_tool_credentials`
    - for Google domains, use Playwright OAuth upload for Instantly/Smartlead (headless by default)
+   - for Recovery Pool, `postmaster@domain` always uploads to the agency Instantly account with warmup enabled, 10/day, slow ramp enabled, +1/day, and 60% reply rate
    - Google OAuth state handling is strict field-order (`totp -> password -> email -> chooser`) to avoid chooser-loop regressions
    - consent detection uses URL path checks only; query-string `continue` parameters are ignored for state classification
    - each inbox OAuth upload runs in an isolated Playwright browser context to avoid session bleed on shared IPs
+   - Email Bison Google upload is browser-based and workspace-locked:
+     - enforce the expected Email Bison workspace before each upload/check
+     - clear Google session state before every inbox so a prior Google account is not reused
+     - use stored inbox `otp_secret` when 1Password is unavailable
+     - validate a new upload from Bison's `/sender-emails?success=1&account_type=Google&email=...` callback for the exact email
+     - guard each Bison login with a local file lock so a single production server/IP runs only one active Bison OAuth upload for that login at a time
+     - do not raise Email Bison OAuth concurrency above one per login until a provider API validation path is available; table/search lag and one-login shared-IP behavior make higher concurrency unsafe
    - Smartlead can run either:
      - `per_inbox_login` (login each isolated context)
      - `single_login_popup_isolation` (login once, isolate per-inbox OAuth contexts with Smartlead-only storage state)

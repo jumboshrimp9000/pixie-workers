@@ -272,6 +272,7 @@ class SupabaseRestClient:
                 attempts = int(row.get("attempts") or 0)
                 max_attempts = int(row.get("max_attempts") or 3)
                 if attempts >= max_attempts:
+                    self._mark_action_exhausted(row, attempts=attempts, max_attempts=max_attempts)
                     continue
                 if str(row.get("status") or "") == "pending":
                     next_retry_at = _parse_ts(row.get("next_retry_at"))
@@ -281,6 +282,37 @@ class SupabaseRestClient:
 
         eligible.sort(key=lambda row: str(row.get("created_at") or ""))
         return eligible[:limit]
+
+    def _mark_action_exhausted(self, action: Dict[str, Any], *, attempts: int, max_attempts: int) -> None:
+        action_id = str(action.get("id") or "").strip()
+        if not action_id:
+            return
+        current_status = str(action.get("status") or "").strip().lower()
+        if current_status == "failed":
+            return
+        existing_error = str(action.get("error") or "").strip()
+        error_message = existing_error or (
+            f"Worker stopped because this job already used all {attempts}/{max_attempts} attempts."
+        )
+        try:
+            self._request(
+                "PATCH",
+                "actions",
+                params={
+                    "id": f"eq.{action_id}",
+                    "status": f"eq.{current_status}",
+                    "attempts": f"eq.{attempts}",
+                },
+                payload={
+                    "status": "failed",
+                    "error": error_message[:4000],
+                    "next_retry_at": None,
+                    "started_at": action.get("started_at"),
+                },
+            )
+            logger.warning("Marked exhausted action %s failed after %s/%s attempts", action_id, attempts, max_attempts)
+        except Exception as exc:
+            logger.warning("Could not mark exhausted action %s failed: %s", action_id, exc)
 
     def claim_action(self, action: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         action_id = action["id"]

@@ -5,8 +5,11 @@ import re
 import string
 import time
 import json
+import hashlib
+import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import dns.resolver
 
@@ -178,9 +181,13 @@ class GoogleSupabaseWorker:
             name = str(item.get("step") or "").strip()
             if not name:
                 continue
-            last_step_status[name] = str(item.get("status") or "").strip().lower()
+            status = str(item.get("status") or "").strip().lower()
+            previous_status = last_step_status.get(name)
+            if previous_status == "completed" and status == "skipped":
+                continue
+            last_step_status[name] = status
             details = item.get("details")
-            if isinstance(details, dict):
+            if isinstance(details, dict) and status != "skipped":
                 last_step_details[name] = details
 
         def start_step(step_name: str) -> Dict[str, Any]:
@@ -638,7 +645,10 @@ class GoogleSupabaseWorker:
                 log_event("step_completed", "info", f"[create_google_order] PartnerHub order ready for {domain_name}", step)
 
             dns_fetch_checkpoint = checkpoint("fetch_google_dns_records")
-            if dns_fetch_checkpoint and self.dry_run:
+            dns_write_checkpoint = checkpoint("add_dns_records")
+            if dns_write_checkpoint:
+                dns_records = []
+            elif dns_fetch_checkpoint and self.dry_run:
                 dns_records = self._default_google_dns_records(domain_name)
             else:
                 if not dns_fetch_checkpoint:
@@ -676,7 +686,6 @@ class GoogleSupabaseWorker:
                             },
                         )
 
-            dns_write_checkpoint = checkpoint("add_dns_records")
             if dns_write_checkpoint:
                 dns_summary = dns_write_checkpoint
                 persist_progress(INTERIM_STATUSES["DNS_RECORDS"], "in_progress")
@@ -835,6 +844,17 @@ class GoogleSupabaseWorker:
             dkim_checkpoint = checkpoint("enable_dkim")
             profile_photo_checkpoint = checkpoint("upload_profile_photos")
             app_plan = self._resolve_google_admin_app_ids(payload)
+            if app_config_checkpoint and not self._admin_apps_checkpoint_satisfies_plan(app_config_checkpoint, app_plan):
+                log_event(
+                    "step_warning",
+                    "warn",
+                    "[configure_admin_apps] Previous checkpoint is missing one or more requested Google app IDs; re-running app allowlist.",
+                    {
+                        "requested": app_plan.get("all") or [],
+                        "checkpoint": app_config_checkpoint,
+                    },
+                )
+                app_config_checkpoint = None
             need_admin_browser = (
                 (not verify_domain_checkpoint)
                 or (not app_config_checkpoint)
@@ -1557,13 +1577,26 @@ class GoogleSupabaseWorker:
             safe_upload_details = delivery_upload_details if isinstance(delivery_upload_details, dict) else {}
             uploaded_emails = safe_upload_details.get("uploaded_emails") or []
             uploaded_count = len(uploaded_emails) if isinstance(uploaded_emails, list) else 0
+            uploaded_email_set = {
+                str(email or "").split(":", 1)[-1].strip().lower()
+                for email in uploaded_emails
+                if str(email or "").strip()
+            }
+            for inbox in inboxes:
+                inbox_email = str(inbox.get("email") or f"{inbox.get('username', '')}@{domain_name}").strip().lower()
+                if inbox_email and inbox_email in uploaded_email_set:
+                    self.client.update_inbox(inbox["id"], {"status": "active"})
+
+            settings_required = bool(safe_upload_details.get("settings_required"))
+            settings_validated = bool(safe_upload_details.get("settings_validated")) if settings_required else True
             delivery_validation = {
                 "passed": True,
                 "domain": domain_name,
                 "expected_inboxes": len(inboxes),
                 "uploaded_count": uploaded_count,
                 "total_candidates": int(safe_upload_details.get("total_candidates") or 0),
-                "settings_validated": True,
+                "settings_required": settings_required,
+                "settings_validated": settings_validated,
                 "provider_check": "sending_tool_not_requested" if upload_not_requested else "domain_verified_before_upload",
                 "validated_at": self._iso_now(),
             }
@@ -1598,6 +1631,7 @@ class GoogleSupabaseWorker:
             hard_stop_google_signin = isinstance(exc, GoogleSignInChallengeBlocked) or self._is_google_signin_challenge_blocked(
                 error_message
             )
+            non_retryable_missing_upload = self._is_sending_tool_upload_not_implemented(error_message)
             deferred_retry_seconds = None if hard_stop_google_signin else self._deferred_retry_seconds(error_message)
 
             # Reset non-active inboxes so retry has clean ownership.
@@ -1689,7 +1723,11 @@ class GoogleSupabaseWorker:
             except Exception:
                 pass
 
-            self.client.fail_action(action, error_message, max_retries=self.max_retries)
+            self.client.fail_action(
+                action,
+                error_message,
+                max_retries=1 if non_retryable_missing_upload else self.max_retries,
+            )
             log_event(
                 "action_failed",
                 "error",
@@ -2041,6 +2079,31 @@ class GoogleSupabaseWorker:
             "all": merged,
         }
 
+    def _admin_apps_checkpoint_satisfies_plan(
+        self,
+        checkpoint: Dict[str, Any],
+        app_plan: Dict[str, List[str]],
+    ) -> bool:
+        planned = {
+            str(value or "").strip()
+            for value in (app_plan.get("all") or [])
+            if str(value or "").strip()
+        }
+        if not planned:
+            return True
+        if not isinstance(checkpoint, dict):
+            return False
+
+        requested = set(self._flatten_google_app_id_input(checkpoint.get("requested")))
+        if not requested:
+            requested = set(self._flatten_google_app_id_input(checkpoint.get("required_app_ids")))
+            requested.update(self._flatten_google_app_id_input(checkpoint.get("optional_app_ids")))
+
+        configured = set(self._flatten_google_app_id_input(checkpoint.get("added")))
+        configured.update(self._flatten_google_app_id_input(checkpoint.get("already_configured")))
+
+        return planned.issubset(requested) and planned.issubset(configured)
+
     def _flatten_google_app_id_input(self, value: Any) -> List[str]:
         if value is None:
             return []
@@ -2307,10 +2370,11 @@ class GoogleSupabaseWorker:
                 global_api_key=global_key,
                 global_email=global_email,
             )
+            auth_mode = "global" if global_key and global_email else "token"
             logger.info(
-                "Cloudflare auth configured (mode=%s, global_fallback=%s, account_id_set=%s)",
-                "token" if api_token else "global",
-                bool(api_token and global_key and global_email),
+                "Cloudflare auth configured (mode=%s, token_fallback=%s, account_id_set=%s)",
+                auth_mode,
+                bool(api_token and auth_mode == "global"),
                 bool(account_id),
             )
         return self._cloudflare
@@ -2371,6 +2435,8 @@ class GoogleSupabaseWorker:
                 "Google sign-in challenge blocked automation. Manually clear the Google Admin sign-in "
                 "challenge in a trusted browser or replace the admin account, then retry provisioning."
             )
+        if GoogleSupabaseWorker._is_sending_tool_upload_not_implemented(text):
+            return "The Google setup reached upload, but this sending-tool uploader is not implemented yet."
         return "Check action_logs metadata for the exact failing step and API response."
 
     @staticmethod
@@ -2398,6 +2464,11 @@ class GoogleSupabaseWorker:
                 for key in ("slug", "id", "name", "provider", "type")
             )
         return bool(sending_tool)
+
+    @staticmethod
+    def _is_sending_tool_upload_not_implemented(error_message: str) -> bool:
+        text = str(error_message or "").lower()
+        return "automated upload not implemented" in text
 
     def _upload_domain_inboxes_to_sending_tool(
         self,
@@ -2439,6 +2510,10 @@ class GoogleSupabaseWorker:
                     "first_name": str(inbox.get("first_name") or "").strip(),
                     "last_name": str(inbox.get("last_name") or "").strip(),
                     "password": password,
+                    "otp_secret": str(mapped.get("otp_secret") or inbox.get("otp_secret") or "").strip(),
+                    "onepassword_item_id": str(
+                        mapped.get("onepassword_item_id") or inbox.get("onepassword_item_id") or ""
+                    ).strip(),
                     "provider": provider,
                 }
             )
@@ -2487,52 +2562,63 @@ class GoogleSupabaseWorker:
         tool_results: List[Dict[str, Any]] = []
         processed_tools: List[str] = []
         skipped_already_uploaded = 0
+        normalized_tool_settings = self._normalize_sending_tool_settings(tool_settings)
+        settings_required = self._sending_tool_settings_required(normalized_tool_settings)
+        settings_validated_all = True
 
         for tool_bundle in tool_bundles:
             tool_slug = self._normalize_sending_tool_slug(str(tool_bundle.get("slug") or ""))
             credential = tool_bundle.get("credential") or {}
             if not tool_slug:
                 raise RuntimeError(f"Sending tool slug missing on credential for domain {domain_name}")
-            if tool_slug not in {"instantly.ai", "smartlead.ai", "amplemarket"}:
+            if tool_slug not in {"instantly.ai", "smartlead.ai", "amplemarket", "email-bison"}:
                 raise RuntimeError(f"Automated upload not implemented for {tool_slug} on domain {domain_name}")
 
             api_key = str(credential.get("api_key") or "").strip()
-            if not api_key:
+            if not api_key and tool_slug != "email-bison":
                 raise RuntimeError(
                     f"Missing API key for {tool_slug} credential on domain {domain_name}. "
                     "Provide toolCredentials.api when placing the order."
+                )
+            if tool_slug == "email-bison" and settings_required and not api_key:
+                raise RuntimeError(
+                    f"Missing Workspace API key for {tool_slug} credential on domain {domain_name}. "
+                    "Email Bison upload can use the browser without an API key, but requested sending settings "
+                    "cannot be validated without the Workspace API key."
                 )
 
             op_client: Optional[OnePasswordCliClient] = None
             if (
                 provider_name == "google"
                 and self.sending_tool_playwright_oauth
-                and tool_slug in {"instantly.ai", "smartlead.ai", "amplemarket"}
+                and tool_slug in {"instantly.ai", "smartlead.ai", "amplemarket", "email-bison"}
             ):
                 try:
                     op_client = OnePasswordCliClient.from_env()
                 except Exception as op_exc:
-                    if self.sending_tool_require_1password:
+                    if self.sending_tool_require_1password and tool_slug != "email-bison":
                         raise RuntimeError(
                             f"1Password is required for {tool_slug} Google OAuth upload but not configured: {op_exc}"
                         ) from op_exc
                     logger.warning(
-                        "[upload_sending_tool] Proceeding without 1Password during Google OAuth upload for %s: %s",
+                        "[upload_sending_tool] Proceeding without 1Password during %s Google OAuth upload for %s: %s",
+                        tool_slug,
                         domain_name,
                         op_exc,
                     )
 
-            result = self._sending_tool_uploader.upload_and_validate(
-                tool=tool_slug,
-                api_key=api_key,
-                inboxes=payloads,
-                provider=provider_name,
-                credential=credential,
-                settings=tool_settings if isinstance(tool_settings, dict) else {},
-                onepassword=op_client,
-                headless=self.playwright_headless,
-                use_playwright_oauth=self.sending_tool_playwright_oauth,
-            )
+            with self._sending_tool_upload_lock(tool_slug=tool_slug, credential=credential):
+                result = self._sending_tool_uploader.upload_and_validate(
+                    tool=tool_slug,
+                    api_key=api_key,
+                    inboxes=payloads,
+                    provider=provider_name,
+                    credential=credential,
+                    settings=normalized_tool_settings,
+                    onepassword=op_client,
+                    headless=self.playwright_headless,
+                    use_playwright_oauth=self.sending_tool_playwright_oauth,
+                )
 
             processed_tools.append(tool_slug)
             tool_uploaded = [str(email or "").strip().lower() for email in (result.get("uploaded_emails") or [])]
@@ -2553,6 +2639,8 @@ class GoogleSupabaseWorker:
                 merged_failures.append(failure)
 
             skipped_already_uploaded += int(result.get("skipped_already_uploaded") or 0)
+            if settings_required and not bool(result.get("settings_validated")):
+                settings_validated_all = False
             tool_results.append(
                 {
                     "tool": tool_slug,
@@ -2560,6 +2648,8 @@ class GoogleSupabaseWorker:
                     "uploaded": len(tool_uploaded),
                     "failed": len(tool_failures),
                     "skipped_already_uploaded": int(result.get("skipped_already_uploaded") or 0),
+                    "settings_required": bool(result.get("settings_required")),
+                    "settings_validated": bool(result.get("settings_validated")),
                 }
             )
 
@@ -2576,7 +2666,60 @@ class GoogleSupabaseWorker:
             "uploaded_emails": uploaded_emails,
             "failed_uploads": merged_failures,
             "skipped_already_uploaded": skipped_already_uploaded,
+            "settings_required": settings_required,
+            "settings_validated": settings_validated_all if settings_required else None,
         }
+
+    @contextmanager
+    def _sending_tool_upload_lock(self, *, tool_slug: str, credential: Dict[str, Any]) -> Iterator[None]:
+        if tool_slug != "email-bison":
+            yield
+            return
+
+        timeout_seconds = max(30.0, float(os.getenv("EMAIL_BISON_UPLOAD_LOCK_TIMEOUT_SECONDS", "900")))
+        poll_seconds = max(1.0, float(os.getenv("EMAIL_BISON_UPLOAD_LOCK_POLL_SECONDS", "5")))
+        lock_dir = str(os.getenv("EMAIL_BISON_UPLOAD_LOCK_DIR") or tempfile.gettempdir()).strip()
+        os.makedirs(lock_dir, exist_ok=True)
+        identity = "|".join(
+            [
+                str(credential.get("id") or "").strip(),
+                str(credential.get("tool_url") or credential.get("url") or "").strip().lower(),
+                str(credential.get("workspace_name") or credential.get("workspace") or "").strip().lower(),
+                str(credential.get("username") or "").strip().lower(),
+            ]
+        )
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+        lock_path = os.path.join(lock_dir, f"simpleinboxes-email-bison-{digest}.lock")
+        handle = open(lock_path, "a+", encoding="utf-8")
+        acquired = False
+        started = time.time()
+        try:
+            import fcntl
+
+            while True:
+                try:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    acquired = True
+                    handle.seek(0)
+                    handle.truncate()
+                    handle.write(f"pid={os.getpid()} acquired_at={self._iso_now()} tool={tool_slug}\n")
+                    handle.flush()
+                    logger.info("[upload_sending_tool] Acquired Email Bison upload lock %s", lock_path)
+                    break
+                except BlockingIOError:
+                    if time.time() - started >= timeout_seconds:
+                        raise RuntimeError(
+                            "Email Bison upload lock timed out because another upload is still running for this login."
+                        )
+                    time.sleep(poll_seconds)
+            yield
+        finally:
+            try:
+                if acquired:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                    logger.info("[upload_sending_tool] Released Email Bison upload lock %s", lock_path)
+            finally:
+                handle.close()
 
     @staticmethod
     def _resolve_sending_tool_settings(domain: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2604,6 +2747,38 @@ class GoogleSupabaseWorker:
                 settings.update(candidate)
 
         return settings
+
+    @staticmethod
+    def _normalize_sending_tool_settings(settings: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        source = dict(settings) if isinstance(settings, dict) else {}
+        if "postUploadEnabled" in source:
+            source["applyRequested"] = source.get("postUploadEnabled") is True
+        elif "applyRequested" not in source:
+            source["applyRequested"] = len(source) > 0
+        return source
+
+    @staticmethod
+    def _sending_tool_settings_required(settings: Optional[Dict[str, Any]]) -> bool:
+        source = settings if isinstance(settings, dict) else {}
+        if not source.get("applyRequested"):
+            return False
+        return any(
+            [
+                source.get("dailyLimit") not in (None, ""),
+                source.get("sendingGap") not in (None, ""),
+                source.get("enableWarmup") is not None,
+                source.get("enableSlowRamp") is not None,
+                bool(source.get("signature")),
+                bool(source.get("tag")),
+                bool(source.get("tags")),
+                isinstance(source.get("instantlyWarmup"), dict) and bool(source.get("instantlyWarmup")),
+                isinstance(source.get("smartleadWarmup"), dict) and bool(source.get("smartleadWarmup")),
+                isinstance(source.get("plusvibeWarmup"), dict) and bool(source.get("plusvibeWarmup")),
+                isinstance(source.get("bisonWarmup"), dict) and bool(source.get("bisonWarmup")),
+                source.get("bisonWarmupDailyLimit") not in (None, ""),
+                bool(source.get("trackingDomainName")),
+            ]
+        )
 
     @staticmethod
     def _normalize_sending_tool_slug(raw: str) -> str:

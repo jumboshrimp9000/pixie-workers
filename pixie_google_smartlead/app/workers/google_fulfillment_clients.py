@@ -91,7 +91,7 @@ class CloudflareClient:
                 "Cloudflare auth missing. Set CLOUDFLARE_API_TOKEN or set CLOUDFLARE_GLOBAL_KEY + CLOUDFLARE_EMAIL."
             )
 
-        self.auth_mode = "token" if self._can_token_auth else "global"
+        self.auth_mode = "global" if self._can_global_auth else "token"
 
         if not self.account_id:
             logger.warning(
@@ -120,13 +120,10 @@ class CloudflareClient:
         allow_fallback: bool = True,
     ) -> Dict[str, Any]:
         modes: List[str] = [self.auth_mode]
-        if (
-            allow_fallback
-            and self.auth_mode == "token"
-            and self._can_global_auth
-            and "global" not in modes
-        ):
+        if allow_fallback and self.auth_mode == "token" and self._can_global_auth and "global" not in modes:
             modes.append("global")
+        if allow_fallback and self.auth_mode == "global" and self._can_token_auth and "token" not in modes:
+            modes.append("token")
 
         last_response: Optional[requests.Response] = None
         last_payload: Dict[str, Any] = {}
@@ -153,7 +150,7 @@ class CloudflareClient:
                 return payload
 
             if self._is_auth_error(response, payload) and index < len(modes) - 1:
-                logger.warning("Cloudflare token auth failed; retrying request with global key auth.")
+                logger.warning("Cloudflare %s auth failed; retrying request with %s auth.", mode, modes[index + 1])
                 continue
 
             last_response = response
