@@ -2464,6 +2464,13 @@ class GoogleInboxLifecycleWorker:
                 else:
                     invalid.append(entry)
 
+        bison_app_id = str(payload.get("bison_app_id") or "").strip()
+        if bison_app_id:
+            if self._is_valid_google_app_id(bison_app_id):
+                required.append(bison_app_id)
+            else:
+                invalid.append(bison_app_id)
+
         for key in (
             "additional_tools_id",
             "additional_app_ids",

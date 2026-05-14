@@ -2047,7 +2047,7 @@ class GoogleSupabaseWorker:
         bison_app_id = str(payload.get("bison_app_id") or "").strip()
         if bison_app_id:
             if self._is_valid_google_app_id(bison_app_id):
-                optional.append(bison_app_id)
+                required.append(bison_app_id)
             else:
                 invalid.append(bison_app_id)
 
@@ -2580,11 +2580,11 @@ class GoogleSupabaseWorker:
                     f"Missing API key for {tool_slug} credential on domain {domain_name}. "
                     "Provide toolCredentials.api when placing the order."
                 )
-            if tool_slug == "email-bison" and settings_required and not api_key:
+            if tool_slug == "email-bison" and not api_key:
                 raise RuntimeError(
                     f"Missing Workspace API key for {tool_slug} credential on domain {domain_name}. "
-                    "Email Bison upload can use the browser without an API key, but requested sending settings "
-                    "cannot be validated without the Workspace API key."
+                    "Email Bison uploads must be API-validated after browser OAuth, so the Workspace API key "
+                    "is required even when no post-upload settings were requested."
                 )
 
             op_client: Optional[OnePasswordCliClient] = None

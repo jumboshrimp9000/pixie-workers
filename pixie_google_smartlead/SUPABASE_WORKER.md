@@ -143,11 +143,16 @@ For each Google action:
    - each inbox OAuth upload runs in an isolated Playwright browser context to avoid session bleed on shared IPs
    - Email Bison Google upload is browser-based and workspace-locked:
      - enforce the expected Email Bison workspace before each upload/check
+     - require the Email Bison Workspace API key so every upload can be provider-validated after OAuth
      - clear Google session state before every inbox so a prior Google account is not reused
      - use stored inbox `otp_secret` when 1Password is unavailable
      - validate a new upload from Bison's `/sender-emails?success=1&account_type=Google&email=...` callback for the exact email
+     - validate final presence through the Email Bison Workspace API for each uploaded email
      - guard each Bison login with a local file lock so a single production server/IP runs only one active Bison OAuth upload for that login at a time
-     - do not raise Email Bison OAuth concurrency above one per login until a provider API validation path is available; table/search lag and one-login shared-IP behavior make higher concurrency unsafe
+     - do not raise Email Bison OAuth concurrency above one per login; shared-IP single-login behavior makes higher concurrency unsafe even with API validation
+   - All sending-tool Google OAuth uploads must use the shared Google sign-in/consent handler after the tool opens Google's OAuth page. Tool-specific code owns only:
+     - opening the Google OAuth page/popup from that sending tool
+     - validating the upload in that sending tool after Google redirects back
    - Smartlead can run either:
      - `per_inbox_login` (login each isolated context)
      - `single_login_popup_isolation` (login once, isolate per-inbox OAuth contexts with Smartlead-only storage state)
@@ -220,8 +225,8 @@ For tracked username/name changes, status is also written into the inbox-mutatio
 - `custom_dns_records` (array of DNS record objects)
 - per-inbox rows can also carry `password`; that value wins over `new_password` / `default_password`
 - optional Google Admin app config fields:
-  - `bison_app_id` (string OAuth client ID)
-  - `additional_tools_id` (string or list of OAuth client IDs)
+  - `bison_app_id` (string OAuth client ID; treated as required when present because Email Bison Google upload depends on it)
+  - `additional_tools_id`, `additional_app_ids`, `google_app_ids`, or `admin_app_ids` (string or list of OAuth client IDs)
   - `master_inbox_enable`, `warmy_enable`/`warmy_enabled`, `plusvibe_enable`/`plusvibe_enabled` (boolean)
 
 Lifecycle payloads:
