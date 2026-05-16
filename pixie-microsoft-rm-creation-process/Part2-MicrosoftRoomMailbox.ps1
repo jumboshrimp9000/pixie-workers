@@ -972,7 +972,8 @@ function New-SendingToolUploadAction {
     param(
         [object]$DomainRecord,
         [string]$ProvisionActionId,
-        [int]$ExpectedActiveInboxCount
+        [int]$ExpectedActiveInboxCount,
+        [object]$MailboxProof = $null
     )
 
     $body = @{
@@ -987,6 +988,8 @@ function New-SendingToolUploadAction {
             source = "microsoft_provision"
             provision_action_id = $ProvisionActionId
             expected_active_inboxes = $ExpectedActiveInboxCount
+            provider_mailbox_proof = $MailboxProof
+            microsoft_mailbox_proof = $MailboxProof
         }
     }
 
@@ -999,7 +1002,8 @@ function Ensure-SendingToolUploadAction {
     param(
         [object]$DomainRecord,
         [string]$ProvisionActionId,
-        [int]$ExpectedActiveInboxCount
+        [int]$ExpectedActiveInboxCount,
+        [object]$MailboxProof = $null
     )
 
     $credentialAssignments = @(Get-DomainCredentialAssignments -DomainId $DomainRecord.id)
@@ -1028,7 +1032,7 @@ function Ensure-SendingToolUploadAction {
         return @{ Success = $true; UploadAction = $existingFailedAction; Created = $false }
     }
 
-    $newAction = New-SendingToolUploadAction -DomainRecord $DomainRecord -ProvisionActionId $ProvisionActionId -ExpectedActiveInboxCount $ExpectedActiveInboxCount
+    $newAction = New-SendingToolUploadAction -DomainRecord $DomainRecord -ProvisionActionId $ProvisionActionId -ExpectedActiveInboxCount $ExpectedActiveInboxCount -MailboxProof $MailboxProof
     if (-not $newAction) {
         return @{
             Success = $false
@@ -1132,7 +1136,8 @@ function Complete-ProvisionActionWithUploadBlocker {
         [string]$Severity,
         [int]$ExpectedActiveInboxCount,
         [int]$ActualMailboxCount = 0,
-        [string]$UploadActionId = $null
+        [string]$UploadActionId = $null,
+        [object]$MailboxProof = $null
     )
 
     $domainId = $DomainRecord.id
@@ -1151,6 +1156,8 @@ function Complete-ProvisionActionWithUploadBlocker {
         domain = $domain
         mailboxes_created = if ($ActualMailboxCount -gt 0) { $ActualMailboxCount } else { $ExpectedActiveInboxCount }
         active_inboxes_verified = $ExpectedActiveInboxCount
+        provider_mailbox_proof = $MailboxProof
+        microsoft_mailbox_proof = $MailboxProof
         upload_validated = $false
         upload_pending = $false
         upload_blocked = $true
@@ -1163,6 +1170,7 @@ function Complete-ProvisionActionWithUploadBlocker {
         upload_action_id = $UploadActionId
         expected_active_inboxes = $ExpectedActiveInboxCount
         microsoft_provisioning_completed = $true
+        provider_mailbox_proof = $MailboxProof
         upload_blocked = $true
     }
     Set-DomainFulfillmentStep -DomainId $domainId -CustomerId $customerId -OrderBatchId $orderBatchId -StepKey "uploaded" -Status "blocked" -Owner "ops" -Summary "Mailboxes are created, but sending-tool upload is blocked." -NextAction "Assign or repair the sending-tool credential, then retry upload." -BlockerCode "sending_tool_credentials_required" -ActionId $ActionId -Evidence @{
@@ -1170,6 +1178,7 @@ function Complete-ProvisionActionWithUploadBlocker {
         upload_action_id = $UploadActionId
         expected_active_inboxes = $ExpectedActiveInboxCount
         microsoft_provisioning_completed = $true
+        provider_mailbox_proof = $MailboxProof
         reason = $Reason
     } | Out-Null
     Set-DomainFulfillmentStep -DomainId $domainId -CustomerId $customerId -OrderBatchId $orderBatchId -StepKey "final_ready" -Status "blocked" -Owner "ops" -Summary "Final readiness is blocked until sending-tool upload is resolved." -NextAction "Resolve the upload blocker, then retry upload/settings validation." -BlockerCode "final_readiness_blocked" -ActionId $ActionId -Evidence @{
@@ -1193,7 +1202,8 @@ function Complete-ProvisionActionWithUploadSkipped {
         [string]$ActionId,
         [string]$History,
         [int]$ExpectedActiveInboxCount,
-        [int]$ActualMailboxCount = 0
+        [int]$ActualMailboxCount = 0,
+        [object]$MailboxProof = $null
     )
 
     $domainId = $DomainRecord.id
@@ -1212,6 +1222,8 @@ function Complete-ProvisionActionWithUploadSkipped {
         domain = $domain
         mailboxes_created = if ($ActualMailboxCount -gt 0) { $ActualMailboxCount } else { $ExpectedActiveInboxCount }
         active_inboxes_verified = $ExpectedActiveInboxCount
+        provider_mailbox_proof = $MailboxProof
+        microsoft_mailbox_proof = $MailboxProof
         upload_required = $false
         upload_skipped = $true
         sending_tool_skipped = $true
@@ -1225,12 +1237,14 @@ function Complete-ProvisionActionWithUploadSkipped {
     Add-ActionLog -ActionId $ActionId -DomainId $domainId -CustomerId $customerId -EventType "sending_tool_upload_skipped" -Severity "info" -Message "Sending-tool upload skipped; order did not request a sending-tool integration." -Metadata @{
         expected_active_inboxes = $ExpectedActiveInboxCount
         microsoft_provisioning_completed = $true
+        provider_mailbox_proof = $MailboxProof
         upload_required = $false
         skip_reason = "sending_tool_not_requested"
     }
     Set-DomainFulfillmentStep -DomainId $domainId -CustomerId $customerId -OrderBatchId $orderBatchId -StepKey "uploaded" -Status "skipped" -Owner "system" -Summary "Sending-tool upload was not requested for this order." -NextAction "" -ActionId $ActionId -Evidence @{
         event_type = "sending_tool_upload_skipped"
         expected_active_inboxes = $ExpectedActiveInboxCount
+        provider_mailbox_proof = $MailboxProof
         skip_reason = "sending_tool_not_requested"
     } | Out-Null
     Set-DomainFulfillmentStep -DomainId $domainId -CustomerId $customerId -OrderBatchId $orderBatchId -StepKey "tool_settings" -Status "skipped" -Owner "system" -Summary "Sending-tool settings were skipped because no sending-tool upload was requested." -NextAction "" -ActionId $ActionId -Evidence @{
@@ -1240,6 +1254,7 @@ function Complete-ProvisionActionWithUploadSkipped {
     Set-DomainFulfillmentStep -DomainId $domainId -CustomerId $customerId -OrderBatchId $orderBatchId -StepKey "final_ready" -Status "done" -Owner "system" -Summary "Microsoft provisioning is complete; sending-tool upload was skipped by order request." -NextAction "" -ActionId $ActionId -Evidence @{
         event_type = "sending_tool_upload_skipped"
         active_inboxes_verified = $ExpectedActiveInboxCount
+        provider_mailbox_proof = $MailboxProof
     } | Out-Null
 
     return @{
@@ -1255,7 +1270,8 @@ function Resolve-MicrosoftProvisioningUploadState {
         [object]$DomainRecord,
         [string]$ActionId,
         [string]$History,
-        [int]$ActualMailboxCount = 0
+        [int]$ActualMailboxCount = 0,
+        [object]$MailboxProof = $null
     )
 
     $domainId = $DomainRecord.id
@@ -1299,16 +1315,60 @@ function Resolve-MicrosoftProvisioningUploadState {
         return @{ Complete = $false; Failed = $false; Pending = $true; History = $history }
     }
 
+    $mailboxProofPassed = $false
+    if ($MailboxProof) {
+        $proofPassedValue = Get-ObjectPropertyValue -Object $MailboxProof -Name "passed"
+        $proofVerifiedValue = Get-ObjectPropertyValue -Object $MailboxProof -Name "verified"
+        $proofFailedValue = Get-ObjectPropertyValue -Object $MailboxProof -Name "failed"
+        $mailboxProofPassed = ([bool]$proofPassedValue) -and ([int]$proofVerifiedValue -ge $expectedActiveCount) -and ([int]$proofFailedValue -eq 0)
+    }
+    if (-not $mailboxProofPassed) {
+        $reason = "microsoft_mailbox_proof_missing: Microsoft mailbox readback has not verified $expectedActiveCount mailbox(es); upload is held."
+        $delaySeconds = 300
+        $history = Add-HistoryEntry -History $History -Entry "PENDING: $reason"
+        Update-Domain -DomainId $domainId -Fields @{ status = "in_progress"; interim_status = "Microsoft - Mailbox Proof Pending"; action_history = $history }
+        Set-ProvisionActionPendingWithoutPenalty -ActionId $ActionId -Reason $reason -DelaySeconds $delaySeconds -Result @{
+            domain = $domain
+            expected_active_inboxes = $expectedActiveCount
+            active_inboxes_verified = $expectedActiveCount
+            mailboxes_created = $ActualMailboxCount
+            provider_mailbox_proof = $MailboxProof
+            microsoft_mailbox_proof = $MailboxProof
+            upload_pending = $false
+            upload_blocked = $false
+        } | Out-Null
+        Add-ActionLog -ActionId $ActionId -DomainId $domainId -CustomerId $customerId -EventType "microsoft_mailbox_proof_missing" -Severity "warn" -Message $reason -Metadata @{
+            expected_active_inboxes = $expectedActiveCount
+            exchange_mailboxes = $ActualMailboxCount
+            provider_mailbox_proof = $MailboxProof
+            retry_delay_seconds = $delaySeconds
+        }
+        Set-DomainFulfillmentStep -DomainId $domainId -CustomerId $customerId -OrderBatchId $orderBatchId -StepKey "inboxes" -Status "in_progress" -Owner "provider" -Summary "Microsoft mailbox creation is waiting for provider readback proof." -NextAction "No action needed yet. Worker retry scheduled after mailbox proof delay." -BlockerCode "microsoft_mailbox_proof_missing" -ActionId $ActionId -Evidence @{
+            event_type = "microsoft_mailbox_proof_missing"
+            expected_active_inboxes = $expectedActiveCount
+            exchange_mailboxes = $ActualMailboxCount
+            provider_mailbox_proof = $MailboxProof
+            retry_delay_seconds = $delaySeconds
+        } | Out-Null
+        Set-DomainFulfillmentStep -DomainId $domainId -CustomerId $customerId -OrderBatchId $orderBatchId -StepKey "uploaded" -Status "waiting" -Owner "system" -Summary "Upload is held until Microsoft mailbox proof is recorded." -NextAction "Do not run upload until Microsoft mailbox proof passes." -BlockerCode "microsoft_mailbox_proof_missing" -ActionId $ActionId -Evidence @{
+            event_type = "microsoft_mailbox_proof_missing"
+            expected_active_inboxes = $expectedActiveCount
+            provider_mailbox_proof = $MailboxProof
+        } | Out-Null
+        return @{ Complete = $false; Failed = $false; Pending = $true; History = $history }
+    }
+
     if (Test-ActionSendingToolSkipped -ActionId $ActionId) {
         return Complete-ProvisionActionWithUploadSkipped `
             -DomainRecord $DomainRecord `
             -ActionId $ActionId `
             -History $History `
             -ExpectedActiveInboxCount $expectedActiveCount `
-            -ActualMailboxCount $ActualMailboxCount
+            -ActualMailboxCount $ActualMailboxCount `
+            -MailboxProof $MailboxProof
     }
 
-    $uploadActionResult = Ensure-SendingToolUploadAction -DomainRecord $DomainRecord -ProvisionActionId $ActionId -ExpectedActiveInboxCount $expectedActiveCount
+    $uploadActionResult = Ensure-SendingToolUploadAction -DomainRecord $DomainRecord -ProvisionActionId $ActionId -ExpectedActiveInboxCount $expectedActiveCount -MailboxProof $MailboxProof
     if (-not $uploadActionResult.Success) {
         $reason = $uploadActionResult.Reason
         $interimStatus = if ($uploadActionResult.Blocked) { "Both - Sending Tool Upload Blocked" } else { "Both - Sending Tool Upload Failed" }
@@ -1321,7 +1381,8 @@ function Resolve-MicrosoftProvisioningUploadState {
             -EventType "sending_tool_upload_blocked" `
             -Severity "warn" `
             -ExpectedActiveInboxCount $expectedActiveCount `
-            -ActualMailboxCount $ActualMailboxCount
+            -ActualMailboxCount $ActualMailboxCount `
+            -MailboxProof $MailboxProof
     }
 
     $uploadAction = $uploadActionResult.UploadAction
@@ -1340,6 +1401,8 @@ function Resolve-MicrosoftProvisioningUploadState {
             domain = $domain
             mailboxes_created = if ($ActualMailboxCount -gt 0) { $ActualMailboxCount } else { $expectedActiveCount }
             active_inboxes_verified = $expectedActiveCount
+            provider_mailbox_proof = $MailboxProof
+            microsoft_mailbox_proof = $MailboxProof
             upload_action_id = $uploadActionId
             upload_validated = $true
             uploaded = $uploaded
@@ -1350,6 +1413,7 @@ function Resolve-MicrosoftProvisioningUploadState {
             upload_action_id = $uploadActionId
             uploaded = $uploaded
             expected_active_inboxes = $expectedActiveCount
+            provider_mailbox_proof = $MailboxProof
         } | Out-Null
         return @{ Complete = $true; Failed = $false; History = $history; UploadActionId = $uploadActionId }
     }
@@ -1366,7 +1430,8 @@ function Resolve-MicrosoftProvisioningUploadState {
             -Severity "error" `
             -ExpectedActiveInboxCount $expectedActiveCount `
             -ActualMailboxCount $ActualMailboxCount `
-            -UploadActionId $uploadActionId
+            -UploadActionId $uploadActionId `
+            -MailboxProof $MailboxProof
     }
 
     # The upload worker finalizes this provision action directly when Instantly
@@ -1392,6 +1457,8 @@ function Resolve-MicrosoftProvisioningUploadState {
         upload_pending = $true
         upload_action_id = $uploadActionId
         expected_active_inboxes = $expectedActiveCount
+        provider_mailbox_proof = $MailboxProof
+        microsoft_mailbox_proof = $MailboxProof
     } | Out-Null
     Add-ActionLog -ActionId $ActionId -DomainId $domainId -CustomerId $customerId -EventType "sending_tool_upload_pending" -Severity "warn" -Message "Waiting for reupload_inboxes action $uploadActionId before marking domain active" -Metadata @{ upload_action_id = $uploadActionId; expected_active_inboxes = $expectedActiveCount; retry_delay_seconds = $delaySeconds }
     Set-DomainFulfillmentStep -DomainId $domainId -CustomerId $customerId -OrderBatchId $orderBatchId -StepKey "uploaded" -Status "in_progress" -Owner "system" -Summary "Mailboxes are created; waiting for sending-tool upload validation." -NextAction "No action needed yet. Upload action $uploadActionId is still running or queued." -ActionId $ActionId -Evidence @{
@@ -2256,6 +2323,52 @@ function Invoke-BulletproofMailboxCheck {
     return @{ Total = $total; Passed = $passed; Failed = ($total - $passed); Issues = $issues; AllPassed = ($passed -eq $total) }
 }
 
+function New-MicrosoftMailboxProof {
+    param(
+        [string]$Domain,
+        [string]$Provider,
+        [string]$MailboxMode,
+        [int]$ExpectedActiveInboxCount,
+        [object]$Bulletproof,
+        [int]$ActualMailboxCount = 0
+    )
+
+    $verified = 0
+    $failed = 0
+    $issues = @()
+    $allPassed = $false
+
+    if ($Bulletproof) {
+        try { $verified = [int](Get-ObjectPropertyValue -Object $Bulletproof -Name "Passed") } catch { $verified = 0 }
+        try { $failed = [int](Get-ObjectPropertyValue -Object $Bulletproof -Name "Failed") } catch { $failed = 0 }
+        $rawIssues = Get-ObjectPropertyValue -Object $Bulletproof -Name "Issues"
+        if ($rawIssues) { $issues = @($rawIssues) }
+        $rawAllPassed = Get-ObjectPropertyValue -Object $Bulletproof -Name "AllPassed"
+        $allPassed = [bool]$rawAllPassed
+    }
+
+    if ($verified -le 0 -and $ActualMailboxCount -gt 0) { $verified = $ActualMailboxCount }
+    if ($failed -lt 0) { $failed = 0 }
+
+    $expected = [Math]::Max(1, $ExpectedActiveInboxCount)
+    $passed = $allPassed -and $failed -eq 0 -and $verified -ge $expected -and $issues.Count -eq 0
+
+    return @{
+        proof_type = "microsoft_mailbox_readback"
+        provider = $Provider
+        domain = $Domain
+        mailbox_mode = $MailboxMode
+        expected = $expected
+        verified = $verified
+        failed = $failed
+        issues = $issues
+        passed = $passed
+        checked_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        source = "Part2-MicrosoftRoomMailbox.Invoke-BulletproofMailboxCheck"
+        bulletproof = $Bulletproof
+    }
+}
+
 # ============================================================================
 # DKIM FUNCTIONS
 # ============================================================================
@@ -2535,6 +2648,7 @@ function Process-MicrosoftDomain {
     $InboxPassword = "A" + $InboxPassword.Substring(1, 12) + "1!"
 
     $failedSteps = @()
+    $MailboxProof = $null
 
     Write-Host ""
     Write-Host "================================================================" -ForegroundColor Magenta
@@ -2934,10 +3048,14 @@ function Process-MicrosoftDomain {
             }
 
             $bulletproof = Invoke-BulletproofMailboxCheck -Domain $Domain -Bearer $Bearer -Password $InboxPassword -MailboxMode $MailboxMode
+            $MailboxProof = New-MicrosoftMailboxProof -Domain $Domain -Provider $NormalizedProvider -MailboxMode $MailboxMode -ExpectedActiveInboxCount $Inboxes.Count -Bulletproof $bulletproof -ActualMailboxCount $bulletproof.Total
             $history = Add-HistoryEntry -History $history -Entry "Bulletproof check: $($bulletproof.Passed)/$($bulletproof.Total) passed"
 
             if (-not $bulletproof.AllPassed) {
-                $failedSteps += "Bulletproof Check"
+                Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "mailbox_readback_not_ready" -Severity "warn" -Message "Initial mailbox readback proof did not pass; the pre-upload proof gate will retry before upload." -Metadata @{
+                    provider_mailbox_proof = $MailboxProof
+                    expected_active_inboxes = $Inboxes.Count
+                }
             }
         }
         Update-Domain -DomainId $DomainId -Fields @{ interim_status = "Microsoft - Configuring Mailboxes"; action_history = $history }
@@ -3041,6 +3159,9 @@ function Process-MicrosoftDomain {
             }
 
             $actualCount = (Get-Mailbox -ResultSize Unlimited | Where-Object { $_.PrimarySmtpAddress -like "*@$Domain" } | Measure-Object).Count
+            $preUploadBulletproof = Invoke-BulletproofMailboxCheck -Domain $Domain -Bearer $Bearer -Password $InboxPassword -MailboxMode $MailboxMode
+            $MailboxProof = New-MicrosoftMailboxProof -Domain $Domain -Provider $NormalizedProvider -MailboxMode $MailboxMode -ExpectedActiveInboxCount $Inboxes.Count -Bulletproof $preUploadBulletproof -ActualMailboxCount $actualCount
+            $history = Add-HistoryEntry -History $history -Entry "Pre-upload mailbox proof: $($MailboxProof.verified)/$($MailboxProof.expected) verified"
             $freshBearer = Get-ROPCToken -TenantId $tenantId -ClientId $AzureCliPublicClientId -Username $AdminEmail -Password $AdminPassword
             if ($freshBearer) {
                 $Bearer = $freshBearer
@@ -3057,7 +3178,7 @@ function Process-MicrosoftDomain {
             Ensure-DomainAdminAssignment -DomainId $DomainId -AdminCredId $AdminRecord.id
             Update-AdminUsage -AdminId $AdminRecord.id -InboxCount $Inboxes.Count
 
-            $uploadState = Resolve-MicrosoftProvisioningUploadState -DomainRecord $DomainRecord -ActionId $ActionId -History $history -ActualMailboxCount $actualCount
+            $uploadState = Resolve-MicrosoftProvisioningUploadState -DomainRecord $DomainRecord -ActionId $ActionId -History $history -ActualMailboxCount $actualCount -MailboxProof $MailboxProof
             $history = $uploadState.History
 
             if ($uploadState.Complete) {
