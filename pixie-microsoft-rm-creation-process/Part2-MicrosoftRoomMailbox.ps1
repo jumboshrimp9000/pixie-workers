@@ -223,9 +223,32 @@ function Get-ObjectPropertyValue {
     if ($Object -is [string]) {
         try { $Object = $Object | ConvertFrom-Json -Depth 20 } catch { return $null }
     }
+    if ($Object -is [System.Collections.IDictionary]) {
+        if ($Object.Contains($Name)) { return $Object[$Name] }
+        foreach ($key in $Object.Keys) {
+            if ([string]$key -eq $Name) { return $Object[$key] }
+        }
+        return $null
+    }
     $property = $Object.PSObject.Properties[$Name]
     if ($property) { return $property.Value }
     return $null
+}
+
+function Test-ObjectPropertyExists {
+    param([object]$Object, [string]$Name)
+    if (-not $Object -or -not $Name) { return $false }
+    if ($Object -is [string]) {
+        try { $Object = $Object | ConvertFrom-Json -Depth 20 } catch { return $false }
+    }
+    if ($Object -is [System.Collections.IDictionary]) {
+        if ($Object.Contains($Name)) { return $true }
+        foreach ($key in $Object.Keys) {
+            if ([string]$key -eq $Name) { return $true }
+        }
+        return $false
+    }
+    return ($null -ne $Object.PSObject.Properties[$Name])
 }
 
 function Get-ReplacementOldDomainFromRecord {
@@ -642,6 +665,7 @@ function Invoke-AzureAcceptedDomainReaddRecovery {
         [string]$Domain,
         [string]$DomainId,
         [string]$CustomerId,
+        [string]$OrderBatchId = $null,
         [string]$ActionId,
         [string]$History,
         [string]$FailureMessage,
@@ -737,6 +761,12 @@ function Invoke-AzureAcceptedDomainReaddRecovery {
             next_retry_at = $nextRetryAt
             retry_delay_seconds = $DelaySeconds
         }
+        Set-DomainFulfillmentStep -DomainId $DomainId -CustomerId $CustomerId -OrderBatchId $OrderBatchId -StepKey "inboxes" -Status "in_progress" -Owner "provider" -Summary "Accepted-domain delete/re-add recovery ran; waiting for Microsoft/Exchange to accept the domain before mailbox creation retries." -NextAction "No action needed yet. Worker retry scheduled for $nextRetryAt." -ActionId $ActionId -Evidence @{
+            event_type = "accepted_domain_readd_requeued"
+            next_retry_at = $nextRetryAt
+            retry_delay_seconds = $DelaySeconds
+            blocker_code = "azure_accepted_domain_mailbox_creation_blocked"
+        } | Out-Null
         return $true
     } catch {
         $errorText = $_.Exception.Message
@@ -867,10 +897,40 @@ function Get-LatestPrepareAction {
 function Test-TruthyPayloadFlag {
     param([object]$Payload, [string]$Name)
 
-    if (-not $Payload -or -not ($Payload.PSObject.Properties.Name -contains $Name)) { return $false }
-    $value = $Payload.$Name
+    if (-not (Test-ObjectPropertyExists -Object $Payload -Name $Name)) { return $false }
+    $value = Get-ObjectPropertyValue -Object $Payload -Name $Name
     if ($value -is [bool]) { return [bool]$value }
-    return ([string]$value).Trim().ToLowerInvariant() -in @("true", "1", "yes")
+    if ($value -is [int] -or $value -is [long] -or $value -is [double]) { return ([double]$value -ne 0) }
+    return ([string]$value).Trim().ToLowerInvariant() -in @("true", "1", "yes", "y", "on")
+}
+
+function Test-FalseyPayloadFlag {
+    param([object]$Payload, [string]$Name)
+
+    if (-not (Test-ObjectPropertyExists -Object $Payload -Name $Name)) { return $false }
+    $value = Get-ObjectPropertyValue -Object $Payload -Name $Name
+    if ($value -is [bool]) { return (-not [bool]$value) }
+    if ($value -is [int] -or $value -is [long] -or $value -is [double]) { return ([double]$value -eq 0) }
+    return ([string]$value).Trim().ToLowerInvariant() -in @("false", "0", "no", "n", "off")
+}
+
+function Test-PayloadSendingToolSkipped {
+    param([object]$Payload)
+
+    return (
+        (Test-TruthyPayloadFlag -Payload $Payload -Name "sending_tool_skipped") -or
+        (Test-TruthyPayloadFlag -Payload $Payload -Name "sendingToolSkipped") -or
+        (Test-TruthyPayloadFlag -Payload $Payload -Name "sequencer_skipped") -or
+        (Test-TruthyPayloadFlag -Payload $Payload -Name "sequencerSkipped") -or
+        (Test-TruthyPayloadFlag -Payload $Payload -Name "upload_skipped") -or
+        (Test-TruthyPayloadFlag -Payload $Payload -Name "uploadSkipped") -or
+        (Test-TruthyPayloadFlag -Payload $Payload -Name "skip_sending_tool_upload") -or
+        (Test-TruthyPayloadFlag -Payload $Payload -Name "skipSendingToolUpload") -or
+        (Test-TruthyPayloadFlag -Payload $Payload -Name "skip_sequencer_upload") -or
+        (Test-TruthyPayloadFlag -Payload $Payload -Name "skipSequencerUpload") -or
+        (Test-FalseyPayloadFlag -Payload $Payload -Name "upload_required") -or
+        (Test-FalseyPayloadFlag -Payload $Payload -Name "uploadRequired")
+    )
 }
 
 function Test-ActionSendingToolSkipped {
@@ -881,14 +941,12 @@ function Test-ActionSendingToolSkipped {
     if (-not $action) { return $false }
 
     $payload = $action.payload
-    if ((Test-TruthyPayloadFlag -Payload $payload -Name "sending_tool_skipped") -or
-        (Test-TruthyPayloadFlag -Payload $payload -Name "sequencer_skipped")) {
-        return $true
-    }
+    if (Test-PayloadSendingToolSkipped -Payload $payload) { return $true }
+    if (Test-PayloadSendingToolSkipped -Payload $action.result) { return $true }
 
     $preparedByActionId = ""
-    if ($payload -and ($payload.PSObject.Properties.Name -contains "prepared_by_action")) {
-        $preparedByActionId = ([string]$payload.prepared_by_action).Trim()
+    if (Test-ObjectPropertyExists -Object $payload -Name "prepared_by_action") {
+        $preparedByActionId = ([string](Get-ObjectPropertyValue -Object $payload -Name "prepared_by_action")).Trim()
     }
 
     $prepareAction = $null
@@ -898,11 +956,8 @@ function Test-ActionSendingToolSkipped {
     if ((-not $prepareAction -or -not $prepareAction.payload) -and $action.domain_id) {
         $prepareAction = Get-LatestPrepareAction -DomainId ([string]$action.domain_id)
     }
-    if (-not $prepareAction -or -not $prepareAction.payload) { return $false }
-    return (
-        (Test-TruthyPayloadFlag -Payload $prepareAction.payload -Name "sending_tool_skipped") -or
-        (Test-TruthyPayloadFlag -Payload $prepareAction.payload -Name "sequencer_skipped")
-    )
+    if (-not $prepareAction) { return $false }
+    return ((Test-PayloadSendingToolSkipped -Payload $prepareAction.payload) -or (Test-PayloadSendingToolSkipped -Payload $prepareAction.result))
 }
 
 function Test-ActionPayloadMatchesProvision {
@@ -1083,6 +1138,7 @@ function Complete-ProvisionActionWithUploadBlocker {
     $domainId = $DomainRecord.id
     $domain = $DomainRecord.domain
     $customerId = $DomainRecord.customer_id
+    $orderBatchId = $DomainRecord.order_batch_id
     $history = Add-HistoryEntry -History $History -Entry "UPLOAD BLOCKED: $Reason"
 
     Update-Domain -DomainId $domainId -Fields @{
@@ -1109,6 +1165,18 @@ function Complete-ProvisionActionWithUploadBlocker {
         microsoft_provisioning_completed = $true
         upload_blocked = $true
     }
+    Set-DomainFulfillmentStep -DomainId $domainId -CustomerId $customerId -OrderBatchId $orderBatchId -StepKey "uploaded" -Status "blocked" -Owner "ops" -Summary "Mailboxes are created, but sending-tool upload is blocked." -NextAction "Assign or repair the sending-tool credential, then retry upload." -BlockerCode "sending_tool_credentials_required" -ActionId $ActionId -Evidence @{
+        event_type = $EventType
+        upload_action_id = $UploadActionId
+        expected_active_inboxes = $ExpectedActiveInboxCount
+        microsoft_provisioning_completed = $true
+        reason = $Reason
+    } | Out-Null
+    Set-DomainFulfillmentStep -DomainId $domainId -CustomerId $customerId -OrderBatchId $orderBatchId -StepKey "final_ready" -Status "blocked" -Owner "ops" -Summary "Final readiness is blocked until sending-tool upload is resolved." -NextAction "Resolve the upload blocker, then retry upload/settings validation." -BlockerCode "final_readiness_blocked" -ActionId $ActionId -Evidence @{
+        blocked_step = "uploaded"
+        event_type = $EventType
+        reason = $Reason
+    } | Out-Null
 
     return @{
         Complete = $true
@@ -1131,6 +1199,7 @@ function Complete-ProvisionActionWithUploadSkipped {
     $domainId = $DomainRecord.id
     $domain = $DomainRecord.domain
     $customerId = $DomainRecord.customer_id
+    $orderBatchId = $DomainRecord.order_batch_id
     $history = Add-HistoryEntry -History $History -Entry "Sending-tool upload skipped because no sending tool was requested for this order."
 
     Update-Domain -DomainId $domainId -Fields @{
@@ -1159,6 +1228,19 @@ function Complete-ProvisionActionWithUploadSkipped {
         upload_required = $false
         skip_reason = "sending_tool_not_requested"
     }
+    Set-DomainFulfillmentStep -DomainId $domainId -CustomerId $customerId -OrderBatchId $orderBatchId -StepKey "uploaded" -Status "skipped" -Owner "system" -Summary "Sending-tool upload was not requested for this order." -NextAction "" -ActionId $ActionId -Evidence @{
+        event_type = "sending_tool_upload_skipped"
+        expected_active_inboxes = $ExpectedActiveInboxCount
+        skip_reason = "sending_tool_not_requested"
+    } | Out-Null
+    Set-DomainFulfillmentStep -DomainId $domainId -CustomerId $customerId -OrderBatchId $orderBatchId -StepKey "tool_settings" -Status "skipped" -Owner "system" -Summary "Sending-tool settings were skipped because no sending-tool upload was requested." -NextAction "" -ActionId $ActionId -Evidence @{
+        event_type = "sending_tool_upload_skipped"
+        skip_reason = "sending_tool_not_requested"
+    } | Out-Null
+    Set-DomainFulfillmentStep -DomainId $domainId -CustomerId $customerId -OrderBatchId $orderBatchId -StepKey "final_ready" -Status "done" -Owner "system" -Summary "Microsoft provisioning is complete; sending-tool upload was skipped by order request." -NextAction "" -ActionId $ActionId -Evidence @{
+        event_type = "sending_tool_upload_skipped"
+        active_inboxes_verified = $ExpectedActiveInboxCount
+    } | Out-Null
 
     return @{
         Complete = $true
@@ -1179,6 +1261,7 @@ function Resolve-MicrosoftProvisioningUploadState {
     $domainId = $DomainRecord.id
     $domain = $DomainRecord.domain
     $customerId = $DomainRecord.customer_id
+    $orderBatchId = $DomainRecord.order_batch_id
     $activeInboxes = @(Get-ActiveDomainInboxes -DomainId $domainId)
     $expectedActiveCount = $activeInboxes.Count
 
@@ -1188,6 +1271,11 @@ function Resolve-MicrosoftProvisioningUploadState {
         Update-Domain -DomainId $domainId -Fields @{ status = "in_progress"; interim_status = "Both - Failed"; action_history = $history }
         Update-ActionStatus -ActionId $ActionId -Status "failed" -Error $reason
         Add-ActionLog -ActionId $ActionId -DomainId $domainId -CustomerId $customerId -EventType "provisioning_finalization_failed" -Severity "error" -Message $reason
+        Set-DomainFulfillmentStep -DomainId $domainId -CustomerId $customerId -OrderBatchId $orderBatchId -StepKey "inboxes" -Status "blocked" -Owner "ops" -Summary "Microsoft provisioning cannot finalize because no active inboxes were found." -NextAction "Inspect mailbox creation and Supabase inbox state, then retry provisioning." -BlockerCode "microsoft_no_active_inboxes" -ActionId $ActionId -Evidence @{
+            event_type = "provisioning_finalization_failed"
+            expected_active_inboxes = $expectedActiveCount
+            reason = $reason
+        } | Out-Null
         return @{ Complete = $false; Failed = $true; History = $history }
     }
 
@@ -1202,6 +1290,12 @@ function Resolve-MicrosoftProvisioningUploadState {
             expected_active_inboxes = $expectedActiveCount
             retry_delay_seconds = 300
         }
+        Set-DomainFulfillmentStep -DomainId $domainId -CustomerId $customerId -OrderBatchId $orderBatchId -StepKey "inboxes" -Status "in_progress" -Owner "provider" -Summary "Mailbox replication count is still catching up before upload can start." -NextAction "No action needed yet. Worker retry scheduled after Exchange replication delay." -ActionId $ActionId -Evidence @{
+            event_type = "mailbox_count_validation_deferred"
+            exchange_mailboxes = $ActualMailboxCount
+            expected_active_inboxes = $expectedActiveCount
+            retry_delay_seconds = 300
+        } | Out-Null
         return @{ Complete = $false; Failed = $false; Pending = $true; History = $history }
     }
 
@@ -1251,6 +1345,12 @@ function Resolve-MicrosoftProvisioningUploadState {
             uploaded = $uploaded
         }
         Add-ActionLog -ActionId $ActionId -DomainId $domainId -CustomerId $customerId -EventType "provisioning_complete" -Severity "info" -Message "Complete: $expectedActiveCount active inboxes, upload validated by action $uploadActionId" -Metadata @{ upload_action_id = $uploadActionId; uploaded = $uploaded; expected_active_inboxes = $expectedActiveCount }
+        Set-DomainFulfillmentStep -DomainId $domainId -CustomerId $customerId -OrderBatchId $orderBatchId -StepKey "uploaded" -Status "done" -Owner "system" -Summary "Sending-tool upload was validated." -NextAction "" -ActionId $ActionId -Evidence @{
+            event_type = "provisioning_complete"
+            upload_action_id = $uploadActionId
+            uploaded = $uploaded
+            expected_active_inboxes = $expectedActiveCount
+        } | Out-Null
         return @{ Complete = $true; Failed = $false; History = $history; UploadActionId = $uploadActionId }
     }
 
@@ -1294,7 +1394,35 @@ function Resolve-MicrosoftProvisioningUploadState {
         expected_active_inboxes = $expectedActiveCount
     } | Out-Null
     Add-ActionLog -ActionId $ActionId -DomainId $domainId -CustomerId $customerId -EventType "sending_tool_upload_pending" -Severity "warn" -Message "Waiting for reupload_inboxes action $uploadActionId before marking domain active" -Metadata @{ upload_action_id = $uploadActionId; expected_active_inboxes = $expectedActiveCount; retry_delay_seconds = $delaySeconds }
+    Set-DomainFulfillmentStep -DomainId $domainId -CustomerId $customerId -OrderBatchId $orderBatchId -StepKey "uploaded" -Status "in_progress" -Owner "system" -Summary "Mailboxes are created; waiting for sending-tool upload validation." -NextAction "No action needed yet. Upload action $uploadActionId is still running or queued." -ActionId $ActionId -Evidence @{
+        event_type = "sending_tool_upload_pending"
+        upload_action_id = $uploadActionId
+        expected_active_inboxes = $expectedActiveCount
+        retry_delay_seconds = $delaySeconds
+    } | Out-Null
     return @{ Complete = $false; Failed = $false; Pending = $true; History = $history; UploadActionId = $uploadActionId }
+}
+
+function Get-MicrosoftFulfillmentStepKey {
+    param([string]$Step, [string]$EventType, [string]$Reason)
+
+    $combined = "$Step $EventType $Reason".ToLowerInvariant()
+    if ($combined -match "dkim|cname") { return "dkim" }
+    if ($combined -match "dns") { return "dns" }
+    if ($combined -match "verification|verify|email_service|email service|exchange|accepted_domain|accepted domain|add_domain|domain_setup") { return "verified" }
+    if ($combined -match "mailbox|inbox|smtp|imap|user") { return "inboxes" }
+    return "inboxes"
+}
+
+function Get-MicrosoftBlockerCode {
+    param([string]$Step)
+
+    $slug = ([string]$Step).Trim().ToLowerInvariant()
+    if ([string]::IsNullOrWhiteSpace($slug)) { return "microsoft_provisioning_blocked" }
+    $slug = $slug -replace "[^a-z0-9]+", "_"
+    $slug = $slug.Trim("_")
+    if ([string]::IsNullOrWhiteSpace($slug)) { return "microsoft_provisioning_blocked" }
+    return "microsoft_${slug}_blocked"
 }
 
 function Stop-MicrosoftProvisioningWithAction {
@@ -1357,6 +1485,14 @@ function Stop-MicrosoftProvisioningWithAction {
         $logMetadata["retry_delay_seconds"] = $DelaySeconds
         if ($retryWithoutPenalty) { $logMetadata["retry_without_penalty"] = $true }
         Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType $EventType -Severity "warn" -Message $safeReason -Metadata $logMetadata
+        Set-DomainFulfillmentStep -DomainId $DomainId -CustomerId $CustomerId -StepKey (Get-MicrosoftFulfillmentStepKey -Step $Step -EventType $EventType -Reason $safeReason) -Status "in_progress" -Owner "provider" -Summary $safeReason -NextAction "No action needed yet. Microsoft worker retry is scheduled for $nextRetryAt." -ActionId $ActionId -Evidence @{
+            event_type = $EventType
+            step = $Step
+            retryable = $Retryable
+            retry_without_penalty = $retryWithoutPenalty
+            next_retry_at = $nextRetryAt
+            retry_delay_seconds = $DelaySeconds
+        } | Out-Null
     } else {
         if ($Retryable) {
             $logMetadata["retryable_but_exhausted"] = $true
@@ -1365,6 +1501,14 @@ function Stop-MicrosoftProvisioningWithAction {
         }
         Update-ActionStatus -ActionId $ActionId -Action $currentAction -Status "failed" -Error $safeReason
         Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType $EventType -Severity $Severity -Message $safeReason -Metadata $logMetadata
+        Set-DomainFulfillmentStep -DomainId $DomainId -CustomerId $CustomerId -StepKey (Get-MicrosoftFulfillmentStepKey -Step $Step -EventType $EventType -Reason $safeReason) -Status "blocked" -Owner "ops" -Summary "Microsoft provisioning stopped: $safeReason" -NextAction "Inspect the Microsoft worker logs and provider state, repair the blocker, then retry provisioning." -BlockerCode (Get-MicrosoftBlockerCode -Step $Step) -ActionId $ActionId -Evidence @{
+            event_type = $EventType
+            step = $Step
+            retryable = $Retryable
+            retryable_but_exhausted = [bool]($Retryable)
+            attempts = $attempts
+            max_attempts = $maxAttempts
+        } | Out-Null
     }
 
     return $history
@@ -2372,6 +2516,7 @@ function Process-MicrosoftDomain {
     $Domain = $DomainRecord.domain
     $DomainId = $DomainRecord.id
     $CustomerId = $DomainRecord.customer_id
+    $OrderBatchId = $DomainRecord.order_batch_id
     $ZoneId = $DomainRecord.cloudflare_zone_id
     $Source = $DomainRecord.source
     $Provider = if ($DomainRecord.provider) { [string]$DomainRecord.provider } else { "microsoft" }
@@ -2717,7 +2862,7 @@ function Process-MicrosoftDomain {
                     )
                 )
                 if ($acceptedDomainBlocked) {
-                    $repairQueued = Invoke-AzureAcceptedDomainReaddRecovery -Bearer $Bearer -Domain $Domain -DomainId $DomainId -CustomerId $CustomerId -ActionId $ActionId -History $history -FailureMessage $failureMessage -DelaySeconds 60
+                    $repairQueued = Invoke-AzureAcceptedDomainReaddRecovery -Bearer $Bearer -Domain $Domain -DomainId $DomainId -CustomerId $CustomerId -OrderBatchId $OrderBatchId -ActionId $ActionId -History $history -FailureMessage $failureMessage -DelaySeconds 60
                     if ($repairQueued) {
                         Write-Log "Accepted-domain delete/re-add recovery queued for $Domain; retrying provisioning after Microsoft sync" -Level Warning
                         return
@@ -2733,6 +2878,14 @@ function Process-MicrosoftDomain {
                     mailbox_mode = $MailboxMode
                     blocker_code = if ($acceptedDomainBlocked) { "azure_accepted_domain_mailbox_creation_blocked" } else { $null }
                 }
+                $mailboxBlockerCode = if ($acceptedDomainBlocked) { "azure_accepted_domain_mailbox_creation_blocked" } else { "microsoft_mailbox_creation_failed" }
+                Set-DomainFulfillmentStep -DomainId $DomainId -CustomerId $CustomerId -OrderBatchId $OrderBatchId -StepKey "inboxes" -Status "blocked" -Owner "ops" -Summary "Microsoft/Azure mailbox creation failed before any inbox was created." -NextAction "Open the Microsoft worker logs, repair the provider blocker, then retry provisioning." -BlockerCode $mailboxBlockerCode -ActionId $ActionId -Evidence @{
+                    event_type = "mailbox_creation_failed_zero_created"
+                    requested_inboxes = $Inboxes.Count
+                    provider = $Provider
+                    mailbox_mode = $MailboxMode
+                    failure = $failureMessage
+                } | Out-Null
                 return
             }
 
@@ -2855,6 +3008,12 @@ function Process-MicrosoftDomain {
                 next_retry_at = $nextRetryAt
                 retry_delay_seconds = $delaySeconds
             }
+            Set-DomainFulfillmentStep -DomainId $DomainId -CustomerId $CustomerId -OrderBatchId $OrderBatchId -StepKey "dkim" -Status "in_progress" -Owner "provider" -Summary "Microsoft DKIM/CNAME acceptance is still pending." -NextAction "No action needed yet. Worker retry scheduled for $nextRetryAt." -ActionId $ActionId -Evidence @{
+                event_type = "dkim_enable_pending"
+                reason = $reason
+                next_retry_at = $nextRetryAt
+                retry_delay_seconds = $delaySeconds
+            } | Out-Null
             Set-ProvisionActionPendingWithoutPenalty -ActionId $ActionId -Reason $reason -DelaySeconds $delaySeconds
             return
         }
