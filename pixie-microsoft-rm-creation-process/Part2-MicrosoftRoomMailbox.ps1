@@ -855,6 +855,56 @@ function Get-SendingToolUploadActions {
     return @()
 }
 
+function Get-LatestPrepareAction {
+    param([string]$DomainId)
+
+    if ([string]::IsNullOrWhiteSpace($DomainId)) { return $null }
+    $result = Invoke-SupabaseApi -Method GET -Table "actions" -Query "domain_id=eq.$DomainId&type=eq.prepare_domain&order=created_at.desc&limit=1&select=*"
+    if ($result.Success -and $result.Data -and $result.Data.Count -gt 0) { return $result.Data[0] }
+    return $null
+}
+
+function Test-TruthyPayloadFlag {
+    param([object]$Payload, [string]$Name)
+
+    if (-not $Payload -or -not ($Payload.PSObject.Properties.Name -contains $Name)) { return $false }
+    $value = $Payload.$Name
+    if ($value -is [bool]) { return [bool]$value }
+    return ([string]$value).Trim().ToLowerInvariant() -in @("true", "1", "yes")
+}
+
+function Test-ActionSendingToolSkipped {
+    param([string]$ActionId)
+
+    if ([string]::IsNullOrWhiteSpace($ActionId)) { return $false }
+    $action = Get-Action -ActionId $ActionId
+    if (-not $action) { return $false }
+
+    $payload = $action.payload
+    if ((Test-TruthyPayloadFlag -Payload $payload -Name "sending_tool_skipped") -or
+        (Test-TruthyPayloadFlag -Payload $payload -Name "sequencer_skipped")) {
+        return $true
+    }
+
+    $preparedByActionId = ""
+    if ($payload -and ($payload.PSObject.Properties.Name -contains "prepared_by_action")) {
+        $preparedByActionId = ([string]$payload.prepared_by_action).Trim()
+    }
+
+    $prepareAction = $null
+    if (-not [string]::IsNullOrWhiteSpace($preparedByActionId)) {
+        $prepareAction = Get-Action -ActionId $preparedByActionId
+    }
+    if ((-not $prepareAction -or -not $prepareAction.payload) -and $action.domain_id) {
+        $prepareAction = Get-LatestPrepareAction -DomainId ([string]$action.domain_id)
+    }
+    if (-not $prepareAction -or -not $prepareAction.payload) { return $false }
+    return (
+        (Test-TruthyPayloadFlag -Payload $prepareAction.payload -Name "sending_tool_skipped") -or
+        (Test-TruthyPayloadFlag -Payload $prepareAction.payload -Name "sequencer_skipped")
+    )
+}
+
 function Test-ActionPayloadMatchesProvision {
     param([object]$Action, [string]$ProvisionActionId)
 
@@ -1069,6 +1119,55 @@ function Complete-ProvisionActionWithUploadBlocker {
     }
 }
 
+function Complete-ProvisionActionWithUploadSkipped {
+    param(
+        [object]$DomainRecord,
+        [string]$ActionId,
+        [string]$History,
+        [int]$ExpectedActiveInboxCount,
+        [int]$ActualMailboxCount = 0
+    )
+
+    $domainId = $DomainRecord.id
+    $domain = $DomainRecord.domain
+    $customerId = $DomainRecord.customer_id
+    $history = Add-HistoryEntry -History $History -Entry "Sending-tool upload skipped because no sending tool was requested for this order."
+
+    Update-Domain -DomainId $domainId -Fields @{
+        status = "active"
+        interim_status = "Both - Provisioning Complete"
+        action_history = $history
+    }
+
+    $result = @{
+        domain = $domain
+        mailboxes_created = if ($ActualMailboxCount -gt 0) { $ActualMailboxCount } else { $ExpectedActiveInboxCount }
+        active_inboxes_verified = $ExpectedActiveInboxCount
+        upload_required = $false
+        upload_skipped = $true
+        sending_tool_skipped = $true
+        upload_validated = $false
+        upload_pending = $false
+        upload_blocked = $false
+        skip_reason = "sending_tool_not_requested"
+    }
+
+    Update-ActionStatus -ActionId $ActionId -Status "completed" -Result $result
+    Add-ActionLog -ActionId $ActionId -DomainId $domainId -CustomerId $customerId -EventType "sending_tool_upload_skipped" -Severity "info" -Message "Sending-tool upload skipped; order did not request a sending-tool integration." -Metadata @{
+        expected_active_inboxes = $ExpectedActiveInboxCount
+        microsoft_provisioning_completed = $true
+        upload_required = $false
+        skip_reason = "sending_tool_not_requested"
+    }
+
+    return @{
+        Complete = $true
+        Failed = $false
+        Skipped = $true
+        History = $history
+    }
+}
+
 function Resolve-MicrosoftProvisioningUploadState {
     param(
         [object]$DomainRecord,
@@ -1104,6 +1203,15 @@ function Resolve-MicrosoftProvisioningUploadState {
             retry_delay_seconds = 300
         }
         return @{ Complete = $false; Failed = $false; Pending = $true; History = $history }
+    }
+
+    if (Test-ActionSendingToolSkipped -ActionId $ActionId) {
+        return Complete-ProvisionActionWithUploadSkipped `
+            -DomainRecord $DomainRecord `
+            -ActionId $ActionId `
+            -History $History `
+            -ExpectedActiveInboxCount $expectedActiveCount `
+            -ActualMailboxCount $ActualMailboxCount
     }
 
     $uploadActionResult = Ensure-SendingToolUploadAction -DomainRecord $DomainRecord -ProvisionActionId $ActionId -ExpectedActiveInboxCount $expectedActiveCount
