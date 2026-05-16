@@ -501,6 +501,7 @@ function Update-ActionStatus {
     if ($Status -eq "completed") {
         $body.completed_at = $now
         $body.next_retry_at = $null
+        $body.error = $null
     }
     if ($Status -eq "failed" -or $Status -eq "cancelled" -or $Status -eq "canceled") {
         $body.next_retry_at = $null

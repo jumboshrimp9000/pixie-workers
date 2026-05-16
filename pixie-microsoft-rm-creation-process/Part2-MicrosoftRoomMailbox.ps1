@@ -1016,6 +1016,59 @@ function Test-MicrosoftProvisioningNoPenaltyRetry {
     return ($combined -match 'verification|email_service|dns_records|exchange_sync|accepted_domain|dkim|cname|propagat|not ready|still processing|pending')
 }
 
+function Complete-ProvisionActionWithUploadBlocker {
+    param(
+        [object]$DomainRecord,
+        [string]$ActionId,
+        [string]$History,
+        [string]$Reason,
+        [string]$InterimStatus,
+        [string]$EventType,
+        [string]$Severity,
+        [int]$ExpectedActiveInboxCount,
+        [int]$ActualMailboxCount = 0,
+        [string]$UploadActionId = $null
+    )
+
+    $domainId = $DomainRecord.id
+    $domain = $DomainRecord.domain
+    $customerId = $DomainRecord.customer_id
+    $history = Add-HistoryEntry -History $History -Entry "UPLOAD BLOCKED: $Reason"
+
+    Update-Domain -DomainId $domainId -Fields @{
+        status = "in_progress"
+        interim_status = $InterimStatus
+        action_history = $history
+    }
+
+    $result = @{
+        domain = $domain
+        mailboxes_created = if ($ActualMailboxCount -gt 0) { $ActualMailboxCount } else { $ExpectedActiveInboxCount }
+        active_inboxes_verified = $ExpectedActiveInboxCount
+        upload_validated = $false
+        upload_pending = $false
+        upload_blocked = $true
+        upload_blocker_reason = $Reason
+    }
+    if ($UploadActionId) { $result.upload_action_id = $UploadActionId }
+
+    Update-ActionStatus -ActionId $ActionId -Status "completed" -Result $result
+    Add-ActionLog -ActionId $ActionId -DomainId $domainId -CustomerId $customerId -EventType $EventType -Severity $Severity -Message $Reason -Metadata @{
+        upload_action_id = $UploadActionId
+        expected_active_inboxes = $ExpectedActiveInboxCount
+        microsoft_provisioning_completed = $true
+        upload_blocked = $true
+    }
+
+    return @{
+        Complete = $true
+        Failed = $false
+        Blocked = $true
+        History = $history
+        UploadActionId = $UploadActionId
+    }
+}
+
 function Resolve-MicrosoftProvisioningUploadState {
     param(
         [object]$DomainRecord,
@@ -1057,11 +1110,16 @@ function Resolve-MicrosoftProvisioningUploadState {
     if (-not $uploadActionResult.Success) {
         $reason = $uploadActionResult.Reason
         $interimStatus = if ($uploadActionResult.Blocked) { "Both - Sending Tool Upload Blocked" } else { "Both - Sending Tool Upload Failed" }
-        $history = Add-HistoryEntry -History $History -Entry "UPLOAD BLOCKED: $reason"
-        Update-Domain -DomainId $domainId -Fields @{ status = "in_progress"; interim_status = $interimStatus; action_history = $history }
-        Update-ActionStatus -ActionId $ActionId -Status "failed" -Error "Sending-tool upload blocked: $reason"
-        Add-ActionLog -ActionId $ActionId -DomainId $domainId -CustomerId $customerId -EventType "sending_tool_upload_blocked" -Severity "error" -Message $reason -Metadata @{ expected_active_inboxes = $expectedActiveCount }
-        return @{ Complete = $false; Failed = $true; History = $history }
+        return Complete-ProvisionActionWithUploadBlocker `
+            -DomainRecord $DomainRecord `
+            -ActionId $ActionId `
+            -History $History `
+            -Reason $reason `
+            -InterimStatus $interimStatus `
+            -EventType "sending_tool_upload_blocked" `
+            -Severity "warn" `
+            -ExpectedActiveInboxCount $expectedActiveCount `
+            -ActualMailboxCount $ActualMailboxCount
     }
 
     $uploadAction = $uploadActionResult.UploadAction
@@ -1090,11 +1148,17 @@ function Resolve-MicrosoftProvisioningUploadState {
 
     if ($validation.Failed) {
         $reason = $validation.Reason
-        $history = Add-HistoryEntry -History $History -Entry "UPLOAD FAILED: $reason"
-        Update-Domain -DomainId $domainId -Fields @{ status = "in_progress"; interim_status = "Both - Sending Tool Upload Failed"; action_history = $history }
-        Update-ActionStatus -ActionId $ActionId -Status "failed" -Error "Sending-tool upload validation failed: $reason"
-        Add-ActionLog -ActionId $ActionId -DomainId $domainId -CustomerId $customerId -EventType "sending_tool_upload_failed" -Severity "error" -Message $reason -Metadata @{ upload_action_id = $uploadActionId; expected_active_inboxes = $expectedActiveCount }
-        return @{ Complete = $false; Failed = $true; History = $history; UploadActionId = $uploadActionId }
+        return Complete-ProvisionActionWithUploadBlocker `
+            -DomainRecord $DomainRecord `
+            -ActionId $ActionId `
+            -History $History `
+            -Reason $reason `
+            -InterimStatus "Both - Sending Tool Upload Failed" `
+            -EventType "sending_tool_upload_failed" `
+            -Severity "error" `
+            -ExpectedActiveInboxCount $expectedActiveCount `
+            -ActualMailboxCount $ActualMailboxCount `
+            -UploadActionId $uploadActionId
     }
 
     # The upload worker finalizes this provision action directly when Instantly
@@ -2730,7 +2794,11 @@ function Process-MicrosoftDomain {
             $history = $uploadState.History
 
             if ($uploadState.Complete) {
-                Write-Host "  [COMPLETE] $Domain - $actualCount $MailboxLabel, upload validated" -ForegroundColor Green
+                if ($uploadState.Blocked) {
+                    Write-Host "  [UPLOAD BLOCKED] $Domain - $actualCount $MailboxLabel created, upload needs ops attention" -ForegroundColor Yellow
+                } else {
+                    Write-Host "  [COMPLETE] $Domain - $actualCount $MailboxLabel, upload validated" -ForegroundColor Green
+                }
             } elseif ($uploadState.Pending) {
                 Write-Host "  [UPLOAD PENDING] $Domain - $actualCount $MailboxLabel, waiting for upload action $($uploadState.UploadActionId)" -ForegroundColor Yellow
             } else {
