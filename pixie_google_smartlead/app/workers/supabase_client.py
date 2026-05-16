@@ -897,12 +897,13 @@ class SupabaseRestClient:
         assignments = self._request(
             "GET",
             "domain_credentials",
-            params={"select": "*", "domain_id": f"eq.{domain_id}"},
+            params={"select": "*", "domain_id": f"eq.{domain_id}", "order": "created_at.desc"},
         )
         if not assignments:
             return []
 
         bundles: List[Dict[str, Any]] = []
+        seen_tools = set()
         for assignment in assignments:
             credential_id = assignment.get("credential_id")
             if not credential_id:
@@ -928,7 +929,12 @@ class SupabaseRestClient:
                 if tool_rows:
                     slug = tool_rows[0].get("slug")
 
-            bundles.append({"slug": slug, "credential": credential})
+            tool_key = str(slug or credential_id).strip().lower()
+            if tool_key in seen_tools:
+                continue
+            seen_tools.add(tool_key)
+
+            bundles.append({"slug": slug, "credential": credential, "assignment": assignment})
 
         return bundles
 

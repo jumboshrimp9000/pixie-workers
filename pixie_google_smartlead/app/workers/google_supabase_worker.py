@@ -53,11 +53,30 @@ INTERIM_STATUSES = {
 
 DEFAULT_SMARTLEAD_APP_ID = "1021517043376-ipe8289dof3t2v9apjpae8hs2q9abetp.apps.googleusercontent.com"
 DEFAULT_INSTANTLY_APP_ID = "536726988839-pt93oro4685dtb1emb0pp2vjgjol5mls.apps.googleusercontent.com"
+DEFAULT_REACH_INBOXES_APP_ID = "549360251880-maeh4okn7btu9cjtf0l2bt1t5b22sbf8.apps.googleusercontent.com"
 OPTIONAL_GOOGLE_APP_IDS = {
     "master_inbox": "563322621692-2vfek77q0f6trjlt3afr7ag6cf0pvfeh.apps.googleusercontent.com",
     "warmy": "964878161904-5uqi9bsrj16frjku01ep27qs0504ujjr.apps.googleusercontent.com",
     "plusvibe": "915060167262-mt46cccq569tgg2rb5qk375pf95obh6e.apps.googleusercontent.com",
 }
+SENDING_TOOL_DEFAULT_GOOGLE_APP_IDS = {
+    "instantly.ai": DEFAULT_INSTANTLY_APP_ID,
+    "smartlead.ai": DEFAULT_SMARTLEAD_APP_ID,
+    "plusvibe": OPTIONAL_GOOGLE_APP_IDS["plusvibe"],
+    "reach-inboxes": DEFAULT_REACH_INBOXES_APP_ID,
+}
+GOOGLE_APP_ID_FIELD_KEYS = (
+    "google_app_id",
+    "googleAppId",
+    "google_oauth_client_id",
+    "googleOauthClientId",
+    "oauth_client_id",
+    "app_id",
+    "appId",
+    "email_bison_app_id",
+    "bison_google_workspace_custom_app_id",
+    "reach_inboxes_app_id",
+)
 LIVE_STATUSES = {"pending", "provisioning", "active"}
 FREE_GOOGLE_PROMO_BILLING_TYPE = "free_inboxes_promo"
 
@@ -720,9 +739,24 @@ class GoogleSupabaseWorker:
                 log_event("step_completed", "info", f"[add_dns_records] DNS write completed for {domain_name}", step)
 
             create_users_checkpoint = checkpoint("create_users")
-            user_updates = self._build_inbox_updates(domain_name, inboxes, partnerhub_users, payload)
             if create_users_checkpoint:
-                reconciled = self._apply_inbox_updates(inboxes, user_updates)
+                checkpoint_admin_id = ""
+                if last_step_status.get("resolve_admin_login") == "completed":
+                    checkpoint_admin_id = str(
+                        (last_step_details.get("resolve_admin_login") or {}).get("admin_inbox_id") or ""
+                    ).strip()
+                if not checkpoint_admin_id:
+                    checkpoint_admin_id = str(create_users_checkpoint.get("admin_inbox_id") or "").strip()
+
+                if checkpoint_admin_id:
+                    user_updates = self._build_current_inbox_updates(domain_name, inboxes, checkpoint_admin_id)
+                    reconciled = self._apply_checkpoint_admin_role(inboxes, checkpoint_admin_id)
+                    if not bool(reconciled.get("admin_found")):
+                        user_updates = self._build_inbox_updates(domain_name, inboxes, partnerhub_users, payload)
+                        reconciled = self._apply_inbox_updates(inboxes, user_updates)
+                else:
+                    user_updates = self._build_inbox_updates(domain_name, inboxes, partnerhub_users, payload)
+                    reconciled = self._apply_inbox_updates(inboxes, user_updates)
                 log_event(
                     "step_info",
                     "info",
@@ -731,6 +765,7 @@ class GoogleSupabaseWorker:
                 )
                 persist_progress(INTERIM_STATUSES["USERS_CREATED"], "in_progress")
             else:
+                user_updates = self._build_inbox_updates(domain_name, inboxes, partnerhub_users, payload)
                 step = start_step("create_users")
                 update_summary = self._apply_inbox_updates(inboxes, user_updates)
                 complete_step(step, update_summary)
@@ -740,33 +775,55 @@ class GoogleSupabaseWorker:
             if admin_checkpoint:
                 rows = self.client.get_domain_inboxes_all(domain_id)
                 live_rows = [row for row in rows if str(row.get("status") or "").lower() in LIVE_STATUSES]
-                admin_candidates = [
-                    row
-                    for row in live_rows
-                    if bool(row.get("is_admin"))
-                    and str(row.get("email") or "").strip()
-                    and str(row.get("password") or "").strip()
-                ]
-                if admin_candidates:
-                    admin_row = sorted(
-                        admin_candidates,
-                        key=lambda r: (str(r.get("created_at") or ""), str(r.get("id") or "")),
-                    )[0]
-                    admin_inbox_id = str(admin_row.get("id") or "").strip()
-                    checkpoint_admin_id = str(admin_checkpoint.get("admin_inbox_id") or "").strip()
-                    if checkpoint_admin_id and checkpoint_admin_id != admin_inbox_id:
+                checkpoint_admin_id = str(admin_checkpoint.get("admin_inbox_id") or "").strip()
+                checkpoint_admin_row = next(
+                    (row for row in live_rows if str(row.get("id") or "").strip() == checkpoint_admin_id),
+                    None,
+                )
+                if (
+                    checkpoint_admin_row
+                    and str(checkpoint_admin_row.get("email") or "").strip()
+                    and str(checkpoint_admin_row.get("password") or "").strip()
+                ):
+                    admin_inbox_id = checkpoint_admin_id
+                    role_sync = self._apply_checkpoint_admin_role(live_rows, checkpoint_admin_id)
+                    if int(role_sync.get("updated") or 0) > 0:
                         log_event(
                             "step_info",
                             "info",
-                            f"[resolve_admin_login] Refreshed admin inbox from current Google order state for {domain_name}",
+                            f"[resolve_admin_login] Restored checkpointed admin inbox for {domain_name}",
                             {
-                                "checkpoint_admin_inbox_id": checkpoint_admin_id,
-                                "current_admin_inbox_id": admin_inbox_id,
-                                "current_admin_email": str(admin_row.get("email") or "").strip().lower(),
+                                **role_sync,
+                                "admin_email": str(checkpoint_admin_row.get("email") or "").strip().lower(),
                             },
                         )
                 else:
-                    admin_inbox_id = str(admin_checkpoint.get("admin_inbox_id") or "").strip()
+                    admin_candidates = [
+                        row
+                        for row in live_rows
+                        if bool(row.get("is_admin"))
+                        and str(row.get("email") or "").strip()
+                        and str(row.get("password") or "").strip()
+                    ]
+                    if admin_candidates:
+                        admin_row = sorted(
+                            admin_candidates,
+                            key=lambda r: (str(r.get("created_at") or ""), str(r.get("id") or "")),
+                        )[0]
+                        admin_inbox_id = str(admin_row.get("id") or "").strip()
+                        if checkpoint_admin_id and checkpoint_admin_id != admin_inbox_id:
+                            log_event(
+                                "step_warning",
+                                "warn",
+                                f"[resolve_admin_login] Checkpoint admin was unavailable; using current admin inbox for {domain_name}",
+                                {
+                                    "checkpoint_admin_inbox_id": checkpoint_admin_id,
+                                    "current_admin_inbox_id": admin_inbox_id,
+                                    "current_admin_email": str(admin_row.get("email") or "").strip().lower(),
+                                },
+                            )
+                    else:
+                        admin_inbox_id = checkpoint_admin_id
             else:
                 step = start_step("resolve_admin_login")
                 rows = self.client.get_domain_inboxes_all(domain_id)
@@ -843,7 +900,7 @@ class GoogleSupabaseWorker:
             app_config_checkpoint = checkpoint("configure_admin_apps")
             dkim_checkpoint = checkpoint("enable_dkim")
             profile_photo_checkpoint = checkpoint("upload_profile_photos")
-            app_plan = self._resolve_google_admin_app_ids(payload)
+            app_plan = self._resolve_google_admin_app_ids(payload, domain_id=domain_id)
             if app_config_checkpoint and not self._admin_apps_checkpoint_satisfies_plan(app_config_checkpoint, app_plan):
                 log_event(
                     "step_warning",
@@ -1882,6 +1939,74 @@ class GoogleSupabaseWorker:
             }
         return updates
 
+    def _build_current_inbox_updates(
+        self,
+        domain_name: str,
+        inboxes: List[Dict[str, Any]],
+        admin_inbox_id: str,
+    ) -> Dict[str, Dict[str, Any]]:
+        updates: Dict[str, Dict[str, Any]] = {}
+        clean_admin_id = str(admin_inbox_id or "").strip()
+        for index, inbox in enumerate(inboxes):
+            inbox_id = str(inbox.get("id") or "").strip()
+            if not inbox_id:
+                continue
+            username = str(inbox.get("username") or f"user{index + 1}").strip().lower()
+            email = str(inbox.get("email") or f"{username}@{domain_name}").strip().lower()
+            updates[inbox_id] = {
+                "email": email,
+                "password": str(inbox.get("password") or "").strip(),
+                "is_admin": inbox_id == clean_admin_id,
+            }
+        return updates
+
+    def _apply_checkpoint_admin_role(
+        self,
+        inboxes: List[Dict[str, Any]],
+        admin_inbox_id: str,
+    ) -> Dict[str, Any]:
+        clean_admin_id = str(admin_inbox_id or "").strip()
+        if not clean_admin_id:
+            return {"updated": 0, "total": len(inboxes), "admin_inbox_id": "", "admin_found": False}
+
+        inbox_ids = {str(row.get("id") or "").strip() for row in inboxes}
+        if clean_admin_id not in inbox_ids:
+            return {
+                "updated": 0,
+                "total": len(inboxes),
+                "admin_inbox_id": clean_admin_id,
+                "admin_found": False,
+            }
+
+        updated = 0
+        target_row: Optional[Dict[str, Any]] = None
+
+        for inbox in inboxes:
+            inbox_id = str(inbox.get("id") or "").strip()
+            if not inbox_id:
+                continue
+            if inbox_id == clean_admin_id:
+                target_row = inbox
+                continue
+            if not bool(inbox.get("is_admin")):
+                continue
+            self.client.update_inbox(inbox_id, {"is_admin": False})
+            inbox["is_admin"] = False
+            updated += 1
+
+        if target_row is not None and not bool(target_row.get("is_admin")):
+            self.client.update_inbox(clean_admin_id, {"is_admin": True})
+            target_row["is_admin"] = True
+            updated += 1
+
+        return {
+            "updated": updated,
+            "total": len(inboxes),
+            "admin_inbox_id": clean_admin_id,
+            "admin_found": True,
+            "preserved_checkpoint_admin": True,
+        }
+
     def _apply_inbox_updates(
         self,
         inboxes: List[Dict[str, Any]],
@@ -2014,7 +2139,7 @@ class GoogleSupabaseWorker:
 
         return parsed
 
-    def _resolve_google_admin_app_ids(self, payload: Dict[str, Any]) -> Dict[str, List[str]]:
+    def _resolve_google_admin_app_ids(self, payload: Dict[str, Any], *, domain_id: str = "") -> Dict[str, List[str]]:
         required = [v for v in self.required_google_app_ids if self._is_valid_google_app_id(v)]
         optional: List[str] = []
         invalid: List[str] = []
@@ -2063,6 +2188,12 @@ class GoogleSupabaseWorker:
             else:
                 invalid.append(entry)
 
+        for entry in self._google_admin_app_ids_from_domain_credentials(domain_id):
+            if self._is_valid_google_app_id(entry):
+                required.append(entry)
+            else:
+                invalid.append(entry)
+
         merged: List[str] = []
         seen = set()
         for candidate in required + optional:
@@ -2072,12 +2203,53 @@ class GoogleSupabaseWorker:
             seen.add(clean)
             merged.append(clean)
 
+        required_unique: List[str] = []
+        required_seen = set()
+        for candidate in required:
+            clean = str(candidate or "").strip()
+            if clean and clean in seen and clean not in required_seen:
+                required_seen.add(clean)
+                required_unique.append(clean)
+        optional_unique: List[str] = []
+        optional_seen = set()
+        for candidate in optional:
+            clean = str(candidate or "").strip()
+            if clean and clean in seen and clean not in required_seen and clean not in optional_seen:
+                optional_seen.add(clean)
+                optional_unique.append(clean)
+
         return {
-            "required": [v for v in required if v in merged],
-            "optional": [v for v in optional if v in merged and v not in required],
+            "required": required_unique,
+            "optional": optional_unique,
             "invalid": sorted({v for v in invalid if v}),
             "all": merged,
         }
+
+    def _google_admin_app_ids_from_domain_credentials(self, domain_id: str) -> List[str]:
+        clean_domain_id = str(domain_id or "").strip()
+        if not clean_domain_id:
+            return []
+        try:
+            bundles = self.client.get_domain_tool_credentials_list(clean_domain_id)
+        except Exception as exc:
+            logger.warning("Could not load domain sending-tool credentials for Google app template: %s", exc)
+            return []
+
+        app_ids: List[str] = []
+        for bundle in bundles:
+            tool_slug = self._normalize_sending_tool_slug(str(bundle.get("slug") or ""))
+            credential = bundle.get("credential") if isinstance(bundle.get("credential"), dict) else {}
+            extra_fields = credential.get("extra_fields") if isinstance(credential.get("extra_fields"), dict) else {}
+            default_app_id = SENDING_TOOL_DEFAULT_GOOGLE_APP_IDS.get(tool_slug)
+            if default_app_id:
+                app_ids.append(default_app_id)
+            for source in (credential, extra_fields):
+                for key in GOOGLE_APP_ID_FIELD_KEYS:
+                    app_ids.extend(self._flatten_google_app_id_input(source.get(key)))
+                app_ids.extend(self._flatten_google_app_id_input(source.get("google_app_ids")))
+                app_ids.extend(self._flatten_google_app_id_input(source.get("admin_app_ids")))
+                app_ids.extend(self._flatten_google_app_id_input(source.get("additional_app_ids")))
+        return app_ids
 
     def _admin_apps_checkpoint_satisfies_plan(
         self,
@@ -2571,7 +2743,7 @@ class GoogleSupabaseWorker:
             credential = tool_bundle.get("credential") or {}
             if not tool_slug:
                 raise RuntimeError(f"Sending tool slug missing on credential for domain {domain_name}")
-            if tool_slug not in {"instantly.ai", "smartlead.ai", "amplemarket", "email-bison"}:
+            if tool_slug not in {"instantly.ai", "smartlead.ai", "amplemarket", "email-bison", "reach-inboxes"}:
                 raise RuntimeError(f"Automated upload not implemented for {tool_slug} on domain {domain_name}")
 
             api_key = str(credential.get("api_key") or "").strip()
@@ -2591,7 +2763,7 @@ class GoogleSupabaseWorker:
             if (
                 provider_name == "google"
                 and self.sending_tool_playwright_oauth
-                and tool_slug in {"instantly.ai", "smartlead.ai", "amplemarket", "email-bison"}
+                and tool_slug in {"instantly.ai", "smartlead.ai", "amplemarket", "email-bison", "reach-inboxes"}
             ):
                 try:
                     op_client = OnePasswordCliClient.from_env()
@@ -2793,6 +2965,8 @@ class GoogleSupabaseWorker:
             return "amplemarket"
         if "bison" in text:
             return "email-bison"
+        if "reach" in text:
+            return "reach-inboxes"
         if "master" in text:
             return "masterinbox.com"
         return text

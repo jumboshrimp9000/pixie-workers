@@ -228,6 +228,9 @@ For tracked username/name changes, status is also written into the inbox-mutatio
   - `bison_app_id` (string OAuth client ID; treated as required when present because Email Bison Google upload depends on it)
   - `additional_tools_id`, `additional_app_ids`, `google_app_ids`, or `admin_app_ids` (string or list of OAuth client IDs)
   - `master_inbox_enable`, `warmy_enable`/`warmy_enabled`, `plusvibe_enable`/`plusvibe_enabled` (boolean)
+  - assigned sending-tool credentials are also inspected for app IDs. Reach Inboxes contributes its default OAuth client ID automatically; Email Bison and other custom tools can carry `googleAppId`, `google_app_id`, `oauth_client_id`, `reach_inboxes_app_id`, or `email_bison_app_id` in `extra_fields`.
+
+Reach Inboxes Google upload uses the workspace API key to request `POST https://api.reachinbox.ai/api/v1/account/get-oauth-url` with `{ "type": "oauth" }`, completes the returned Google OAuth URL in an isolated Playwright context per inbox, then validates each mailbox with `GET /api/v1/account/all?contains={email}&status=all` plus `GET /api/v1/account/get-mailboxes/{email}` when available.
 
 Lifecycle payloads:
 

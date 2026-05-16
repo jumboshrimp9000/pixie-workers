@@ -9,6 +9,8 @@ import requests
 
 logger = logging.getLogger(__name__)
 
+REACH_INBOXES_API_BASE = "https://api.reachinbox.ai"
+
 
 class SendingToolUploader:
     def __init__(self, timeout_seconds: int = 25):
@@ -56,7 +58,7 @@ class SendingToolUploader:
         use_oauth_browser = (
             use_playwright_oauth
             and provider_name == "google"
-            and normalized_tool in {"instantly.ai", "smartlead.ai", "amplemarket", "email-bison"}
+            and normalized_tool in {"instantly.ai", "smartlead.ai", "amplemarket", "email-bison", "reach-inboxes"}
         )
         resolved_headless = self._as_bool(
             os.getenv("GOOGLE_PLAYWRIGHT_HEADLESS", "true"),
@@ -134,6 +136,30 @@ class SendingToolUploader:
                     {
                         "email": str(row.get("email") or "").strip().lower(),
                         "error": "Email Bison automated upload currently supports Google OAuth inboxes only",
+                    }
+                    for row in inboxes
+                    if str(row.get("email") or "").strip()
+                ],
+                "skipped_already_uploaded": 0,
+            }
+
+        if normalized_tool == "reach-inboxes":
+            if provider_name == "google" and use_playwright_oauth:
+                return self._upload_reach_inboxes_google_via_oauth(
+                    api_key=api_key,
+                    inboxes=inboxes,
+                    onepassword=onepassword,
+                    headless=resolved_headless,
+                    settings=self._normalize_settings(settings),
+                )
+            return {
+                "tool": "reach-inboxes",
+                "total_candidates": len(inboxes),
+                "uploaded_emails": [],
+                "failed_uploads": [
+                    {
+                        "email": str(row.get("email") or "").strip().lower(),
+                        "error": "Reach Inboxes automated upload currently supports Google OAuth inboxes only",
                     }
                     for row in inboxes
                     if str(row.get("email") or "").strip()
@@ -861,6 +887,167 @@ class SendingToolUploader:
         )
         return result
 
+    def _upload_reach_inboxes_google_via_oauth(
+        self,
+        *,
+        api_key: str,
+        inboxes: List[Dict[str, Any]],
+        onepassword: Any,
+        headless: bool,
+        settings: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        targets = [self._normalize_email(row.get("email")) for row in inboxes]
+        targets = [email for email in targets if email]
+        target_set = set(targets)
+        present: Set[str] = set()
+        provisional_errors: Dict[str, str] = {}
+        skipped_already_uploaded = 0
+
+        if not target_set:
+            return {
+                "tool": "reach-inboxes",
+                "total_candidates": 0,
+                "uploaded_emails": [],
+                "failed_uploads": [],
+                "skipped_already_uploaded": 0,
+            }
+        if not str(api_key or "").strip():
+            return self._failed_result("reach-inboxes", target_set, "Missing Reach Inboxes Workspace API key")
+
+        logger.info(
+            "[SendingToolUploader:ReachInboxes] Using API-generated Google OAuth upload for %s inbox(es) (headless=%s)",
+            len(target_set),
+            headless,
+        )
+
+        browser = None
+        playwright = None
+        try:
+            from playwright.sync_api import sync_playwright
+
+            playwright = sync_playwright().start()
+            browser = self._launch_playwright_browser(playwright, headless=headless)
+
+            total_inboxes = len(inboxes)
+            for index, inbox in enumerate(inboxes, start=1):
+                email = self._normalize_email(inbox.get("email"))
+                password = str(inbox.get("password") or "").strip()
+                otp_secret = str(inbox.get("otp_secret") or "").strip()
+                if not email:
+                    continue
+                if not password:
+                    provisional_errors[email] = "Missing inbox password"
+                    continue
+
+                started_at = time.time()
+                context = None
+                page = None
+                logger.info(
+                    "[SendingToolUploader:ReachInboxes] [%s/%s] Starting Google OAuth for %s",
+                    index,
+                    total_inboxes,
+                    email,
+                )
+                try:
+                    if self._check_reach_inboxes_account(api_key=api_key, email=email):
+                        present.add(email)
+                        skipped_already_uploaded += 1
+                        logger.info(
+                            "[SendingToolUploader:ReachInboxes] [%s/%s] Already connected: %s",
+                            index,
+                            total_inboxes,
+                            email,
+                        )
+                        continue
+
+                    context, page = self._create_oauth_context_page(browser)
+                    oauth_url = self._reach_inboxes_google_oauth_url(api_key)
+                    page.goto(oauth_url, wait_until="domcontentloaded", timeout=60_000)
+                    self._reach_inboxes_capture(page=page, email=email, label="oauth-started")
+                    self._complete_google_signin_and_consent(
+                        page=page,
+                        context=context,
+                        email=email,
+                        password=password,
+                        onepassword=onepassword,
+                        otp_secret=otp_secret,
+                    )
+                    try:
+                        page.wait_for_load_state("domcontentloaded", timeout=8_000)
+                    except Exception:
+                        pass
+                    self._reach_inboxes_capture(page=page, email=email, label="after-oauth-callback")
+
+                    if self._wait_for_reach_inboxes_account(api_key=api_key, email=email):
+                        present.add(email)
+                        logger.info(
+                            "[SendingToolUploader:ReachInboxes] [%s/%s] OAuth accepted for %s (%.1fs)",
+                            index,
+                            total_inboxes,
+                            email,
+                            time.time() - started_at,
+                        )
+                    else:
+                        provisional_errors[email] = "Reach Inboxes account not found after OAuth callback"
+                except Exception as exc:
+                    try:
+                        if page is not None:
+                            self._reach_inboxes_capture(page=page, email=email, label="failure")
+                    except Exception:
+                        pass
+                    provisional_errors[email] = str(exc)
+                    logger.warning(
+                        "[SendingToolUploader:ReachInboxes] [%s/%s] OAuth failed for %s (%.1fs): %s",
+                        index,
+                        total_inboxes,
+                        email,
+                        time.time() - started_at,
+                        exc,
+                    )
+                finally:
+                    self._close_oauth_context_page(context=context, page=page)
+        except Exception as exc:
+            message = f"Playwright Reach Inboxes Google OAuth upload failed: {exc}"
+            logger.warning("[SendingToolUploader:ReachInboxes] %s", message)
+            for email in target_set:
+                provisional_errors.setdefault(email, message)
+        finally:
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+            if playwright is not None:
+                try:
+                    playwright.stop()
+                except Exception:
+                    pass
+
+        attempts = max(1, int(os.getenv("REACH_INBOXES_VALIDATION_ATTEMPTS", "8")))
+        interval_seconds = max(1.0, float(os.getenv("REACH_INBOXES_VALIDATION_INTERVAL_MS", "5000")) / 1000.0)
+        concurrency = max(1, int(os.getenv("REACH_INBOXES_VALIDATION_CONCURRENCY", "6")))
+        validated = self._wait_for_account_presence(
+            targets=target_set,
+            attempts=attempts,
+            interval_seconds=interval_seconds,
+            checker=lambda email: self._check_reach_inboxes_account(api_key=api_key, email=email),
+            concurrency=concurrency,
+            tool_label="ReachInboxes",
+        )
+        present.update(validated)
+
+        result = self._build_result(
+            tool="reach-inboxes",
+            inboxes=inboxes,
+            present=present,
+            provisional_errors=provisional_errors,
+            missing_error_prefix="Reach Inboxes account not found after validation",
+            total_candidates=len(target_set),
+        )
+        result["skipped_already_uploaded"] = skipped_already_uploaded
+        result = self._apply_reach_inboxes_settings(api_key=api_key, result=result, settings=settings)
+        return result
+
     def _apply_email_bison_settings(
         self,
         *,
@@ -1429,6 +1616,271 @@ class SendingToolUploader:
         if settings.get("tag") or settings.get("tags"):
             labels.append("tags")
         return labels
+
+    def _apply_reach_inboxes_settings(
+        self,
+        *,
+        api_key: str,
+        result: Dict[str, Any],
+        settings: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        uploaded = [
+            self._normalize_email(email)
+            for email in (result.get("uploaded_emails") or [])
+            if self._normalize_email(email)
+        ]
+        if not uploaded:
+            return result
+        if not self._has_reach_inboxes_settings_to_apply(settings):
+            result["settings_required"] = False
+            result["settings_skipped"] = True
+            return result
+
+        result["settings_required"] = True
+        account_by_email: Dict[str, Dict[str, Any]] = {}
+        failed = list(result.get("failed_uploads") or [])
+        failed_emails: Set[str] = set()
+        for email in uploaded:
+            try:
+                account = self._fetch_reach_inboxes_account(api_key=api_key, email=email)
+                if not account:
+                    failed.append({"email": email, "error": "Reach Inboxes account was not found after OAuth upload"})
+                    failed_emails.add(email)
+                    continue
+                account_by_email[email] = account
+            except Exception as exc:
+                failed.append({"email": email, "error": f"Reach Inboxes account lookup failed: {exc}"})
+                failed_emails.add(email)
+
+        setting_failures = self._patch_reach_inboxes_settings(
+            api_key=api_key,
+            account_by_email=account_by_email,
+            settings=settings,
+        )
+        for email, error in setting_failures.items():
+            failed.append({"email": email, "error": error})
+            failed_emails.add(email)
+
+        result["failed_uploads"] = failed
+        result["uploaded_emails"] = [email for email in uploaded if email not in failed_emails]
+        result["settings_validated"] = not failed_emails and len(account_by_email) == len(uploaded)
+        if result["settings_validated"]:
+            result["applied_settings"] = self._reach_inboxes_applied_settings_summary(settings)
+        return result
+
+    def _patch_reach_inboxes_settings(
+        self,
+        *,
+        api_key: str,
+        account_by_email: Dict[str, Dict[str, Any]],
+        settings: Dict[str, Any],
+    ) -> Dict[str, str]:
+        if not account_by_email:
+            return {}
+
+        failures: Dict[str, str] = {}
+        ids_by_email: Dict[str, int] = {}
+        for email, account in account_by_email.items():
+            try:
+                account_id = int(account.get("id") or 0)
+            except Exception:
+                account_id = 0
+            if account_id <= 0:
+                failures[email] = "Reach Inboxes account ID was missing from the API response"
+                continue
+            ids_by_email[email] = account_id
+
+        ids = list(ids_by_email.values())
+        if not ids:
+            return failures
+
+        update_payload: Dict[str, Any] = {"id": ids, "exclude": []}
+        if settings.get("dailyLimit") is not None:
+            update_payload["limits"] = int(settings["dailyLimit"])
+        if settings.get("sendingGap") is not None:
+            update_payload["minimumDelayBetweenCampaignEmails"] = int(settings["sendingGap"])
+        if settings.get("signature"):
+            update_payload["signature"] = str(settings.get("signature") or "")
+        if settings.get("tag"):
+            update_payload["warmupTag"] = str(settings.get("tag") or "").strip()
+        if settings.get("enableSlowRamp") is not None:
+            update_payload["warmupDisableSlow"] = not bool(settings.get("enableSlowRamp"))
+        if settings.get("bisonWarmupDailyLimit") is not None:
+            update_payload["warmupLimit"] = int(settings["bisonWarmupDailyLimit"])
+
+        headers = self._reach_inboxes_headers(api_key)
+        try:
+            if len(update_payload) > 2:
+                response = requests.post(
+                    f"{REACH_INBOXES_API_BASE}/api/v1/account/update-account",
+                    headers=headers,
+                    json=update_payload,
+                    timeout=self.timeout_seconds,
+                )
+                response.raise_for_status()
+        except Exception as exc:
+            for email in ids_by_email:
+                failures.setdefault(email, f"Reach Inboxes settings update failed: {exc}")
+
+        if settings.get("enableWarmup") is not None:
+            warmup_url = "enable" if settings.get("enableWarmup") else "pause"
+            try:
+                response = requests.post(
+                    f"{REACH_INBOXES_API_BASE}/api/v1/account/warmup/{warmup_url}",
+                    headers=headers,
+                    json={"ids": ids, "exclude": []},
+                    timeout=self.timeout_seconds,
+                )
+                response.raise_for_status()
+            except Exception as exc:
+                for email in ids_by_email:
+                    failures.setdefault(email, f"Reach Inboxes warmup update failed: {exc}")
+
+        return failures
+
+    @staticmethod
+    def _has_reach_inboxes_settings_to_apply(settings: Dict[str, Any]) -> bool:
+        if not settings.get("applyRequested"):
+            return False
+        return any(
+            [
+                settings.get("dailyLimit") is not None,
+                settings.get("sendingGap") is not None,
+                settings.get("enableWarmup") is not None,
+                settings.get("enableSlowRamp") is not None,
+                settings.get("bisonWarmupDailyLimit") is not None,
+                bool(settings.get("signature")),
+                bool(settings.get("tag")),
+            ]
+        )
+
+    @staticmethod
+    def _reach_inboxes_applied_settings_summary(settings: Dict[str, Any]) -> List[str]:
+        labels: List[str] = []
+        if settings.get("dailyLimit") is not None:
+            labels.append("dailyLimit")
+        if settings.get("sendingGap") is not None:
+            labels.append("sendingGap")
+        if settings.get("enableWarmup") is not None:
+            labels.append("warmup")
+        if settings.get("signature"):
+            labels.append("signature")
+        if settings.get("tag"):
+            labels.append("warmupTag")
+        return labels
+
+    def _reach_inboxes_google_oauth_url(self, api_key: str) -> str:
+        response = requests.post(
+            f"{REACH_INBOXES_API_BASE}/api/v1/account/get-oauth-url",
+            headers=self._reach_inboxes_headers(api_key),
+            json={"type": "oauth"},
+            timeout=self.timeout_seconds,
+        )
+        response.raise_for_status()
+        payload = self._json_or_empty(response)
+        redirect_url = str(
+            (payload.get("redirectUrl") if isinstance(payload, dict) else "")
+            or ((payload.get("data") or {}).get("redirectUrl") if isinstance(payload, dict) and isinstance(payload.get("data"), dict) else "")
+            or ""
+        ).strip()
+        if not redirect_url:
+            raise RuntimeError("Reach Inboxes OAuth URL response did not include redirectUrl")
+        return redirect_url
+
+    def _wait_for_reach_inboxes_account(self, *, api_key: str, email: str) -> bool:
+        attempts = max(1, int(os.getenv("REACH_INBOXES_CALLBACK_VALIDATION_ATTEMPTS", "6")))
+        interval_seconds = max(1.0, float(os.getenv("REACH_INBOXES_CALLBACK_VALIDATION_INTERVAL_MS", "3000")) / 1000.0)
+        for attempt in range(1, attempts + 1):
+            if self._check_reach_inboxes_account(api_key=api_key, email=email):
+                return True
+            if attempt < attempts:
+                time.sleep(interval_seconds)
+        return False
+
+    def _check_reach_inboxes_account(self, *, api_key: str, email: str) -> bool:
+        account = self._fetch_reach_inboxes_account(api_key=api_key, email=email)
+        if not account:
+            return False
+        if str(account.get("isDisconnected") or "").strip().lower() in {"true", "1", "yes"}:
+            return False
+        if str(account.get("error") or "").strip().lower() in {"true", "1", "yes"}:
+            return False
+        try:
+            response = requests.get(
+                f"{REACH_INBOXES_API_BASE}/api/v1/account/get-mailboxes/{requests.utils.quote(self._normalize_email(email), safe='')}",
+                headers=self._reach_inboxes_headers(api_key),
+                timeout=self.timeout_seconds,
+            )
+            if response.ok:
+                return True
+            logger.warning(
+                "[SendingToolUploader:ReachInboxes] Mailbox detail validation failed for %s (status=%s): %s",
+                email,
+                response.status_code,
+                self._response_error(response),
+            )
+        except Exception as exc:
+            logger.warning("[SendingToolUploader:ReachInboxes] Mailbox detail validation failed for %s: %s", email, exc)
+        return str(account.get("statusConnection") or "").strip() in {"100", "connected", "success"} or not str(account.get("statusConnection") or "").strip()
+
+    def _fetch_reach_inboxes_account(self, *, api_key: str, email: str) -> Optional[Dict[str, Any]]:
+        normalized = self._normalize_email(email)
+        if not normalized:
+            return None
+        response = requests.get(
+            f"{REACH_INBOXES_API_BASE}/api/v1/account/all",
+            headers=self._reach_inboxes_headers(api_key),
+            params={
+                "contains": normalized,
+                "status": "all",
+                "limit": 10,
+                "offset": 0,
+                "sortField": "createdAt",
+                "order": "DESC",
+            },
+            timeout=self.timeout_seconds,
+        )
+        response.raise_for_status()
+        payload = self._json_or_empty(response)
+        rows: List[Any] = []
+        if isinstance(payload, dict):
+            data = payload.get("data")
+            if isinstance(data, dict) and isinstance(data.get("emailsConnected"), list):
+                rows = data.get("emailsConnected") or []
+            elif isinstance(payload.get("emailsConnected"), list):
+                rows = payload.get("emailsConnected") or []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            row_email = self._normalize_email(row.get("email") or row.get("from_email") or row.get("username"))
+            if row_email == normalized:
+                return row
+        return None
+
+    def _reach_inboxes_capture(self, *, page: Any, email: str, label: str) -> None:
+        debug_dir = str(os.getenv("REACH_INBOXES_DEBUG_DIR") or "/tmp/reach-inboxes-uploader").strip()
+        if not debug_dir:
+            return
+        safe_email = re.sub(r"[^a-z0-9_.@-]+", "_", self._normalize_email(email), flags=re.I).strip("_") or "unknown"
+        safe_label = re.sub(r"[^a-z0-9_.-]+", "_", str(label or "checkpoint"), flags=re.I).strip("_")
+        timestamp = time.strftime("%Y%m%d%H%M%S")
+        folder = os.path.join(debug_dir, safe_email)
+        try:
+            os.makedirs(folder, exist_ok=True)
+            page.screenshot(path=os.path.join(folder, f"{timestamp}-{safe_label}.png"), full_page=True)
+            with open(os.path.join(folder, f"{timestamp}-{safe_label}.txt"), "w", encoding="utf-8") as handle:
+                handle.write(f"url={str(getattr(page, 'url', '') or '')}\n\n")
+                handle.write(self._safe_body_excerpt(page, limit=30_000))
+        except Exception:
+            pass
+
+    @staticmethod
+    def _reach_inboxes_headers(api_key: str) -> Dict[str, str]:
+        return {
+            "Authorization": f"Bearer {str(api_key or '').strip()}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
 
     def _upload_amplemarket(
         self,
@@ -3505,6 +3957,8 @@ class SendingToolUploader:
             "smartlead.ai/oauth",
             "sender-email-connect/google-callback",
             "sender-emails",
+            "app.reachinbox.ai",
+            "reachinbox.ai",
         ]
         return any(marker in actual_page for marker in callback_markers)
 
@@ -4132,6 +4586,8 @@ class SendingToolUploader:
             return "amplemarket"
         if "bison" in text:
             return "email-bison"
+        if "reach" in text:
+            return "reach-inboxes"
         return text
 
     @staticmethod

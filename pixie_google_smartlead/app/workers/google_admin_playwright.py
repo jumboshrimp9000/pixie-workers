@@ -109,7 +109,9 @@ class GoogleAdminPlaywrightClient:
         self.page: Optional[Page] = None
 
     def __enter__(self) -> "GoogleAdminPlaywrightClient":
+        logger.info("Google Playwright bootstrap: starting Playwright driver")
         self._playwright = sync_playwright().start()
+        logger.info("Google Playwright bootstrap: Playwright driver started")
         launch_kwargs: Dict[str, Any] = {"headless": self.headless}
         if self.slow_mo_ms:
             launch_kwargs["slow_mo"] = self.slow_mo_ms
@@ -123,9 +125,21 @@ class GoogleAdminPlaywrightClient:
         launch_kwargs["args"].extend([
             "--disable-blink-features=AutomationControlled",
         ])
+        launch_kwargs["timeout"] = max(
+            10_000,
+            int(os.getenv("GOOGLE_PLAYWRIGHT_LAUNCH_TIMEOUT_MS", "45_000")),
+        )
 
+        logger.info(
+            "Google Playwright bootstrap: launching Chromium (headless=%s, channel=%s, executable_path_set=%s)",
+            self.headless,
+            self.playwright_channel or "chromium-default",
+            bool(self.chromium_executable_path),
+        )
         self.browser = self._playwright.chromium.launch(**launch_kwargs)
+        logger.info("Google Playwright bootstrap: Chromium launched")
         self._create_context_and_page()
+        logger.info("Google Playwright bootstrap: browser context and page ready")
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -148,6 +162,7 @@ class GoogleAdminPlaywrightClient:
 
     def _create_context_and_page(self) -> None:
         browser = self._require_browser()
+        logger.info("Google Playwright bootstrap: creating fresh browser context")
         self.context = browser.new_context(
             viewport={"width": 1920, "height": 1080},
             locale="en-US",
@@ -156,6 +171,7 @@ class GoogleAdminPlaywrightClient:
         self.context.add_init_script(
             "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
         )
+        logger.info("Google Playwright bootstrap: creating fresh page")
         self.page = self.context.new_page()
         self.page.set_default_timeout(self.timeout_ms)
         self.page.set_default_navigation_timeout(max(self.timeout_ms, 60_000))
@@ -190,6 +206,12 @@ class GoogleAdminPlaywrightClient:
         last_error: Optional[Exception] = None
         for attempt in range(1, self.admin_login_attempts + 1):
             try:
+                logger.info(
+                    "Google Admin login attempt %d/%d starting for %s",
+                    attempt,
+                    self.admin_login_attempts,
+                    admin_email,
+                )
                 if attempt > 1:
                     logger.warning(
                         "Retrying Google Admin login for %s (attempt %d/%d)",
@@ -200,8 +222,12 @@ class GoogleAdminPlaywrightClient:
                     self._reset_session()
                     time.sleep(min(120.0, self.admin_login_retry_seconds * (attempt - 1)))
 
+                logger.info("Google Admin login attempt %d: starting Google account sign-in for %s", attempt, admin_email)
                 self._login_google_account(admin_email, admin_password, onepassword=onepassword)
+                logger.info("Google Admin login attempt %d: Google account sign-in returned for %s", attempt, admin_email)
+                logger.info("Google Admin login attempt %d: opening Admin console for %s", attempt, admin_email)
                 self._open_admin_home_page()
+                logger.info("Google Admin login attempt %d: Admin console ready for %s", attempt, admin_email)
                 return
             except GoogleSignInChallengeBlocked as exc:
                 message = str(exc)
@@ -2517,23 +2543,31 @@ class GoogleAdminPlaywrightClient:
         signin_url = "https://accounts.google.com/signin/v2/identifier"
         if clean_email:
             signin_url = f"{signin_url}?Email={quote(clean_email)}"
+        logger.info("Google sign-in: navigating to identifier page for %s", clean_email or email)
         self._goto(signin_url)
+        logger.info("Google sign-in: identifier page loaded for %s url=%s", clean_email or email, self._safe_url())
         time.sleep(1)
+        logger.info("Google sign-in: completing sign-in flow for %s", clean_email or email)
         self._complete_google_signin_flow(
             email=clean_email or email,
             password=password,
             onepassword=onepassword,
             context="login",
         )
+        logger.info("Google sign-in: sign-in flow returned for %s url=%s", clean_email or email, self._safe_url())
         self._dismiss_sign_in_to_chrome_prompt_if_present()
+        logger.info("Google sign-in: draining interstitials for %s", clean_email or email)
         self._drain_google_login_interstitials(clean_email or email, onepassword)
+        logger.info("Google sign-in: interstitial drain returned for %s url=%s", clean_email or email, self._safe_url())
         if verify_profile:
+            logger.info("Google sign-in: verifying profile for %s", clean_email or email)
             self._ensure_expected_google_profile(
                 clean_email or email,
                 password,
                 onepassword=onepassword,
                 context="login",
             )
+            logger.info("Google sign-in: profile verified for %s", clean_email or email)
 
     def _drain_google_login_interstitials(
         self,
@@ -2659,33 +2693,52 @@ class GoogleAdminPlaywrightClient:
         ]
 
         for _ in range(10):
+            loop_index = _ + 1
             self._raise_if_google_signin_rejected(email=email)
-            if self._handle_google_signin_interstitials_once(email, onepassword):
-                time.sleep(1.0)
-                continue
             self._raise_if_google_signin_challenge_blocked(email=email, context=context)
             if not self._has_google_sign_in_prompt():
+                logger.info("Google sign-in[%s] loop %d no sign-in prompt url=%s", context, loop_index, self._safe_url())
                 return
 
             # Google changes routing frequently; classify by visible controls, not URL.
             # Keep this order aligned with the worker policy so an account chooser can
             # never steal focus before a password or TOTP challenge is handled.
             if self._exists(totp_selectors, timeout_ms=1_500):
+                logger.info("Google sign-in[%s] loop %d handling TOTP for %s url=%s", context, loop_index, email, self._safe_url())
                 self._maybe_complete_totp_challenge(email, onepassword)
                 time.sleep(0.8)
                 continue
 
             if self._exists(password_selectors, timeout_ms=2_500):
+                logger.info(
+                    "Google sign-in[%s] loop %d filling password for %s expected_length=%d url=%s",
+                    context,
+                    loop_index,
+                    email,
+                    len(str(password or "")),
+                    self._safe_url(),
+                )
                 self._fill_any(password_selectors, password, timeout_ms=22_000)
+                logger.info("Google sign-in[%s] loop %d password field filled for %s", context, loop_index, email)
                 self._click_google_action(
                     ["#passwordNext", "//*[@id='passwordNext']", "//span[text()='Next']"],
                     ["Next", "Continue"],
                     timeout_ms=10_000,
                 )
-                time.sleep(1.0)
+                logger.info("Google sign-in[%s] loop %d submitted password for %s url=%s", context, loop_index, email, self._safe_url())
+                time.sleep(1.8)
+                if self._google_password_empty_error_visible(password_selectors):
+                    debug = self._capture_debug_state(
+                        f"google_password_empty_after_submit_{context}_{self._slug(email)}"
+                    )
+                    raise RuntimeError(
+                        f"Google rejected the password submit for {email} as empty during {context}. "
+                        f"expected_password_length={len(str(password or ''))} {debug}"
+                    )
                 continue
 
             if self._exists(email_selectors, timeout_ms=2_500):
+                logger.info("Google sign-in[%s] loop %d filling email for %s url=%s", context, loop_index, email, self._safe_url())
                 self._fill_any(email_selectors, clean_email or email, timeout_ms=16_000)
                 self._click_google_action(
                     ["#identifierNext", "//*[@id='identifierNext']", "//span[text()='Next']"],
@@ -2706,6 +2759,7 @@ class GoogleAdminPlaywrightClient:
                 optional=True,
             )
             if try_password:
+                logger.info("Google sign-in[%s] loop %d clicked try another way for %s", context, loop_index, email)
                 time.sleep(0.8)
                 continue
 
@@ -2720,11 +2774,18 @@ class GoogleAdminPlaywrightClient:
                 optional=True,
             )
             if use_password:
+                logger.info("Google sign-in[%s] loop %d clicked use password for %s", context, loop_index, email)
                 time.sleep(0.8)
                 continue
 
             if self._handle_google_account_chooser(clean_email):
+                logger.info("Google sign-in[%s] loop %d handled account chooser for %s", context, loop_index, email)
                 time.sleep(0.8)
+                continue
+
+            if self._handle_google_signin_interstitials_once(email, onepassword):
+                logger.info("Google sign-in[%s] loop %d handled interstitial url=%s", context, loop_index, self._safe_url())
+                time.sleep(1.0)
                 continue
 
             time.sleep(0.8)
@@ -2926,6 +2987,30 @@ class GoogleAdminPlaywrightClient:
         if clicked:
             time.sleep(2)
             return True
+        return False
+
+    def _google_password_empty_error_visible(self, password_selectors: Iterable[str]) -> bool:
+        page = self._require_page()
+        for selector in password_selectors:
+            normalized = self._selector(selector)
+            locator = page.locator(normalized)
+            try:
+                count = min(locator.count(), 4)
+            except Exception:
+                count = 0
+            for idx in range(count):
+                candidate = locator.nth(idx)
+                try:
+                    if not candidate.is_visible():
+                        continue
+                    aria_invalid = str(candidate.get_attribute("aria-invalid") or "").strip().lower()
+                    current_value = str(candidate.input_value(timeout=1_000) or "")
+                    if aria_invalid == "true" and not current_value:
+                        text = self._visible_text_excerpt(limit=500).lower()
+                        if "enter your password" in text:
+                            return True
+                except Exception:
+                    continue
         return False
 
     def _accept_pending_terms_of_service_if_present(self) -> bool:
@@ -4033,6 +4118,7 @@ class GoogleAdminPlaywrightClient:
         value: str,
         timeout_ms: int = 20_000,
         optional: bool = False,
+        force_keyboard: bool = False,
     ) -> bool:
         page = self._require_page()
         options = list(selectors)
@@ -4071,12 +4157,9 @@ class GoogleAdminPlaywrightClient:
                             continue
 
                         candidate.scroll_into_view_if_needed(timeout=1_000)
+                        clean_value = str(value or "")
                         filled = False
-                        try:
-                            candidate.fill("")
-                            candidate.type(str(value or ""))
-                            filled = True
-                        except Exception:
+                        if force_keyboard:
                             try:
                                 candidate.click(timeout=min(per_selector_timeout, 1_500))
                             except Exception:
@@ -4085,22 +4168,49 @@ class GoogleAdminPlaywrightClient:
                                 except Exception:
                                     pass
                             try:
-                                candidate.fill("")
-                                candidate.type(str(value or ""))
+                                candidate.fill(clean_value)
                                 filled = True
                             except Exception:
                                 pass
+                        else:
+                            try:
+                                candidate.fill(clean_value)
+                                filled = True
+                            except Exception:
+                                try:
+                                    candidate.click(timeout=min(per_selector_timeout, 1_500))
+                                except Exception:
+                                    try:
+                                        candidate.click(timeout=min(per_selector_timeout, 1_500), force=True)
+                                    except Exception:
+                                        pass
+                                try:
+                                    candidate.fill(clean_value)
+                                    filled = True
+                                except Exception:
+                                    pass
                         if not filled:
                             candidate.evaluate(
-                                """([el, nextValue]) => {
-                                    el.focus();
-                                    el.value = '';
-                                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                                    el.value = nextValue;
-                                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                                }""",
-                                [str(value or "")],
+                                self._native_value_setter_script(),
+                                clean_value,
+                            )
+                            filled = True
+                        else:
+                            candidate.evaluate(self._native_value_setter_script(), clean_value)
+                        try:
+                            actual_value = candidate.input_value(timeout=min(per_selector_timeout, 2_000))
+                        except Exception:
+                            actual_value = candidate.evaluate("(el) => String(el.value || '')")
+                        if actual_value != clean_value:
+                            candidate.evaluate(self._native_value_setter_script(), clean_value)
+                            try:
+                                actual_value = candidate.input_value(timeout=min(per_selector_timeout, 2_000))
+                            except Exception:
+                                actual_value = candidate.evaluate("(el) => String(el.value || '')")
+                        if actual_value != clean_value:
+                            raise RuntimeError(
+                                f"Filled selector {normalized}[{idx}] but browser value length "
+                                f"{len(actual_value or '')} did not match expected length {len(clean_value)}"
                             )
                         return True
                     except Exception as cand_exc:
@@ -4110,6 +4220,33 @@ class GoogleAdminPlaywrightClient:
         if optional:
             return False
         raise RuntimeError(f"Unable to fill any selector {options} ({last_error})")
+
+    @staticmethod
+    def _native_value_setter_script() -> str:
+        return """(el, nextValue) => {
+            const value = String(nextValue ?? '');
+            el.focus();
+            const proto = el instanceof HTMLTextAreaElement
+                ? HTMLTextAreaElement.prototype
+                : HTMLInputElement.prototype;
+            const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+            if (descriptor && descriptor.set) {
+                descriptor.set.call(el, value);
+            } else {
+                el.value = value;
+            }
+            try {
+                el.dispatchEvent(new InputEvent('input', {
+                    bubbles: true,
+                    cancelable: true,
+                    inputType: 'insertText',
+                    data: value
+                }));
+            } catch (_) {
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+            }
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        }"""
 
     def _inner_text_any(
         self,

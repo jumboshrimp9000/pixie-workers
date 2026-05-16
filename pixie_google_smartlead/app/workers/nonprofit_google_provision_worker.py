@@ -47,11 +47,30 @@ INTERIM_STATUSES = {
 
 DEFAULT_SMARTLEAD_APP_ID = "1021517043376-ipe8289dof3t2v9apjpae8hs2q9abetp.apps.googleusercontent.com"
 DEFAULT_INSTANTLY_APP_ID = "536726988839-pt93oro4685dtb1emb0pp2vjgjol5mls.apps.googleusercontent.com"
+DEFAULT_REACH_INBOXES_APP_ID = "549360251880-maeh4okn7btu9cjtf0l2bt1t5b22sbf8.apps.googleusercontent.com"
 OPTIONAL_GOOGLE_APP_IDS = {
     "master_inbox": "563322621692-2vfek77q0f6trjlt3afr7ag6cf0pvfeh.apps.googleusercontent.com",
     "warmy": "964878161904-5uqi9bsrj16frjku01ep27qs0504ujjr.apps.googleusercontent.com",
     "plusvibe": "915060167262-mt46cccq569tgg2rb5qk375pf95obh6e.apps.googleusercontent.com",
 }
+SENDING_TOOL_DEFAULT_GOOGLE_APP_IDS = {
+    "instantly.ai": DEFAULT_INSTANTLY_APP_ID,
+    "smartlead.ai": DEFAULT_SMARTLEAD_APP_ID,
+    "plusvibe": OPTIONAL_GOOGLE_APP_IDS["plusvibe"],
+    "reach-inboxes": DEFAULT_REACH_INBOXES_APP_ID,
+}
+GOOGLE_APP_ID_FIELD_KEYS = (
+    "google_app_id",
+    "googleAppId",
+    "google_oauth_client_id",
+    "googleOauthClientId",
+    "oauth_client_id",
+    "app_id",
+    "appId",
+    "email_bison_app_id",
+    "bison_google_workspace_custom_app_id",
+    "reach_inboxes_app_id",
+)
 
 
 class DeferredNonprofitAction(RuntimeError):
@@ -305,7 +324,7 @@ class NonprofitGoogleProvisionWorker:
             panel_id = str(panel_details.get("panel_id") or panel_details.get("id") or "").strip()
             if not panel_id:
                 raise RuntimeError("Panel assignment RPC did not return panel_id")
-            app_plan = self._resolve_google_admin_app_ids(payload)
+            app_plan = self._resolve_google_admin_app_ids(payload, domain_id=domain_id)
 
             panel_record = self._get_panel_record(panel_id)
             if not panel_record:
@@ -561,22 +580,35 @@ class NonprofitGoogleProvisionWorker:
                 step = start_step("upload_sending_tool")
                 upload_result = self._upload_to_sending_tool(domain_id, domain_name, inboxes)
                 if upload_result.get("skipped"):
-                    fail_message = f"Sending-tool upload skipped: {upload_result.get('skipped')}"
-                    fail_step(step, fail_message, upload_result)
-                    log_event("step_failed", "error", f"[upload_sending_tool] {fail_message}", {"upload_result": upload_result})
-                    persist_progress(INTERIM_STATUSES["FAILED"], "in_progress")
-                    raise RuntimeError(fail_message)
-                if upload_result.get("failed_uploads"):
-                    fail_message = (
-                        f"{upload_result.get('tool') or 'sending tool'} upload validation failed for "
-                        f"{len(upload_result.get('failed_uploads') or [])}/{upload_result.get('total_candidates') or 0} inbox(es)"
-                    )
-                    fail_step(step, fail_message, upload_result)
-                    log_event("step_failed", "error", f"[upload_sending_tool] {fail_message}", {"upload_result": upload_result})
-                    persist_progress(INTERIM_STATUSES["FAILED"], "in_progress")
-                    raise RuntimeError(fail_message)
-                complete_step(step, upload_result)
-                persist_progress(INTERIM_STATUSES["SENDING_TOOL_UPLOAD"], "in_progress")
+                    if self._action_allows_sending_tool_skip(action):
+                        complete_step(
+                            step,
+                            {
+                                **upload_result,
+                                "upload_skipped": True,
+                                "sending_tool_skipped": True,
+                                "reason": upload_result.get("skipped"),
+                            },
+                        )
+                        persist_progress(INTERIM_STATUSES["SENDING_TOOL_UPLOAD"], "in_progress")
+                    else:
+                        fail_message = f"Sending-tool upload skipped: {upload_result.get('skipped')}"
+                        fail_step(step, fail_message, upload_result)
+                        log_event("step_failed", "error", f"[upload_sending_tool] {fail_message}", {"upload_result": upload_result})
+                        persist_progress(INTERIM_STATUSES["FAILED"], "in_progress")
+                        raise RuntimeError(fail_message)
+                else:
+                    if upload_result.get("failed_uploads"):
+                        fail_message = (
+                            f"{upload_result.get('tool') or 'sending tool'} upload validation failed for "
+                            f"{len(upload_result.get('failed_uploads') or [])}/{upload_result.get('total_candidates') or 0} inbox(es)"
+                        )
+                        fail_step(step, fail_message, upload_result)
+                        log_event("step_failed", "error", f"[upload_sending_tool] {fail_message}", {"upload_result": upload_result})
+                        persist_progress(INTERIM_STATUSES["FAILED"], "in_progress")
+                        raise RuntimeError(fail_message)
+                    complete_step(step, upload_result)
+                    persist_progress(INTERIM_STATUSES["SENDING_TOOL_UPLOAD"], "in_progress")
 
             finalize_checkpoint = checkpoint("finalize")
             if not finalize_checkpoint:
@@ -1217,6 +1249,22 @@ class NonprofitGoogleProvisionWorker:
             "uploaded": total_uploaded,
         }
 
+    def _action_allows_sending_tool_skip(self, action: Dict[str, Any]) -> bool:
+        payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
+        result = action.get("result") if isinstance(action.get("result"), dict) else {}
+        fulfillment_process = str(payload.get("fulfillment_process") or "").strip().lower()
+        return any(
+            bool(value)
+            for value in [
+                payload.get("sending_tool_skipped"),
+                payload.get("sequencer_skipped"),
+                payload.get("free_google_promo"),
+                result.get("sending_tool_skipped"),
+                result.get("upload_skipped"),
+                fulfillment_process == "free_google_nonprofit",
+            ]
+        )
+
     def _assign_or_reuse_panel(self, *, domain_id: str, customer_id: str, user_count: int) -> Dict[str, Any]:
         existing = self._get_existing_panel_assignment(domain_id)
         if existing:
@@ -1704,11 +1752,17 @@ class NonprofitGoogleProvisionWorker:
             return "instantly.ai"
         if "smartlead" in text:
             return "smartlead.ai"
+        if "plusvibe" in text:
+            return "plusvibe"
         if "amplemarket" in text or "ample market" in text:
             return "amplemarket"
+        if "bison" in text:
+            return "email-bison"
+        if "reach" in text:
+            return "reach-inboxes"
         return text
 
-    def _resolve_google_admin_app_ids(self, payload: Dict[str, Any]) -> Dict[str, List[str]]:
+    def _resolve_google_admin_app_ids(self, payload: Dict[str, Any], *, domain_id: str = "") -> Dict[str, List[str]]:
         required = [v for v in self.required_google_app_ids if self._is_valid_google_app_id(v)]
         optional: List[str] = []
         invalid: List[str] = []
@@ -1757,6 +1811,12 @@ class NonprofitGoogleProvisionWorker:
             else:
                 invalid.append(entry)
 
+        for entry in self._google_admin_app_ids_from_domain_credentials(domain_id):
+            if self._is_valid_google_app_id(entry):
+                required.append(entry)
+            else:
+                invalid.append(entry)
+
         merged: List[str] = []
         seen = set()
         for candidate in required + optional:
@@ -1766,12 +1826,53 @@ class NonprofitGoogleProvisionWorker:
             seen.add(clean)
             merged.append(clean)
 
+        required_unique: List[str] = []
+        required_seen = set()
+        for candidate in required:
+            clean = str(candidate or "").strip()
+            if clean and clean in seen and clean not in required_seen:
+                required_seen.add(clean)
+                required_unique.append(clean)
+        optional_unique: List[str] = []
+        optional_seen = set()
+        for candidate in optional:
+            clean = str(candidate or "").strip()
+            if clean and clean in seen and clean not in required_seen and clean not in optional_seen:
+                optional_seen.add(clean)
+                optional_unique.append(clean)
+
         return {
-            "required": [v for v in required if v in merged],
-            "optional": [v for v in optional if v in merged and v not in required],
+            "required": required_unique,
+            "optional": optional_unique,
             "invalid": sorted({v for v in invalid if v}),
             "all": merged,
         }
+
+    def _google_admin_app_ids_from_domain_credentials(self, domain_id: str) -> List[str]:
+        clean_domain_id = str(domain_id or "").strip()
+        if not clean_domain_id:
+            return []
+        try:
+            bundles = self.client.get_domain_tool_credentials_list(clean_domain_id)
+        except Exception as exc:
+            logger.warning("Could not load domain sending-tool credentials for Google app template: %s", exc)
+            return []
+
+        app_ids: List[str] = []
+        for bundle in bundles:
+            tool_slug = self._normalize_tool_slug(str(bundle.get("slug") or ""))
+            credential = bundle.get("credential") if isinstance(bundle.get("credential"), dict) else {}
+            extra_fields = credential.get("extra_fields") if isinstance(credential.get("extra_fields"), dict) else {}
+            default_app_id = SENDING_TOOL_DEFAULT_GOOGLE_APP_IDS.get(tool_slug)
+            if default_app_id:
+                app_ids.append(default_app_id)
+            for source in (credential, extra_fields):
+                for key in GOOGLE_APP_ID_FIELD_KEYS:
+                    app_ids.extend(self._flatten_google_app_id_input(source.get(key)))
+                app_ids.extend(self._flatten_google_app_id_input(source.get("google_app_ids")))
+                app_ids.extend(self._flatten_google_app_id_input(source.get("admin_app_ids")))
+                app_ids.extend(self._flatten_google_app_id_input(source.get("additional_app_ids")))
+        return app_ids
 
     def _admin_apps_checkpoint_satisfies_plan(
         self,
