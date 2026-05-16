@@ -107,6 +107,7 @@ Endpoint strategy and tradeoff:
 - The domain is marked `active` only when the upload action is `completed`, has zero failed uploads, and reports `uploaded >= active inbox count`.
 - If the original order explicitly set `sending_tool_skipped` or `sequencer_skipped`, Microsoft provisioning marks the domain `active` after mailbox/DKIM completion and records `upload_skipped=true`; missing sending-tool credentials are not treated as a blocker for those orders.
 - If no sending-tool credential is assigned, or the upload action fails validation, Microsoft provisioning is recorded as complete with `upload_blocked=true` while the domain remains `in_progress` at an upload-blocked/failed state. Upload ownership stays with AP `ReuploadWorker`/ops, so mailbox creation does not look failed when the true blocker is sending-tool assignment or validation.
+- The worker writes canonical `domain_fulfillment_steps` rows for Microsoft waits, upload skipped/blocked/pending/done states, and final readiness blockers so the internal admin does not have to infer current state from stale action text alone.
 - Completed action updates clear stale `error` text so admin views do not show an old pending/failure reason beside a completed action.
 
 ## Recovery Pool Instantly Upload
