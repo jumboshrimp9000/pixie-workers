@@ -90,6 +90,25 @@ function Get-WorkerActionHeartbeatSeconds {
     return [Math]::Max(5, [Math]::Min([int]([double](Get-WorkerActionLeaseSeconds) / 3), $configured))
 }
 
+function Get-WorkerStaleReclaimExtraAttempts {
+    $configured = 1
+    if ($env:WORKER_STALE_RECLAIM_EXTRA_ATTEMPTS) {
+        try { $configured = [Math]::Max(0, [int][double]$env:WORKER_STALE_RECLAIM_EXTRA_ATTEMPTS) } catch { $configured = 1 }
+    }
+    return $configured
+}
+
+function Test-RetryableWorkerError {
+    param([object]$ErrorMessage)
+
+    $text = ([string]$ErrorMessage).Trim().ToLowerInvariant()
+    if (-not $text) { return $false }
+    if ($text -match 'missing api key|invalid key|unauthori[sz]ed|forbidden|\b401\b|\b403\b|cannot find module|missing dependency') {
+        return $false
+    }
+    return ($text -match 'rate limit|too many requests|\b429\b|\b5(00|02|03|04)\b|timeout|timed out|temporar|still processing|not ready yet|propagat|dns_delegation_not_public|m365 domain verification pending|m365 email service pending|exchange sync pending|exchange accepted domain missing|dkim|cname|accepted-domain delete/re-add recovery')
+}
+
 function Register-ActionLeaseFence {
     param([object]$Action)
 
@@ -196,7 +215,7 @@ function Start-ActionLeaseHeartbeat {
             "Content-Type"  = "application/json"
             "Prefer"        = "return=representation"
         }
-        $body = @{ started_at = $nextStartedAt } | ConvertTo-Json -Depth 4 -Compress
+        $body = @{ started_at = $nextStartedAt; updated_at = $nextStartedAt } | ConvertTo-Json -Depth 4 -Compress
         try {
             $rows = Invoke-RestMethod -Method PATCH -Uri "$($data.BaseUrl)/rest/v1/actions?$query" -Headers $headers -Body $body -UserAgent "pixie-worker/1.0 (PowerShell)" -TimeoutSec 60 -ErrorAction Stop
             $rowList = @($rows)
@@ -387,10 +406,22 @@ function Get-PendingActions {
     return @(@($pendingResult.Data) + @($staleResult.Data) | Sort-Object created_at | Where-Object {
         $attempts = if ($_.attempts -ne $null) { [int]$_.attempts } else { 0 }
         $maxAttempts = if ($_.max_attempts -ne $null) { [int]$_.max_attempts } else { 3 }
+        $status = if ($_.status) { [string]$_.status } else { "pending" }
         $includeAction = $true
-        if ($attempts -ge $maxAttempts) { $includeAction = $false }
+        if ($attempts -ge $maxAttempts) {
+            if ($status -eq "in_progress") {
+                $extraReclaims = Get-WorkerStaleReclaimExtraAttempts
+                if ($attempts -ge ($maxAttempts + $extraReclaims)) {
+                    $includeAction = $false
+                }
+            } elseif ($status -eq "pending" -and $attempts -eq $maxAttempts -and (Test-RetryableWorkerError $_.error)) {
+                $includeAction = $true
+            } else {
+                $includeAction = $false
+            }
+        }
 
-        if ($includeAction -and $_.status -eq "pending") {
+        if ($includeAction -and $status -eq "pending") {
             $nextRetryAt = $null
             if ($_.next_retry_at) {
                 try { $nextRetryAt = [DateTime]::Parse($_.next_retry_at).ToUniversalTime() } catch { $nextRetryAt = $null }
@@ -401,7 +432,7 @@ function Get-PendingActions {
             }
         }
 
-        if ($includeAction -and $pendingMinAgeSeconds -gt 0 -and $_.status -eq "pending" -and $_.updated_at) {
+        if ($includeAction -and $pendingMinAgeSeconds -gt 0 -and $status -eq "pending" -and $_.updated_at) {
             try {
                 $updatedAt = [DateTime]::Parse([string]$_.updated_at).ToUniversalTime()
                 if ($updatedAt -gt $now.ToUniversalTime().AddSeconds(-$pendingMinAgeSeconds)) {
@@ -430,6 +461,7 @@ function Claim-Action {
         status = "in_progress"
         attempts = $attempts + 1
         started_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        updated_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
         error = $null
         next_retry_at = $null
     }
@@ -466,7 +498,13 @@ function Update-ActionStatus {
     $now = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     $body = @{ status = $Status; updated_at = $now }
     if ($Status -eq "in_progress") { $body.started_at = $now }
-    if ($Status -eq "completed") { $body.completed_at = $now }
+    if ($Status -eq "completed") {
+        $body.completed_at = $now
+        $body.next_retry_at = $null
+    }
+    if ($Status -eq "failed" -or $Status -eq "cancelled" -or $Status -eq "canceled") {
+        $body.next_retry_at = $null
+    }
     if ($Error) { $body.error = $Error }
     if ($Result) { $body.result = $Result }
     if ($PSBoundParameters.ContainsKey("NextRetryAt")) {
@@ -796,9 +834,9 @@ function Add-ActionLog {
         [object]$Metadata = $null
     )
     $body = @{
-        action_id  = $ActionId
-        domain_id  = $DomainId
-        customer_id = $CustomerId
+        action_id  = if ([string]::IsNullOrWhiteSpace($ActionId)) { $null } else { $ActionId }
+        domain_id  = if ([string]::IsNullOrWhiteSpace($DomainId)) { $null } else { $DomainId }
+        customer_id = if ([string]::IsNullOrWhiteSpace($CustomerId)) { $null } else { $CustomerId }
         event_type = $EventType
         severity   = $Severity
         message    = $Message
