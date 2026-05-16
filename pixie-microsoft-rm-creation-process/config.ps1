@@ -466,7 +466,11 @@ function Update-ActionStatus {
     $now = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
     $body = @{ status = $Status; updated_at = $now }
     if ($Status -eq "in_progress") { $body.started_at = $now }
-    if ($Status -eq "completed") { $body.completed_at = $now }
+    if ($Status -eq "completed") {
+        $body.completed_at = $now
+        $body.error = $null
+        $body.next_retry_at = $null
+    }
     if ($Error) { $body.error = $Error }
     if ($Result) { $body.result = $Result }
     if ($PSBoundParameters.ContainsKey("NextRetryAt")) {
@@ -555,6 +559,45 @@ function Update-Domain {
     )
     $Fields.updated_at = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
     Invoke-SupabaseApi -Method PATCH -Table "domains" -Query "id=eq.$DomainId" -Body $Fields | Out-Null
+}
+
+function Set-DomainFulfillmentStep {
+    param(
+        [string]$DomainId,
+        [string]$CustomerId,
+        [string]$OrderBatchId = $null,
+        [string]$StepKey,
+        [ValidateSet("waiting","in_progress","done","blocked","skipped","cancelled")][string]$Status,
+        [ValidateSet("system","customer","ops","provider")][string]$Owner = "system",
+        [string]$Summary,
+        [string]$NextAction = "",
+        [string]$BlockerCode = $null,
+        [string]$ActionId = $null,
+        [object]$Evidence = $null
+    )
+
+    if (-not $DomainId -or -not $StepKey -or -not $Status) { return $false }
+
+    $payload = @{
+        p_domain_id        = $DomainId
+        p_customer_id      = if ([string]::IsNullOrWhiteSpace($CustomerId)) { $null } else { $CustomerId }
+        p_order_batch_id   = if ([string]::IsNullOrWhiteSpace($OrderBatchId)) { $null } else { $OrderBatchId }
+        p_step_key         = $StepKey
+        p_status           = $Status
+        p_owner            = $Owner
+        p_summary          = if ($Summary) { $Summary } else { "" }
+        p_next_action      = if ($NextAction) { $NextAction } else { "" }
+        p_blocker_code     = if ([string]::IsNullOrWhiteSpace($BlockerCode)) { $null } else { $BlockerCode }
+        p_source_action_id = if ([string]::IsNullOrWhiteSpace($ActionId)) { $null } else { $ActionId }
+        p_evidence         = if ($Evidence) { $Evidence } else { @{} }
+    }
+
+    $result = Invoke-SupabaseRpc -FunctionName "upsert_domain_fulfillment_step" -Body $payload
+    if (-not $result.Success) {
+        Write-Log "Skipped fulfillment step update for $DomainId/${StepKey}: $($result.Error)" -Level Warning
+        return $false
+    }
+    return $true
 }
 
 function Update-Inbox {
