@@ -261,17 +261,16 @@ class GoogleCancelWorker:
                 for inbox in inboxes:
                     inbox_id = str(inbox.get("id") or "").strip()
                     if inbox_id:
-                        self.client.update_inbox(inbox_id, {"status": "deleted", "deleted_at": now_iso})
+                        self.client.update_inbox(inbox_id, {"status": "deleted"})
                 domain_update: Dict[str, Any] = {
                     "status": "cancelled",
                     "interim_status": None,
                     "cancel_at": None,
-                    "cancelled_at": now_iso,
                 }
                 if payment_status_on_cancel is not None:
                     domain_update["payment_status"] = payment_status_on_cancel
                 self.client.update_domain(domain_id, domain_update)
-                complete_step(step, {"domain_status": "cancelled", "inboxes": len(inboxes)})
+                complete_step(step, {"domain_status": "cancelled", "inboxes": len(inboxes), "cancelledAt": now_iso})
                 persist()
 
             result = {

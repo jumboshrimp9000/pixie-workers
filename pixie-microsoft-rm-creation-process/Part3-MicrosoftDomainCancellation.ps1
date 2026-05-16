@@ -124,9 +124,9 @@ function Complete-Step {
         [object]$Step,
         [hashtable]$Details = $null
     )
-    $Step.status = "completed"
-    $Step.completedAt = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
-    if ($Details) { $Step.details = $Details }
+    $Step["status"] = "completed"
+    $Step["completedAt"] = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
+    if ($Details) { $Step["details"] = $Details }
     Persist-Progress
 }
 
@@ -135,9 +135,9 @@ function Fail-Step {
         [object]$Step,
         [string]$ErrorMessage
     )
-    $Step.status = "failed"
-    $Step.completedAt = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
-    $Step.error = $ErrorMessage
+    $Step["status"] = "failed"
+    $Step["completedAt"] = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
+    $Step["error"] = $ErrorMessage
     Persist-Progress
 }
 
