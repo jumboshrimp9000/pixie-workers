@@ -105,7 +105,8 @@ Endpoint strategy and tradeoff:
 - The PowerShell worker uses Supabase REST to enqueue and poll the existing `reupload_inboxes` action because the AP `ReuploadWorker` already owns provider-specific upload and API validation for Instantly/Smartlead.
 - While upload is pending, the domain stays `status='in_progress'` with `interim_status='Both - Sending Tool Upload Pending'`; the `provision_inbox` action is requeued without consuming attempts.
 - The domain is marked `active` only when the upload action is `completed`, has zero failed uploads, and reports `uploaded >= active inbox count`.
-- If no sending-tool credential is assigned, or the upload action fails validation, provisioning stops in an actionable upload-blocked/failed state instead of pretending completion.
+- If no sending-tool credential is assigned, or the upload action fails validation, Microsoft provisioning is recorded as complete with `upload_blocked=true` while the domain remains `in_progress` at an upload-blocked/failed state. Upload ownership stays with AP `ReuploadWorker`/ops, so mailbox creation does not look failed when the true blocker is sending-tool assignment or validation.
+- Completed action updates clear stale `error` text so admin views do not show an old pending/failure reason beside a completed action.
 
 ## Recovery Pool Instantly Upload
 
