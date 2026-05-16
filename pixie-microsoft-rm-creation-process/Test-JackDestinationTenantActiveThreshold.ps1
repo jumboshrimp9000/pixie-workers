@@ -32,6 +32,7 @@ param(
     [string]$LogDir = (Join-Path $PSScriptRoot "logs"),
     [string[]]$SkipAdminEmail = @(),
     [string]$TargetAdminCsv = "",
+    [string]$CredentialCsv = "",
     [switch]$AllActiveMicrosoftTenants
 )
 
@@ -70,6 +71,54 @@ function Normalize-Text {
 }
 
 function Get-TenantTargets {
+    if ($CredentialCsv) {
+        if (-not (Test-Path $CredentialCsv)) { throw "Credential CSV not found: $CredentialCsv" }
+        $rows = @(Import-Csv -Path $CredentialCsv)
+        $targets = New-Object System.Collections.Generic.List[object]
+        $seen = @{}
+
+        foreach ($row in $rows) {
+            $email = ""
+            $password = ""
+            foreach ($name in @("email", "admin", "adminemail", "admin_email", "microsoft email", "full onmicrosoft email", "AdminEmail")) {
+                $prop = $row.PSObject.Properties | Where-Object { $_.Name.Trim().ToLowerInvariant() -eq $name } | Select-Object -First 1
+                if ($prop -and $prop.Value) { $email = ([string]$prop.Value).Trim().ToLowerInvariant(); break }
+            }
+            foreach ($name in @("password", "admin password", "admin_password", "microsoft password", "AdminPassword")) {
+                $prop = $row.PSObject.Properties | Where-Object { $_.Name.Trim().ToLowerInvariant() -eq $name } | Select-Object -First 1
+                if ($prop -and $prop.Value) { $password = [string]$prop.Value; break }
+            }
+
+            if (-not $email -or -not $password) { continue }
+            if ($email -notmatch "^admin@[a-z0-9._%+-]+\.onmicrosoft\.com$") {
+                throw "Invalid Microsoft admin email in credential CSV: $email"
+            }
+            if ($seen.ContainsKey($email)) { continue }
+            $seen[$email] = $true
+
+            $targets.Add([pscustomobject]@{
+                AdminId = ""
+                AdminEmail = $email
+                AdminPassword = $password
+                Status = "Candidate"
+                Active = $false
+                DomainCount = 0
+                Domains = @()
+            }) | Out-Null
+        }
+
+        $credentialTargets = @($targets.ToArray() | Sort-Object AdminEmail)
+        if ($ShardCount -gt 1) {
+            $filtered = New-Object System.Collections.Generic.List[object]
+            for ($i = 0; $i -lt $credentialTargets.Count; $i++) {
+                if (($i % $ShardCount) -eq $ShardIndex) { $filtered.Add($credentialTargets[$i]) | Out-Null }
+            }
+            $credentialTargets = @($filtered.ToArray())
+        }
+        if ($Limit -gt 0) { $credentialTargets = @($credentialTargets | Select-Object -First $Limit) }
+        return $credentialTargets
+    }
+
     if ($TargetAdminCsv) {
         if (-not (Test-Path $TargetAdminCsv)) { throw "Target admin CSV not found: $TargetAdminCsv" }
         $csvRows = @(Import-Csv -Path $TargetAdminCsv)
@@ -676,6 +725,7 @@ function Read-ProbeTrace {
 
 function Update-AdminStatus {
     param([string]$AdminId, [string]$Status)
+    if (-not ([string]$AdminId).Trim()) { return }
     $body = @{ status = $Status; updated_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") }
     Invoke-SupabaseApi -Method PATCH -Table "admin_credentials" -Query "id=eq.$AdminId" -Body $body | Out-Null
 }
@@ -822,7 +872,7 @@ if ($SkipAdminEmail -and $SkipAdminEmail.Count -gt 0) {
     }
     $allTargets = @($allTargets | Where-Object { -not $skipSet.ContainsKey(([string]$_.AdminEmail).Trim().ToLowerInvariant()) })
 }
-$targetLabel = if ($AllActiveMicrosoftTenants) { "active Microsoft tenant(s)" } else { "destination tenant(s)" }
+$targetLabel = if ($CredentialCsv) { "candidate credential tenant(s)" } elseif ($AllActiveMicrosoftTenants) { "active Microsoft tenant(s)" } else { "destination tenant(s)" }
 Write-Log "Active threshold test shard ${ShardIndex}/${ShardCount}: $($allTargets.Count) $targetLabel, recipient=$Recipient, run=$RunId" -Level Info
 
 $results = New-Object System.Collections.Generic.List[object]

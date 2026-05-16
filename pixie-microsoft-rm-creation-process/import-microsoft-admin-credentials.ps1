@@ -15,6 +15,8 @@ param(
     [switch]$Live,
     [switch]$ActivateNew,
     [switch]$UpdateExistingPasswords,
+    [string]$ReadinessCsv = "",
+    [switch]$AllowUnverifiedImport,
     [string]$ConfirmText = "",
     [string]$OutputCsv = "",
     [string]$LogDir = (Join-Path $PSScriptRoot "logs")
@@ -91,6 +93,22 @@ function Write-Report {
     $Rows | Export-Csv -Path $Path -NoTypeInformation
 }
 
+function Get-ReadyToInsertEmails {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) { throw "Readiness CSV not found: $Path" }
+    $ready = @{}
+    foreach ($row in @(Import-Csv -Path $Path)) {
+        $email = Normalize-AdminEmail ([string]$row.email)
+        if (-not $email) { $email = Normalize-AdminEmail ([string]$row.admin_email) }
+        $stage = ([string]$row.move_stage).Trim().ToLowerInvariant()
+        $eligible = ([string]$row.eligible_for_insert).Trim().ToLowerInvariant()
+        if ($email -and ($stage -eq "ready_to_insert" -or $eligible -in @("true", "1", "yes", "y"))) {
+            $ready[$email] = $true
+        }
+    }
+    return $ready
+}
+
 if (-not (Test-Path $LogDir)) {
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 }
@@ -123,17 +141,34 @@ if ($conflicts.Count -gt 0) {
 }
 
 $existing = Get-ExistingMicrosoftAdminsByEmail
+$readyEmails = $null
+if ($ReadinessCsv) {
+    $readyEmails = Get-ReadyToInsertEmails -Path $ReadinessCsv
+}
+
+if ($Live -and -not $ReadinessCsv -and -not $AllowUnverifiedImport) {
+    throw "Live import requires -ReadinessCsv from Build-SIAdminCandidateMovePlan.ps1, or explicit -AllowUnverifiedImport."
+}
+
 $reportRows = New-Object System.Collections.Generic.List[object]
 $missing = New-Object System.Collections.Generic.List[string]
 $existingRows = New-Object System.Collections.Generic.List[string]
 
 foreach ($email in @($byEmail.Keys | Sort-Object)) {
+    $readinessStatus = ""
+    $readyForInsert = $true
+    if ($null -ne $readyEmails) {
+        $readyForInsert = $readyEmails.ContainsKey($email)
+        $readinessStatus = if ($readyForInsert) { "ready_to_insert" } else { "not_ready_to_insert" }
+    }
+
     if ($existing.ContainsKey($email)) {
         $current = $existing[$email]
         $existingRows.Add($email) | Out-Null
         $reportRows.Add([pscustomobject]@{
             email = $email
-            action = if ($UpdateExistingPasswords) { "update_existing_password" } else { "already_exists_no_password_update" }
+            readiness_status = $readinessStatus
+            action = if ($UpdateExistingPasswords -and $readyForInsert) { "update_existing_password" } elseif ($UpdateExistingPasswords) { "blocked_not_ready_to_insert" } else { "already_exists_no_password_update" }
             existing_status = [string]$current.status
             existing_active = [string]$current.active
             inserted_active = ""
@@ -141,10 +176,11 @@ foreach ($email in @($byEmail.Keys | Sort-Object)) {
             error = ""
         }) | Out-Null
     } else {
-        $missing.Add($email) | Out-Null
+        if ($readyForInsert) { $missing.Add($email) | Out-Null }
         $reportRows.Add([pscustomobject]@{
             email = $email
-            action = "insert_missing"
+            readiness_status = $readinessStatus
+            action = if ($readyForInsert) { "insert_missing" } else { "blocked_not_ready_to_insert" }
             existing_status = ""
             existing_active = ""
             inserted_active = [string]$ActivateNew.IsPresent
@@ -189,6 +225,7 @@ if ($Live) {
 
     if ($UpdateExistingPasswords) {
         foreach ($email in @($existingRows | Sort-Object)) {
+            if ($null -ne $readyEmails -and -not $readyEmails.ContainsKey($email)) { continue }
             $admin = $existing[$email]
             $body = @{
                 password = [string]$byEmail[$email]

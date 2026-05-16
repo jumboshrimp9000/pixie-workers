@@ -11,6 +11,8 @@ Safety:
   - Never writes passwords to the dry-run report.
   - Apply mode inserts missing Microsoft admins only unless explicitly asked to
     update existing passwords.
+  - Apply mode requires a readiness report unless explicitly overridden. The
+    readiness report must mark each imported admin as ready_to_insert.
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ import re
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 try:
     import psycopg
@@ -139,7 +142,24 @@ def fetch_existing(conn) -> dict[str, dict[str, object]]:
         return {str(row["email"]).lower(): dict(row) for row in cur.fetchall()}
 
 
-def classify(rows: list[dict[str, object]], existing: dict[str, dict[str, object]]) -> tuple[list[dict[str, object]], Counter]:
+def read_ready_emails(path: Path) -> set[str]:
+    ready: set[str] = set()
+    with path.open(newline="", encoding="utf-8-sig", errors="ignore") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            email = str(row.get("email") or row.get("admin_email") or "").strip().lower()
+            move_stage = str(row.get("move_stage") or "").strip().lower()
+            eligible = str(row.get("eligible_for_insert") or "").strip().lower()
+            if email and (move_stage == "ready_to_insert" or eligible in {"true", "1", "yes", "y"}):
+                ready.add(email)
+    return ready
+
+
+def classify(
+    rows: list[dict[str, object]],
+    existing: dict[str, dict[str, object]],
+    ready_emails: Optional[set[str]] = None,
+) -> tuple[list[dict[str, object]], Counter]:
     seen = Counter(str(row["email"]) for row in rows)
     report: list[dict[str, object]] = []
     counts: Counter = Counter()
@@ -163,6 +183,8 @@ def classify(rows: list[dict[str, object]], existing: dict[str, dict[str, object
         existing_row = existing.get(email)
         if problems:
             action = "blocked_" + ";".join(problems)
+        elif ready_emails is not None and email not in ready_emails:
+            action = "blocked_not_ready_to_insert"
         elif existing_row:
             action = "already_exists_skip"
         else:
@@ -261,6 +283,8 @@ def write_report(report_rows: list[dict[str, object]], counts: Counter, applied:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Dry-run/import Microsoft admin credentials without logging passwords.")
     parser.add_argument("--input", required=True, help="CSV/TSV containing email,password rows.")
+    parser.add_argument("--readiness-report", default="", help="CSV from Build-SIAdminCandidateMovePlan.ps1. Apply imports only ready_to_insert rows.")
+    parser.add_argument("--allow-unverified-import", action="store_true", help="Bypass readiness-report requirement for --apply. Use only for deliberate emergency exceptions.")
     parser.add_argument("--apply", action="store_true", help="Actually insert missing admins. Dry-run is default.")
     parser.add_argument("--confirm", default="", help=f"Required for --apply: {CONFIRM_TEXT}")
     parser.add_argument("--update-existing-passwords", action="store_true", help="Also update passwords/status for existing admins.")
@@ -268,20 +292,36 @@ def main() -> None:
 
     load_env_file(ENV_FILE)
     input_path = Path(args.input).expanduser().resolve()
+    readiness_path = Path(args.readiness_report).expanduser().resolve() if args.readiness_report else None
+    ready_emails = read_ready_emails(readiness_path) if readiness_path else None
+    if args.apply and ready_emails is None and not args.allow_unverified_import:
+        raise SystemExit("--apply requires --readiness-report from Build-SIAdminCandidateMovePlan.ps1, or explicit --allow-unverified-import.")
+
     rows = read_input(input_path)
+    apply_rows = rows
+    if ready_emails is not None:
+        apply_rows = [row for row in rows if str(row["email"]).lower() in ready_emails]
+
     with connect() as conn:
         existing = fetch_existing(conn)
-        report, counts = classify(rows, existing)
+        report, counts = classify(rows, existing, ready_emails=ready_emails)
         if args.apply:
             if args.confirm != CONFIRM_TEXT:
                 raise SystemExit(f"--apply requires --confirm {CONFIRM_TEXT}")
-            applied_counts = apply_import(conn, rows, args.update_existing_passwords)
+            applied_counts = apply_import(conn, apply_rows, args.update_existing_passwords)
             existing_after = fetch_existing(conn)
-            report, counts = classify(rows, existing_after)
+            report, counts = classify(rows, existing_after, ready_emails=ready_emails)
             counts.update({f"apply_{key}": value for key, value in applied_counts.items()})
         report_path = write_report(report, counts, applied=args.apply)
 
-    print(json.dumps({"input_rows": len(rows), "applied": bool(args.apply), "counts": dict(counts), "report": str(report_path)}, indent=2, sort_keys=True))
+    print(json.dumps({
+        "input_rows": len(rows),
+        "ready_rows": len(apply_rows) if ready_emails is not None else None,
+        "readiness_report": str(readiness_path) if readiness_path else "",
+        "applied": bool(args.apply),
+        "counts": dict(counts),
+        "report": str(report_path),
+    }, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":
