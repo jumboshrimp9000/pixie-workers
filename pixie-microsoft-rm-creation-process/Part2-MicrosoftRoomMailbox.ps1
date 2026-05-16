@@ -1005,6 +1005,17 @@ function Set-ProvisionActionPendingWithoutPenalty {
     }
 }
 
+function Test-MicrosoftProvisioningNoPenaltyRetry {
+    param(
+        [string]$Step,
+        [string]$EventType,
+        [string]$Reason
+    )
+
+    $combined = "$Step $EventType $Reason".ToLowerInvariant()
+    return ($combined -match 'verification|email_service|dns_records|exchange_sync|accepted_domain|dkim|cname|propagat|not ready|still processing|pending')
+}
+
 function Resolve-MicrosoftProvisioningUploadState {
     param(
         [object]$DomainRecord,
@@ -1112,6 +1123,89 @@ function Resolve-MicrosoftProvisioningUploadState {
     } | Out-Null
     Add-ActionLog -ActionId $ActionId -DomainId $domainId -CustomerId $customerId -EventType "sending_tool_upload_pending" -Severity "warn" -Message "Waiting for reupload_inboxes action $uploadActionId before marking domain active" -Metadata @{ upload_action_id = $uploadActionId; expected_active_inboxes = $expectedActiveCount; retry_delay_seconds = $delaySeconds }
     return @{ Complete = $false; Failed = $false; Pending = $true; History = $history; UploadActionId = $uploadActionId }
+}
+
+function Stop-MicrosoftProvisioningWithAction {
+    param(
+        [string]$DomainId,
+        [string]$CustomerId,
+        [string]$ActionId,
+        [string]$History,
+        [string]$Reason,
+        [string]$EventType,
+        [string]$Step = "provider_provisioning",
+        [string]$InterimStatus = "Both - Failed",
+        [string]$Severity = "error",
+        [bool]$Retryable = $false,
+        [int]$DelaySeconds = 300,
+        [object]$Metadata = $null
+    )
+
+    $safeReason = if ([string]::IsNullOrWhiteSpace($Reason)) { "Microsoft provisioning stopped without a reason" } else { $Reason }
+    $currentAction = Get-Action -ActionId $ActionId
+    $attempts = if ($currentAction -and $currentAction.attempts -ne $null) { [int]$currentAction.attempts } else { 1 }
+    $maxAttempts = if ($currentAction -and $currentAction.max_attempts -ne $null) { [int]$currentAction.max_attempts } else { 5 }
+    $retryWithoutPenalty = $Retryable -and (Test-MicrosoftProvisioningNoPenaltyRetry -Step $Step -EventType $EventType -Reason $safeReason)
+    $canRetry = $Retryable -and ($retryWithoutPenalty -or ($attempts -lt $maxAttempts))
+    $historyPrefix = if ($canRetry) { "PENDING" } else { "FAILED" }
+    $history = Add-HistoryEntry -History $History -Entry "${historyPrefix}: $safeReason"
+    $domainFields = @{
+        status = "in_progress"
+        interim_status = if ($canRetry) { $InterimStatus } else { "Both - Failed" }
+        action_history = $history
+    }
+    Update-Domain -DomainId $DomainId -Fields $domainFields
+
+    $logMetadata = @{
+        step = $Step
+        retryable = $Retryable
+    }
+    if ($Metadata -is [hashtable]) {
+        foreach ($key in $Metadata.Keys) {
+            $logMetadata[$key] = $Metadata[$key]
+        }
+    } elseif ($Metadata) {
+        foreach ($property in $Metadata.PSObject.Properties) {
+            $logMetadata[$property.Name] = $property.Value
+        }
+    }
+
+    if ($canRetry) {
+        $nextRetryAt = (Get-Date).ToUniversalTime().AddSeconds($DelaySeconds).ToString("yyyy-MM-ddTHH:mm:ssZ")
+        if ($retryWithoutPenalty -and $currentAction) {
+            $requeued = Requeue-ActionWithoutPenalty -Action $currentAction -Reason $safeReason -DelaySeconds $DelaySeconds
+            if (-not $requeued) {
+                Write-Log "No-penalty retry requeue did not update action $ActionId; falling back to a normal pending update" -Level Warning
+                Update-ActionStatus -ActionId $ActionId -Action $currentAction -Status "pending" -Error $safeReason -NextRetryAt $nextRetryAt | Out-Null
+            }
+        } else {
+            Update-ActionStatus -ActionId $ActionId -Action $currentAction -Status "pending" -Error $safeReason -NextRetryAt $nextRetryAt | Out-Null
+        }
+        $logMetadata["next_retry_at"] = $nextRetryAt
+        $logMetadata["retry_delay_seconds"] = $DelaySeconds
+        if ($retryWithoutPenalty) { $logMetadata["retry_without_penalty"] = $true }
+        Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType $EventType -Severity "warn" -Message $safeReason -Metadata $logMetadata
+    } else {
+        if ($Retryable) {
+            $logMetadata["retryable_but_exhausted"] = $true
+            $logMetadata["attempts"] = $attempts
+            $logMetadata["max_attempts"] = $maxAttempts
+        }
+        Update-ActionStatus -ActionId $ActionId -Action $currentAction -Status "failed" -Error $safeReason
+        Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType $EventType -Severity $Severity -Message $safeReason -Metadata $logMetadata
+    }
+
+    return $history
+}
+
+function Test-MicrosoftProvisioningTransientError {
+    param([string]$Message)
+
+    if ([string]::IsNullOrWhiteSpace($Message)) { return $false }
+    if (Get-Command Test-RetryableWorkerError -ErrorAction SilentlyContinue) {
+        return (Test-RetryableWorkerError $Message)
+    }
+    return ($Message -match 'rate limit|too many requests|\b429\b|\b5(00|02|03|04)\b|timeout|timed out|temporar|still processing|not ready yet|propagat|dns_delegation_not_public|m365 domain verification pending|m365 email service pending|exchange sync pending|exchange accepted domain missing|dkim|cname')
 }
 
 # ============================================================================
@@ -2151,6 +2245,11 @@ function Process-MicrosoftDomain {
 
     if ($interimStatus -eq "Both - Provisioning Complete") {
         Write-Log "Already completed, skipping" -Level Warning
+        Update-ActionStatus -ActionId $ActionId -Status "completed" -Result @{
+            domain = $Domain
+            already_completed = $true
+            active_inboxes_verified = $Inboxes.Count
+        }
         return
     }
 
@@ -2161,8 +2260,7 @@ function Process-MicrosoftDomain {
         "Both - DKIM Complete",
         "Both - Sending Tool Upload Pending",
         "Both - Sending Tool Upload Blocked",
-        "Both - Sending Tool Upload Failed",
-        "Both - Failed"
+        "Both - Sending Tool Upload Failed"
     )
     if ($Inboxes.Count -gt 0 -and $interimStatus -in $statusesAfterMailboxCreation) {
         $rewindReason = "Found $($Inboxes.Count) pending inbox row(s) while domain was at '$interimStatus'; rewinding to mailbox creation before finalization"
@@ -2179,7 +2277,7 @@ function Process-MicrosoftDomain {
     $tenantId = Get-TenantIdFromDomain -Domain $adminDomainPart
     if (-not $tenantId) {
         Write-Log "Could not resolve tenant ID" -Level Error
-        Update-Domain -DomainId $DomainId -Fields @{ interim_status = "Both - Failed"; action_history = (Add-HistoryEntry -History $history -Entry "FAILED: Could not resolve tenant ID") }
+        Stop-MicrosoftProvisioningWithAction -DomainId $DomainId -CustomerId $CustomerId -ActionId $ActionId -History $history -Reason "Could not resolve Microsoft tenant ID for admin domain $adminDomainPart" -EventType "tenant_id_resolution_failed" -Step "tenant_resolution" | Out-Null
         return
     }
 
@@ -2187,7 +2285,7 @@ function Process-MicrosoftDomain {
     $Bearer = Get-ROPCToken -TenantId $tenantId -ClientId $AzureCliPublicClientId -Username $AdminEmail -Password $AdminPassword
     if (-not $Bearer) {
         Write-Log "Failed to get Graph token" -Level Error
-        Update-Domain -DomainId $DomainId -Fields @{ interim_status = "Both - Failed"; action_history = (Add-HistoryEntry -History $history -Entry "FAILED: ROPC token failed (MFA?)") }
+        Stop-MicrosoftProvisioningWithAction -DomainId $DomainId -CustomerId $CustomerId -ActionId $ActionId -History $history -Reason "ROPC token failed for Microsoft admin $AdminEmail. Confirm password, MFA, and tenant sign-in policy." -EventType "graph_token_failed" -Step "graph_token" | Out-Null
         return
     }
     Write-Log "Graph token acquired" -Level Success
@@ -2226,8 +2324,10 @@ function Process-MicrosoftDomain {
             Connect-ExchangeOnline -Credential $creds -ShowBanner:$false -ErrorAction Stop
             Write-Log "Connected to Exchange Online" -Level Success
         } catch {
-            Write-Log "Exchange Online connection failed: $($_.Exception.Message)" -Level Error
-            Update-Domain -DomainId $DomainId -Fields @{ interim_status = "Both - Failed"; action_history = (Add-HistoryEntry -History $history -Entry "FAILED: Exchange connection - $($_.Exception.Message)") }
+            $exchangeError = $_.Exception.Message
+            Write-Log "Exchange Online connection failed: $exchangeError" -Level Error
+            $retryExchange = Test-MicrosoftProvisioningTransientError $exchangeError
+            Stop-MicrosoftProvisioningWithAction -DomainId $DomainId -CustomerId $CustomerId -ActionId $ActionId -History $history -Reason "Exchange Online connection failed: $exchangeError" -EventType "exchange_connection_failed" -Step "exchange_connection" -Retryable $retryExchange -DelaySeconds 300 -Metadata @{ admin_email = $AdminEmail } | Out-Null
             return
         }
     }
@@ -2243,9 +2343,9 @@ function Process-MicrosoftDomain {
         if (-not $DryRun) {
             $addResult = Add-DomainToM365 -Bearer $Bearer -Domain $Domain
             if (-not $addResult.Success) {
-                $history = Add-HistoryEntry -History $history -Entry "FAILED: Add domain to M365 - $($addResult.Error)"
-                Update-Domain -DomainId $DomainId -Fields @{ status = "in_progress"; interim_status = "Both - Failed"; action_history = $history }
-                Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "domain_setup_failed" -Severity "error" -Message "Add to M365 failed: $($addResult.Error)"
+                $addError = "Add domain to M365 failed: $($addResult.Error)"
+                $retryAdd = Test-MicrosoftProvisioningTransientError $addError
+                Stop-MicrosoftProvisioningWithAction -DomainId $DomainId -CustomerId $CustomerId -ActionId $ActionId -History $history -Reason $addError -EventType "domain_setup_failed" -Step "add_domain_to_m365" -Retryable $retryAdd -DelaySeconds 300 | Out-Null
                 return
             }
             if ($addResult.IsVerified) { $interimStatus = "Both - Domain Verified" }
@@ -2262,8 +2362,7 @@ function Process-MicrosoftDomain {
         if (-not $DryRun) {
             $verificationTxt = Get-DomainVerificationRecord -Bearer $Bearer -Domain $Domain
             if (-not $verificationTxt) {
-                $history = Add-HistoryEntry -History $history -Entry "FAILED: Could not get verification TXT"
-                Update-Domain -DomainId $DomainId -Fields @{ interim_status = "Both - Failed"; action_history = $history }
+                Stop-MicrosoftProvisioningWithAction -DomainId $DomainId -CustomerId $CustomerId -ActionId $ActionId -History $history -Reason "Could not get Microsoft domain verification TXT record. Microsoft may not have published verification records yet." -EventType "domain_verification_txt_missing" -Step "verification_txt" -InterimStatus "Microsoft - Added to M365" -Retryable $true -DelaySeconds 300 | Out-Null
                 return
             }
 
@@ -2284,9 +2383,7 @@ function Process-MicrosoftDomain {
         if (-not $DryRun) {
             $verified = Verify-M365Domain -Bearer $Bearer -Domain $Domain
             if (-not $verified -and -not (Test-DomainVerified -Bearer $Bearer -Domain $Domain)) {
-                $history = Add-HistoryEntry -History $history -Entry "FAILED: Domain verification failed"
-                Update-Domain -DomainId $DomainId -Fields @{ interim_status = "Both - Failed"; action_history = $history }
-                Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "domain_verify_failed" -Severity "error" -Message "Verification failed after max attempts"
+                Stop-MicrosoftProvisioningWithAction -DomainId $DomainId -CustomerId $CustomerId -ActionId $ActionId -History $history -Reason "Microsoft domain verification failed after worker checks; retrying after DNS/Microsoft propagation delay." -EventType "domain_verify_failed" -Step "domain_verification" -InterimStatus "Both - Verification TXT Added" -Retryable $true -DelaySeconds 600 | Out-Null
                 return
             }
         }
@@ -2313,9 +2410,7 @@ function Process-MicrosoftDomain {
         if (-not $DryRun) {
             $dnsOk = Add-M365DnsRecords -Domain $Domain -Bearer $Bearer -ZoneId $ZoneId
             if (-not $dnsOk) {
-                $history = Add-HistoryEntry -History $history -Entry "FAILED: All DNS records failed"
-                Update-Domain -DomainId $DomainId -Fields @{ interim_status = "Both - Failed"; action_history = $history }
-                Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "dns_failed" -Severity "error" -Message "All DNS records failed"
+                Stop-MicrosoftProvisioningWithAction -DomainId $DomainId -CustomerId $CustomerId -ActionId $ActionId -History $history -Reason "All Microsoft DNS record writes failed; retrying to avoid stranding the action on a transient DNS/API issue." -EventType "dns_failed" -Step "m365_dns_records" -InterimStatus "Microsoft - Email Enabled" -Retryable $true -DelaySeconds 300 | Out-Null
                 return
             }
         }
@@ -2357,11 +2452,7 @@ function Process-MicrosoftDomain {
 
                 $verified = Verify-M365Domain -Bearer $Bearer -Domain $Domain
                 if (-not $verified -and -not (Test-DomainVerified -Bearer $Bearer -Domain $Domain)) {
-                    $nextRetryAt = (Get-Date).AddSeconds($exchangeSyncDeferSeconds).ToString("yyyy-MM-ddTHH:mm:ssZ")
-                    $history = Add-HistoryEntry -History $history -Entry "M365 domain verification still pending; deferring retry for $exchangeSyncDeferSeconds seconds"
-                    Update-Domain -DomainId $DomainId -Fields @{ status = "in_progress"; interim_status = "Both - Verification TXT Added"; action_history = $history }
-                    Update-ActionStatus -ActionId $ActionId -Status "pending" -Error "M365 domain verification pending" -NextRetryAt $nextRetryAt
-                    Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "domain_verification_deferred" -Severity "warn" -Message "Graph still reports the domain as unverified; retrying in $exchangeSyncDeferSeconds seconds" -Metadata @{ next_retry_at = $nextRetryAt; retry_delay_seconds = $exchangeSyncDeferSeconds }
+                    Stop-MicrosoftProvisioningWithAction -DomainId $DomainId -CustomerId $CustomerId -ActionId $ActionId -History $history -Reason "M365 domain verification pending" -EventType "domain_verification_deferred" -Step "domain_verification_preflight" -InterimStatus "Both - Verification TXT Added" -Retryable $true -DelaySeconds $exchangeSyncDeferSeconds | Out-Null
                     return
                 }
 
@@ -2378,11 +2469,7 @@ function Process-MicrosoftDomain {
                 Write-Log "Graph reports Email service is not enabled for $Domain; re-enabling before Exchange sync" -Level Warning
                 $emailEnabled = Enable-DomainEmailService -Bearer $Bearer -Domain $Domain
                 if (-not $emailEnabled) {
-                    $nextRetryAt = (Get-Date).AddSeconds($exchangeSyncDeferSeconds).ToString("yyyy-MM-ddTHH:mm:ssZ")
-                    $history = Add-HistoryEntry -History $history -Entry "Email service still pending; deferring retry for $exchangeSyncDeferSeconds seconds"
-                    Update-Domain -DomainId $DomainId -Fields @{ status = "in_progress"; interim_status = "Both - Domain Verified"; action_history = $history }
-                    Update-ActionStatus -ActionId $ActionId -Status "pending" -Error "M365 email service pending" -NextRetryAt $nextRetryAt
-                    Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "email_enable_deferred" -Severity "warn" -Message "Email service is not active yet for $Domain; retrying in $exchangeSyncDeferSeconds seconds" -Metadata @{ next_retry_at = $nextRetryAt; retry_delay_seconds = $exchangeSyncDeferSeconds }
+                    Stop-MicrosoftProvisioningWithAction -DomainId $DomainId -CustomerId $CustomerId -ActionId $ActionId -History $history -Reason "M365 email service pending" -EventType "email_enable_deferred" -Step "email_service_preflight" -InterimStatus "Both - Domain Verified" -Retryable $true -DelaySeconds $exchangeSyncDeferSeconds | Out-Null
                     return
                 }
 
@@ -2394,9 +2481,7 @@ function Process-MicrosoftDomain {
             if ($interimStatus -eq "Both - Domain Verified" -or $interimStatus -eq "Microsoft - Email Enabled") {
                 $dnsOk = Add-M365DnsRecords -Domain $Domain -Bearer $Bearer -ZoneId $ZoneId
                 if (-not $dnsOk) {
-                    $history = Add-HistoryEntry -History $history -Entry "FAILED: All DNS records failed during Exchange preflight recovery"
-                    Update-Domain -DomainId $DomainId -Fields @{ interim_status = "Both - Failed"; action_history = $history }
-                    Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "dns_failed" -Severity "error" -Message "All DNS records failed during Exchange preflight recovery"
+                    Stop-MicrosoftProvisioningWithAction -DomainId $DomainId -CustomerId $CustomerId -ActionId $ActionId -History $history -Reason "All Microsoft DNS record writes failed during Exchange preflight recovery; retrying to avoid stranding the action." -EventType "dns_failed" -Step "m365_dns_records_preflight" -InterimStatus "Microsoft - Email Enabled" -Retryable $true -DelaySeconds 300 | Out-Null
                     return
                 }
 
@@ -2407,11 +2492,9 @@ function Process-MicrosoftDomain {
 
             $synced = Wait-ForExchangeSync -Domain $Domain -MaxWaitSeconds $exchangeSyncMaxWaitSeconds
             if (-not $synced) {
-                $nextRetryAt = (Get-Date).AddSeconds($exchangeSyncDeferSeconds).ToString("yyyy-MM-ddTHH:mm:ssZ")
-                $history = Add-HistoryEntry -History $history -Entry "Exchange sync still pending after $exchangeSyncMaxWaitSeconds seconds; deferring retry for $exchangeSyncDeferSeconds seconds"
-                Update-Domain -DomainId $DomainId -Fields @{ status = "in_progress"; interim_status = "Both - DNS Records Added"; action_history = $history }
-                Update-ActionStatus -ActionId $ActionId -Status "pending" -Error "Exchange sync pending after $exchangeSyncMaxWaitSeconds seconds" -NextRetryAt $nextRetryAt
-                Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "exchange_sync_deferred" -Severity "warn" -Message "Exchange sync still pending after $exchangeSyncMaxWaitSeconds seconds; retrying in $exchangeSyncDeferSeconds seconds" -Metadata @{ next_retry_at = $nextRetryAt; retry_delay_seconds = $exchangeSyncDeferSeconds }
+                Stop-MicrosoftProvisioningWithAction -DomainId $DomainId -CustomerId $CustomerId -ActionId $ActionId -History $history -Reason "Exchange sync pending after $exchangeSyncMaxWaitSeconds seconds" -EventType "exchange_sync_deferred" -Step "exchange_sync" -InterimStatus "Both - DNS Records Added" -Retryable $true -DelaySeconds $exchangeSyncDeferSeconds -Metadata @{
+                    exchange_sync_max_wait_seconds = $exchangeSyncMaxWaitSeconds
+                } | Out-Null
                 return
             }
         }
@@ -2433,15 +2516,9 @@ function Process-MicrosoftDomain {
         try { $acceptedNow = Get-AcceptedDomain -Identity $Domain -ErrorAction SilentlyContinue } catch { }
         if (-not $acceptedNow) {
             Write-Log "Exchange does not currently list $Domain as an accepted domain; deferring before mailbox creation" -Level Warning
-            $nextRetryAt = (Get-Date).AddSeconds($exchangeSyncDeferSeconds).ToString("yyyy-MM-ddTHH:mm:ssZ")
-            $history = Add-HistoryEntry -History $history -Entry "Exchange accepted-domain check missing before mailbox creation; deferring retry for $exchangeSyncDeferSeconds seconds"
-            Update-Domain -DomainId $DomainId -Fields @{ status = "in_progress"; interim_status = "Both - DNS Records Added"; action_history = $history }
-            Update-ActionStatus -ActionId $ActionId -Status "pending" -Error "Exchange accepted domain missing before mailbox creation" -NextRetryAt $nextRetryAt
-            Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "exchange_accepted_domain_missing_before_mailbox_creation" -Severity "warn" -Message "Exchange does not currently list $Domain as an accepted domain; retrying mailbox creation after Exchange sync" -Metadata @{
-                next_retry_at = $nextRetryAt
-                retry_delay_seconds = $exchangeSyncDeferSeconds
+            Stop-MicrosoftProvisioningWithAction -DomainId $DomainId -CustomerId $CustomerId -ActionId $ActionId -History $history -Reason "Exchange accepted domain missing before mailbox creation" -EventType "exchange_accepted_domain_missing_before_mailbox_creation" -Step "accepted_domain_preflight" -InterimStatus "Both - DNS Records Added" -Retryable $true -DelaySeconds $exchangeSyncDeferSeconds -Metadata @{
                 previous_interim_status = $interimStatus
-            }
+            } | Out-Null
             return
         }
     }

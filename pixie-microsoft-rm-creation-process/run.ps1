@@ -273,6 +273,37 @@ function Process-SingleAction {
 
         try {
             & $ps1Script @part2Params
+            $postPart2Action = Get-Action -ActionId $actionId
+            $postPart2Status = if ($postPart2Action -and $postPart2Action.status) { [string]$postPart2Action.status } else { "" }
+            if ($postPart2Status -eq "in_progress") {
+                $freshDomain = Get-Domain -DomainId $domainId
+                $freshInterim = if ($freshDomain -and $freshDomain.interim_status) { [string]$freshDomain.interim_status } else { "" }
+                $freshStatus = if ($freshDomain -and $freshDomain.status) { [string]$freshDomain.status } else { "" }
+
+                if ($freshStatus -eq "active" -or $freshInterim -eq "Both - Provisioning Complete") {
+                    Write-Log "Part 2 returned with action still in_progress even though domain is complete; marking action completed" -Level Warning
+                    Update-ActionStatus -ActionId $actionId -Status "completed" -Result @{
+                        domain = $domain.domain
+                        completed_by_orchestrator_guard = $true
+                        interim_status = $freshInterim
+                    } -Action $postPart2Action | Out-Null
+                    Add-ActionLog -ActionId $actionId -DomainId $domainId -CustomerId $domain.customer_id -EventType "part2_orchestrator_guard_completed" -Severity "warn" -Message "Part 2 returned without a terminal action update; domain was already complete, so the orchestrator marked the action completed." -Metadata @{
+                        interim_status = $freshInterim
+                    }
+                } else {
+                    $guardReason = if ($freshInterim -eq "Both - Failed") {
+                        "Part 2 returned after setting domain to Both - Failed without updating the action row"
+                    } else {
+                        "Part 2 returned without updating the action row to pending, failed, or completed"
+                    }
+                    Write-Log $guardReason -Level Error
+                    Fail-Action -Action $postPart2Action -ErrorMessage $guardReason | Out-Null
+                    Add-ActionLog -ActionId $actionId -DomainId $domainId -CustomerId $domain.customer_id -EventType "part2_orchestrator_guard_failed" -Severity "error" -Message $guardReason -Metadata @{
+                        interim_status = $freshInterim
+                        domain_status = $freshStatus
+                    }
+                }
+            }
         } catch {
             Write-Log "Part 2 execution error: $($_.Exception.Message)" -Level Error
             Fail-Action -Action $Action -ErrorMessage "Part 2 execution error: $($_.Exception.Message)"

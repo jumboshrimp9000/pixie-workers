@@ -6,6 +6,8 @@ Hybrid TypeScript + PowerShell worker for Microsoft-backed mailbox provisioning.
 - `microsoft_update_inboxes` — tracked rename / username-change mutations on existing Microsoft-backed mailboxes
 - `microsoft_cancel_domain` — post-grace cancellation teardown and final state sync
 
+Future worker/status changes should preserve the hardening rules documented in the app repo at `docs/fulfillment-worker-flow-hardening.md`.
+
 ## Architecture
 
 ```text
@@ -181,7 +183,15 @@ Deployment/config notes:
 - one-admin-at-a-time behavior depends on the Supabase RPCs `acquire_microsoft_admin_lock`, `refresh_microsoft_admin_lock`, and `release_microsoft_admin_lock`
 - Microsoft admin rows must exist in `admin_credentials` with `provider=microsoft` and `active=true`
 - `WORKER_ACTION_LEASE_SECONDS` controls stale action reclaim for crashed workers; it does not disable or replace the per-admin Supabase lock
+- `WORKER_STALE_RECLAIM_EXTRA_ATTEMPTS` controls how many stale `in_progress` actions may be reclaimed after the normal `max_attempts` ceiling; default is `1`, which gives a crashed/hung final attempt one safe reclaim but prevents an infinite loop
 - the admin lock lease defaults to 7200 seconds in `Acquire-MicrosoftAdminLock`; actions that cannot obtain the lock are requeued without consuming an attempt
+- long-running actions heartbeat both `started_at` and `updated_at`, so AP/internal-admin liveness checks can distinguish an active PowerShell run from a stranded row
+
+Retry safety:
+- pending actions at `max_attempts` are normally not reclaimed
+- the worker will process one due pending action at exactly `max_attempts` only when its error text is a known transient provider delay, such as DNS propagation, Exchange accepted-domain lag, DKIM/CNAME lag, Microsoft 5xx/timeout, or rate limiting
+- Microsoft propagation waits inside `provision_inbox` use no-penalty requeue. Domain verification, Email service activation, Cloudflare/M365 DNS writes, Exchange sync, accepted-domain preflight, and DKIM/CNAME waits must clear the running lease, set `status='pending'`, set `next_retry_at`, and restore the attempt count so bulk orders do not silently exhaust retries while waiting on Microsoft/DNS.
+- non-retryable configuration or credential failures, such as missing API keys, unauthorized responses, or missing dependencies, stay stopped for ops review
 
 ## Files
 
