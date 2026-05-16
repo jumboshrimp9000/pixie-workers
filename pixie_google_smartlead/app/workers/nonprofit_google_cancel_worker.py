@@ -330,7 +330,31 @@ class NonprofitGoogleCancelWorker:
         except Exception as exc:
             persist()
             log_event("action_failed", "error", str(exc))
+            if action_type != "google_recovery_purge" and domain_id and self._is_final_attempt(action):
+                self._mark_domain_cancellation_failed(domain_id)
             self.client.fail_action(action, str(exc), max_retries=self.max_retries)
+
+    def _is_final_attempt(self, action: Dict[str, Any]) -> bool:
+        attempts = int(action.get("attempts") or 1)
+        row_max_attempts = int(action.get("max_attempts") or 0)
+        effective_max_retries = row_max_attempts if row_max_attempts > 0 else self.max_retries
+        if self.max_retries > 0 and row_max_attempts > 0:
+            effective_max_retries = min(self.max_retries, row_max_attempts)
+        elif self.max_retries > 0:
+            effective_max_retries = self.max_retries
+        return attempts >= effective_max_retries
+
+    def _mark_domain_cancellation_failed(self, domain_id: str) -> None:
+        try:
+            self.client.update_domain(
+                domain_id,
+                {
+                    "status": "in_progress",
+                    "interim_status": "Google - Cancellation Failed",
+                },
+            )
+        except Exception:
+            logger.exception("Failed to mark nonprofit Google cancellation failed for domain %s", domain_id)
 
     def _process_recovery_purge_action(
         self,
