@@ -115,7 +115,7 @@ function New-Step {
         attempt = if ($script:ActionRecord -and $script:ActionRecord.attempts -ne $null) { [int]$script:ActionRecord.attempts } else { 1 }
     }
     $script:Steps += $step
-    Persist-Progress
+    Persist-Progress | Out-Null
     return $step
 }
 
@@ -127,7 +127,7 @@ function Complete-Step {
     $Step["status"] = "completed"
     $Step["completedAt"] = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
     if ($Details) { $Step["details"] = $Details }
-    Persist-Progress
+    Persist-Progress | Out-Null
 }
 
 function Fail-Step {
@@ -138,7 +138,7 @@ function Fail-Step {
     $Step["status"] = "failed"
     $Step["completedAt"] = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ssZ")
     $Step["error"] = $ErrorMessage
-    Persist-Progress
+    Persist-Progress | Out-Null
 }
 
 function Persist-Progress {
