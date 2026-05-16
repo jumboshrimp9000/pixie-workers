@@ -220,12 +220,16 @@ class NonprofitGoogleCancelWorker:
                 step = start_step("mark_deleted")
                 now_iso = self._iso_now()
                 for inbox in inboxes:
-                    self.client.update_inbox(str(inbox.get("id")), {"status": "deleted", "deleted_at": now_iso})
-                domain_update: Dict[str, Any] = {"status": "cancelled", "cancelled_at": now_iso}
+                    self.client.update_inbox(str(inbox.get("id")), {"status": "deleted"})
+                domain_update: Dict[str, Any] = {
+                    "status": "cancelled",
+                    "interim_status": None,
+                    "cancel_at": None,
+                }
                 if payment_status_on_cancel is not None:
                     domain_update["payment_status"] = payment_status_on_cancel
                 self.client.update_domain(domain_id, domain_update)
-                complete_step(step, {"inboxes": len(inboxes), "domain_status": "cancelled"})
+                complete_step(step, {"inboxes": len(inboxes), "domain_status": "cancelled", "cancelledAt": now_iso})
                 persist()
 
             if not checkpoint("release_panel_assignment"):
