@@ -933,6 +933,19 @@ function Test-PayloadSendingToolSkipped {
     )
 }
 
+function Test-ActionMailboxProofRefresh {
+    param([object]$Action)
+
+    if (-not $Action) { return $false }
+    $payload = $Action.payload
+    return (
+        (Test-TruthyPayloadFlag -Payload $payload -Name "mailbox_proof_refresh") -or
+        (Test-TruthyPayloadFlag -Payload $payload -Name "mailboxProofRefresh") -or
+        (Test-TruthyPayloadFlag -Payload $payload -Name "proof_refresh") -or
+        (Test-TruthyPayloadFlag -Payload $payload -Name "proofRefresh")
+    )
+}
+
 function Test-ActionSendingToolSkipped {
     param([string]$ActionId)
 
@@ -2649,6 +2662,8 @@ function Process-MicrosoftDomain {
 
     $failedSteps = @()
     $MailboxProof = $null
+    $actionForProofRefresh = Get-Action -ActionId $ActionId
+    $mailboxProofRefresh = Test-ActionMailboxProofRefresh -Action $actionForProofRefresh
 
     Write-Host ""
     Write-Host "================================================================" -ForegroundColor Magenta
@@ -2673,6 +2688,14 @@ function Process-MicrosoftDomain {
         "Both - Sending Tool Upload Blocked", "Both - Sending Tool Upload Failed",
         "Both - Provisioning Complete", "Both - Failed"
     )
+
+    if ($mailboxProofRefresh -and $interimStatus -eq "Both - Provisioning Complete") {
+        Write-Log "Mailbox proof refresh requested for completed domain; resuming at pre-upload proof gate" -Level Warning
+        $interimStatus = "Both - DKIM Complete"
+    } elseif ($interimStatus -eq "Microsoft - Mailbox Proof Pending") {
+        Write-Log "Mailbox proof is pending; resuming at pre-upload proof gate" -Level Warning
+        $interimStatus = "Both - DKIM Complete"
+    }
 
     if ($interimStatus -eq "Both - Provisioning Complete") {
         Write-Log "Already completed, skipping" -Level Warning
@@ -3261,7 +3284,8 @@ if ($inboxes.Count -eq 0) {
     }
 
     $interimStatus = if ($domainRecord.interim_status) { [string]$domainRecord.interim_status } else { "" }
-    if ($interimStatus -eq "Both - DKIM Complete") {
+    $mailboxProofRefresh = Test-ActionMailboxProofRefresh -Action $actionRecord
+    if ($mailboxProofRefresh -or $interimStatus -eq "Microsoft - Mailbox Proof Pending" -or $interimStatus -eq "Both - DKIM Complete") {
         Write-Log "No pending inboxes; reconnecting to validate Exchange mailbox count before upload" -Level Warning
         $inboxes = $activeInboxes
     } elseif ($interimStatus -in @("Both - Sending Tool Upload Pending", "Both - Sending Tool Upload Blocked", "Both - Sending Tool Upload Failed", "Both - Provisioning Complete")) {
