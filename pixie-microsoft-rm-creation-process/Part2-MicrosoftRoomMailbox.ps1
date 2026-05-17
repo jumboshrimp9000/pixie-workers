@@ -2716,6 +2716,14 @@ function Process-MicrosoftDomain {
         "Both - Sending Tool Upload Blocked",
         "Both - Sending Tool Upload Failed"
     )
+    if ($mailboxProofRefresh -and $Inboxes.Count -gt 0) {
+        $ignorePendingReason = "Mailbox proof refresh requested; ignoring $($Inboxes.Count) pending inbox row(s) and validating active mailbox readback only"
+        Write-Log $ignorePendingReason -Level Warning
+        Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "mailbox_proof_refresh_ignored_pending_inboxes" -Severity "warn" -Message $ignorePendingReason -Metadata @{
+            pending_inboxes = $Inboxes.Count
+        }
+        $Inboxes = @()
+    }
     if ($Inboxes.Count -gt 0 -and $interimStatus -in $statusesAfterMailboxCreation) {
         $rewindReason = "Found $($Inboxes.Count) pending inbox row(s) while domain was at '$interimStatus'; rewinding to mailbox creation before finalization"
         Write-Log $rewindReason -Level Warning
