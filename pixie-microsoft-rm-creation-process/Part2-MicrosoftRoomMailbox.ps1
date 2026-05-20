@@ -3048,6 +3048,19 @@ function Process-MicrosoftDomain {
     # ── STEP 3: Verify domain ──
     if ($interimStatus -eq "Both - Verification TXT Added") {
         if (-not $DryRun) {
+            $verificationTxt = Get-DomainVerificationRecord -Bearer $Bearer -Domain $Domain
+            if ($verificationTxt) {
+                $cfResult = Set-CloudflareDnsRecord -ZoneId $ZoneId -Type "TXT" -Name "@" -Domain $Domain -Content $verificationTxt
+                if ($cfResult.Success -or $cfResult.AlreadyExists) {
+                    Write-Log "Verification TXT refreshed before Microsoft verify for $Domain" -Level Success
+                    Start-Sleep -Seconds 15
+                } else {
+                    Write-Log "Failed to refresh verification TXT for $Domain before Microsoft verify" -Level Warning
+                }
+            } else {
+                Write-Log "Microsoft did not return a verification TXT for $Domain before verification retry" -Level Warning
+            }
+
             $verified = Verify-M365Domain -Bearer $Bearer -Domain $Domain
             if (-not $verified -and -not (Test-DomainVerified -Bearer $Bearer -Domain $Domain)) {
                 Stop-MicrosoftProvisioningWithAction -DomainId $DomainId -CustomerId $CustomerId -ActionId $ActionId -History $history -Reason "Microsoft domain verification failed after worker checks; retrying after DNS/Microsoft propagation delay." -EventType "domain_verify_failed" -Step "domain_verification" -InterimStatus "Both - Verification TXT Added" -Retryable $true -DelaySeconds 600 | Out-Null
