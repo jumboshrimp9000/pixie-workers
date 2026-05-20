@@ -2376,6 +2376,24 @@ function Test-ImapProxyMailboxLogin {
     }
 }
 
+function Test-SmtpPlusImapProxyFailureRetryable {
+    param([object]$Check)
+
+    $errorText = [string]$Check.Error
+    $loginLine = [string]$Check.LoginLine
+    $selectLine = [string]$Check.SelectLine
+
+    if ($errorText -match "Missing email|Missing password") { return $false }
+    if ($errorText -match "login failed" -and $loginLine -match "AUTHENTICATIONFAILED|Invalid credentials|Wrong password|NO|BAD") {
+        return $false
+    }
+
+    return (
+        $errorText -match "Timed out|timeout|Unexpected IMAP greeting|inbox select failed|connection|closed|reset|temporar|not ready|unavailable" -or
+        [string]::IsNullOrWhiteSpace($selectLine)
+    )
+}
+
 function Confirm-SmtpPlusImapProxyAccessForDomain {
     param(
         [string]$DomainId,
@@ -2392,46 +2410,93 @@ function Confirm-SmtpPlusImapProxyAccessForDomain {
 
     $passed = 0
     $failed = @()
+    $retryableFailed = @()
+    $hardFailed = @()
     $imapHost = if ($env:SMTP_PLUS_IMAP_HOST) { $env:SMTP_PLUS_IMAP_HOST } elseif ($env:IMAP_PROXY_HOST) { $env:IMAP_PROXY_HOST } else { "imap.simpleinboxes.com" }
     $port = if ($env:SMTP_PLUS_IMAP_PORT) { [int]$env:SMTP_PLUS_IMAP_PORT } elseif ($env:IMAP_PROXY_PORT) { [int]$env:IMAP_PROXY_PORT } else { 993 }
+    $maxAttempts = 4
+    if ($env:SMTP_PLUS_IMAP_VALIDATION_ATTEMPTS) {
+        try { $maxAttempts = [Math]::Max(1, [int]$env:SMTP_PLUS_IMAP_VALIDATION_ATTEMPTS) } catch { $maxAttempts = 4 }
+    }
+    $retryDelaySeconds = 30
+    if ($env:SMTP_PLUS_IMAP_VALIDATION_RETRY_SECONDS) {
+        try { $retryDelaySeconds = [Math]::Max(5, [int]$env:SMTP_PLUS_IMAP_VALIDATION_RETRY_SECONDS) } catch { $retryDelaySeconds = 30 }
+    }
 
     Write-Log "Validating SMTP+ IMAP proxy login for $($activeInboxes.Count) inbox(es) on $Domain via ${imapHost}:${port}" -Level Info
 
     foreach ($inbox in $activeInboxes) {
         $email = [string]$inbox.email
         $password = [string]$inbox.password
-        $check = Test-ImapProxyMailboxLogin -Email $email -Password $password -ImapHost $imapHost -Port $port
-        if ($check.Success) {
-            $passed++
-            Write-Log "SMTP+ IMAP proxy validated for $email" -Level Success
-        } else {
+        $check = $null
+        $validated = $false
+        $retryable = $false
+        $attemptUsed = 0
+
+        for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+            $attemptUsed = $attempt
+            $check = Test-ImapProxyMailboxLogin -Email $email -Password $password -ImapHost $imapHost -Port $port
+            if ($check.Success) {
+                $passed++
+                $validated = $true
+                Write-Log "SMTP+ IMAP proxy validated for $email (attempt $attempt/$maxAttempts)" -Level Success
+                break
+            }
+
+            $retryable = Test-SmtpPlusImapProxyFailureRetryable -Check $check
             $reason = "$email`: $($check.Error)"
             if ($check.LoginLine) { $reason += " ($($check.LoginLine))" }
             if ($check.SelectLine) { $reason += " ($($check.SelectLine))" }
+
+            if ($retryable -and $attempt -lt $maxAttempts) {
+                Write-Log "SMTP+ IMAP proxy not ready for ${email}: $reason; retrying in ${retryDelaySeconds}s (attempt $attempt/$maxAttempts)" -Level Warning
+                Start-Sleep -Seconds $retryDelaySeconds
+                continue
+            }
+        }
+
+        if (-not $validated) {
+            $reason = "$email`: $($check.Error)"
+            if ($check.LoginLine) { $reason += " ($($check.LoginLine))" }
+            if ($check.SelectLine) { $reason += " ($($check.SelectLine))" }
+            $reason += " after $attemptUsed attempt(s)"
             $failed += $reason
+            if ($retryable) {
+                $retryableFailed += $reason
+            } else {
+                $hardFailed += $reason
+            }
             Write-Log "SMTP+ IMAP proxy validation failed for ${email}: $reason" -Level Error
         }
     }
 
     $success = ($failed.Count -eq 0)
+    $pending = (-not $success -and $hardFailed.Count -eq 0)
     $metadata = @{
         domain = $Domain
         imap_host = $imapHost
         imap_port = $port
+        validation_attempts = $maxAttempts
+        retry_delay_seconds = $retryDelaySeconds
         total = $activeInboxes.Count
         passed = $passed
         failed = $failed
+        retryable_failed = $retryableFailed
+        hard_failed = $hardFailed
     }
 
     if ($success) {
         Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "smtp_plus_imap_proxy_validated" -Severity "info" -Message "SMTP+ IMAP proxy login validated for $passed inbox(es)." -Metadata $metadata
         Set-DomainFulfillmentStep -DomainId $DomainId -CustomerId $CustomerId -OrderBatchId $OrderBatchId -StepKey "inboxes" -Status "done" -Owner "provider" -Summary "Microsoft mailboxes and SMTP+ IMAP proxy access are ready." -NextAction "" -ActionId $ActionId -Evidence $metadata | Out-Null
+    } elseif ($pending) {
+        Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "smtp_plus_imap_proxy_validation_pending" -Severity "warn" -Message "SMTP+ IMAP proxy login validation is still pending after retries." -Metadata $metadata
+        Set-DomainFulfillmentStep -DomainId $DomainId -CustomerId $CustomerId -OrderBatchId $OrderBatchId -StepKey "inboxes" -Status "in_progress" -Owner "provider" -Summary "SMTP+ IMAP proxy login is still pending." -NextAction "No action needed yet. The worker will retry after Microsoft/proxy readiness catches up." -ActionId $ActionId -Evidence $metadata | Out-Null
     } else {
         Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "smtp_plus_imap_proxy_validation_failed" -Severity "error" -Message "SMTP+ IMAP proxy login validation failed." -Metadata $metadata
         Set-DomainFulfillmentStep -DomainId $DomainId -CustomerId $CustomerId -OrderBatchId $OrderBatchId -StepKey "inboxes" -Status "blocked" -Owner "ops" -Summary "SMTP+ IMAP proxy login failed." -NextAction "Fix the IMAP proxy routing or Microsoft mailbox client access, then retry provisioning." -BlockerCode "smtp_plus_imap_proxy_failed" -ActionId $ActionId -Evidence $metadata | Out-Null
     }
 
-    return @{ Success = $success; Total = $activeInboxes.Count; Passed = $passed; Failed = $failed; Host = $imapHost; Port = $port }
+    return @{ Success = $success; Pending = $pending; Retryable = $pending; Total = $activeInboxes.Count; Passed = $passed; Failed = $failed; RetryableFailed = $retryableFailed; HardFailed = $hardFailed; Host = $imapHost; Port = $port; RetryDelaySeconds = $retryDelaySeconds; ValidationAttempts = $maxAttempts }
 }
 
 # ============================================================================
@@ -3443,6 +3508,25 @@ function Process-MicrosoftDomain {
                 $imapProxyValidation = Confirm-SmtpPlusImapProxyAccessForDomain -DomainId $DomainId -Domain $Domain -ActionId $ActionId -CustomerId $CustomerId -OrderBatchId $OrderBatchId
                 if ($imapProxyValidation.Success) {
                     $history = Add-HistoryEntry -History $history -Entry "SMTP+ IMAP proxy validated: $($imapProxyValidation.Passed)/$($imapProxyValidation.Total) inboxes"
+                } elseif ($imapProxyValidation.Pending) {
+                    $delaySeconds = 300
+                    if ($env:SMTP_PLUS_IMAP_PROXY_RETRY_DELAY_SECONDS) {
+                        try { $delaySeconds = [Math]::Max(60, [int]$env:SMTP_PLUS_IMAP_PROXY_RETRY_DELAY_SECONDS) } catch { $delaySeconds = 300 }
+                    }
+                    $metadata = @{
+                        domain = $Domain
+                        total = $imapProxyValidation.Total
+                        passed = $imapProxyValidation.Passed
+                        failed = $imapProxyValidation.Failed
+                        retryable_failed = $imapProxyValidation.RetryableFailed
+                        hard_failed = $imapProxyValidation.HardFailed
+                        imap_host = $imapProxyValidation.Host
+                        imap_port = $imapProxyValidation.Port
+                        validation_attempts = $imapProxyValidation.ValidationAttempts
+                        in_process_retry_delay_seconds = $imapProxyValidation.RetryDelaySeconds
+                    }
+                    $history = Stop-MicrosoftProvisioningWithAction -DomainId $DomainId -CustomerId $CustomerId -ActionId $ActionId -History $history -Reason "SMTP+ IMAP proxy validation pending" -EventType "smtp_plus_imap_proxy_validation_pending" -Step "smtp_plus_imap_proxy_validation" -InterimStatus "Both - DKIM Complete" -Retryable $true -DelaySeconds $delaySeconds -Metadata $metadata
+                    return
                 } else {
                     $failedSteps += "SMTP+ IMAP Proxy Validation"
                     $history = Add-HistoryEntry -History $history -Entry "FAILED: SMTP+ IMAP proxy validation failed ($($imapProxyValidation.Passed)/$($imapProxyValidation.Total) passed)"
