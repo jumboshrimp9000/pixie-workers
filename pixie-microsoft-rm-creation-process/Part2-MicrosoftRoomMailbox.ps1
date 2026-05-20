@@ -61,6 +61,7 @@ function Add-CloudflareDnsRecord {
         [string]$Type,
         [string]$Name,
         [string]$Content,
+        [string]$Domain = "",
         [int]$TTL = 3600,
         [int]$Priority = -1
     )
@@ -72,13 +73,26 @@ function Add-CloudflareDnsRecord {
         "Content-Type" = "application/json"
     }
 
-    $body = @{ type = $Type; name = $Name; content = $Content; ttl = $TTL }
+    $recordName = $Name
+    if ($Domain) {
+        $normalizedName = ([string]$Name).TrimEnd(".")
+        $normalizedDomain = ([string]$Domain).TrimEnd(".")
+        if ($normalizedName -eq "@") {
+            $recordName = $normalizedDomain
+        } elseif ($normalizedName -eq $normalizedDomain -or $normalizedName -match ([regex]::Escape($normalizedDomain) + "$")) {
+            $recordName = $normalizedName
+        } else {
+            $recordName = "$normalizedName.$normalizedDomain"
+        }
+    }
+
+    $body = @{ type = $Type; name = $recordName; content = $Content; ttl = $TTL }
     if ($Priority -ge 0 -and $Type -eq "MX") { $body.priority = $Priority }
 
     try {
         $bodyJson = $body | ConvertTo-Json -Depth 5 -Compress
         Invoke-RestMethod -Method POST -Uri "https://api.cloudflare.com/client/v4/zones/$ZoneId/dns_records" -Headers $headers -Body $bodyJson -UserAgent "pixie-worker/1.0" -TimeoutSec 30 -ErrorAction Stop | Out-Null
-        Write-Log "Added $Type record: $Name -> $Content" -Level Success
+        Write-Log "Added $Type record: $recordName -> $Content" -Level Success
         return @{ Success = $true }
     } catch {
         $errMsg = $_.Exception.Message
@@ -88,10 +102,10 @@ function Add-CloudflareDnsRecord {
         $statusCode = $null
         if ($_.Exception.Response) { $statusCode = [int]$_.Exception.Response.StatusCode }
         if ($errMsg -match "already exists" -or $detailMsg -match "already exists" -or $detailMsg -match "same type" -or $statusCode -eq 409 -or ($statusCode -eq 400 -and $detailMsg -match "already exists|same type|Record already")) {
-            Write-Log "$Type record already exists: $Name" -Level Warning
+            Write-Log "$Type record already exists: $recordName" -Level Warning
             return @{ Success = $true; AlreadyExists = $true }
         }
-        Write-Log "Failed to add $Type record ($Name): $errMsg | Detail: $detailMsg" -Level Error
+        Write-Log "Failed to add $Type record ($recordName): $errMsg | Detail: $detailMsg" -Level Error
         return @{ Success = $false; Error = $errMsg }
     }
 }
@@ -148,7 +162,7 @@ function Set-CloudflareDnsRecord {
         Write-Log "Failed to inspect/update $Type record ($Name): $($_.Exception.Message)" -Level Warning
     }
 
-    return Add-CloudflareDnsRecord -ZoneId $ZoneId -Type $Type -Name $Name -Content $Content -TTL $TTL -Priority $Priority
+    return Add-CloudflareDnsRecord -ZoneId $ZoneId -Type $Type -Name $recordName -Content $Content -TTL $TTL -Priority $Priority
 }
 
 # ============================================================================
@@ -533,6 +547,29 @@ function Get-DomainVerificationRecord {
     return $null
 }
 
+function Disable-MicrosoftAdminForAuthFailure {
+    param(
+        [object]$AdminRecord,
+        [string]$DomainId,
+        [string]$ActionId,
+        [string]$Reason
+    )
+
+    if (-not $AdminRecord -or -not $AdminRecord.id) { return }
+
+    $nowIso = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    Invoke-SupabaseApi -Method PATCH -Table "admin_credentials" -Query "id=eq.$($AdminRecord.id)" -Body @{
+        active = $false
+        status = "Active"
+        locked_by_action_id = $null
+        locked_domain_id = $null
+        lock_type = $null
+        lock_acquired_at = $null
+        lock_expires_at = $null
+        updated_at = $nowIso
+    } | Out-Null
+}
+
 function Test-DomainVerified {
     param([string]$Bearer, [string]$Domain)
     try {
@@ -794,16 +831,16 @@ function Add-M365DnsRecords {
             $result = $null
             switch ($rec.recordType) {
                 "Mx" {
-                    $result = Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "MX" -Name "@" -Content $rec.mailExchange -Priority $rec.preference
+                    $result = Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "MX" -Name "@" -Domain $Domain -Content $rec.mailExchange -Priority $rec.preference
                 }
                 "Txt" {
                     if ($rec.text -match "spf") {
-                        $result = Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "TXT" -Name "@" -Content $rec.text
+                        $result = Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "TXT" -Name "@" -Domain $Domain -Content $rec.text
                     }
                 }
                 "CName" {
                     $cnameName = $rec.label -replace "\.$Domain$", ""
-                    $result = Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "CNAME" -Name $cnameName -Content $rec.canonicalName
+                    $result = Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "CNAME" -Name $cnameName -Domain $Domain -Content $rec.canonicalName
                 }
             }
             if ($result) {
@@ -813,7 +850,7 @@ function Add-M365DnsRecords {
             }
         }
 
-        $dmarcResult = Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "TXT" -Name "_dmarc" -Content "v=DMARC1; p=none"
+        $dmarcResult = Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "TXT" -Name "_dmarc" -Domain $Domain -Content "v=DMARC1; p=none"
         if ($dmarcResult.AlreadyExists) { $existed++ } elseif ($dmarcResult.Success) { $added++ } else { $failed++ }
 
         $total = $added + $existed + $failed
@@ -828,10 +865,10 @@ function Add-M365DnsRecords {
         Write-Log "Failed to fetch DNS from Microsoft: $($_.Exception.Message). Using fallback records." -Level Warning
 
         $mxHost = $Domain -replace '\.', '-'
-        Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "MX" -Name "@" -Content "$mxHost.mail.protection.outlook.com" -Priority 0 | Out-Null
-        Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "TXT" -Name "@" -Content "v=spf1 include:spf.protection.outlook.com -all" | Out-Null
-        Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "TXT" -Name "_dmarc" -Content "v=DMARC1; p=none" | Out-Null
-        Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "CNAME" -Name "autodiscover" -Content "autodiscover.outlook.com" | Out-Null
+        Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "MX" -Name "@" -Domain $Domain -Content "$mxHost.mail.protection.outlook.com" -Priority 0 | Out-Null
+        Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "TXT" -Name "@" -Domain $Domain -Content "v=spf1 include:spf.protection.outlook.com -all" | Out-Null
+        Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "TXT" -Name "_dmarc" -Domain $Domain -Content "v=DMARC1; p=none" | Out-Null
+        Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "CNAME" -Name "autodiscover" -Domain $Domain -Content "autodiscover.outlook.com" | Out-Null
 
         return $true
     }
@@ -2160,8 +2197,37 @@ function Confirm-DomainClientAccessForDomain {
         return @{ Success = $false; Total = 0; Enabled = 0; Failed = @("No mailboxes found") }
     }
 
-    Write-Log "Domain-level client access ready; skipping per-mailbox Set-CASMailbox loop ($total mailbox rows)" -Level Success
-    return @{ Success = $true; Total = $total; Enabled = $total; Failed = @() }
+    $enabled = 0
+    $failed = @()
+
+    foreach ($mb in $mailboxes) {
+        $email = $mb.PrimarySmtpAddress.ToString()
+
+        try {
+            Set-CASMailbox -Identity $email -SmtpClientAuthenticationDisabled $false -ImapEnabled $true -MAPIEnabled $true -ErrorAction Stop
+            Start-Sleep -Seconds 1
+
+            $cas = Get-CASMailbox -Identity $email -ErrorAction Stop
+            if ($cas.ImapEnabled -eq $true -and $cas.SmtpClientAuthenticationDisabled -eq $false) {
+                $enabled++
+                Write-Log "Client access confirmed for $email (IMAP enabled, SMTP auth enabled)" -Level Success
+            } else {
+                $failed += "$email`: IMAP/SMTP auth is still not ready after Set-CASMailbox (ImapEnabled=$($cas.ImapEnabled), SmtpClientAuthenticationDisabled=$($cas.SmtpClientAuthenticationDisabled))"
+                Write-Log "Client access not ready for $email`: IMAP/SMTP auth is still not ready after Set-CASMailbox" -Level Error
+            }
+        } catch {
+            $message = $_.Exception.Message
+            $failed += "$email`: $message"
+            Write-Log "Failed to enable client access for $email`: $message" -Level Error
+        }
+    }
+
+    if ($failed.Count -gt 0) {
+        return @{ Success = $false; Total = $total; Enabled = $enabled; Failed = $failed }
+    }
+
+    Write-Log "Domain-level client access ready for $Domain ($enabled/$total mailboxes with IMAP enabled)" -Level Success
+    return @{ Success = $true; Total = $total; Enabled = $enabled; Failed = @() }
 }
 
 # ============================================================================
@@ -2235,6 +2301,161 @@ function Sync-ActiveInboxPasswordsForUpload {
 
     Write-Log "Password sync complete before upload for $Domain" -Level Success
     return $true
+}
+
+function ConvertTo-ImapQuotedString {
+    param([string]$Value)
+
+    $safe = ([string]$Value).Replace("\", "\\").Replace('"', '\"')
+    return '"' + $safe + '"'
+}
+
+function Read-ImapTaggedResponse {
+    param(
+        [System.IO.StreamReader]$Reader,
+        [string]$Tag,
+        [int]$MaxLines = 80
+    )
+
+    $lines = @()
+    for ($i = 0; $i -lt $MaxLines; $i++) {
+        $line = $Reader.ReadLine()
+        if ($null -eq $line) { break }
+        $lines += $line
+        if ($line.StartsWith("$Tag ")) {
+            return @{ Line = $line; Lines = $lines }
+        }
+    }
+
+    return @{ Line = ""; Lines = $lines }
+}
+
+function Test-ImapProxyMailboxLogin {
+    param(
+        [string]$Email,
+        [string]$Password,
+        [string]$Host = $(if ($env:SMTP_PLUS_IMAP_HOST) { $env:SMTP_PLUS_IMAP_HOST } elseif ($env:IMAP_PROXY_HOST) { $env:IMAP_PROXY_HOST } else { "imap.simpleinboxes.com" }),
+        [int]$Port = $(if ($env:SMTP_PLUS_IMAP_PORT) { [int]$env:SMTP_PLUS_IMAP_PORT } elseif ($env:IMAP_PROXY_PORT) { [int]$env:IMAP_PROXY_PORT } else { 993 })
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Email)) {
+        return @{ Success = $false; Email = $Email; Host = $Host; Port = $Port; Error = "Missing email" }
+    }
+    if ([string]::IsNullOrWhiteSpace($Password)) {
+        return @{ Success = $false; Email = $Email; Host = $Host; Port = $Port; Error = "Missing password" }
+    }
+
+    $client = $null
+    $ssl = $null
+    $reader = $null
+    $writer = $null
+
+    try {
+        $client = [System.Net.Sockets.TcpClient]::new()
+        $client.ReceiveTimeout = 30000
+        $client.SendTimeout = 30000
+
+        $connect = $client.BeginConnect($Host, $Port, $null, $null)
+        if (-not $connect.AsyncWaitHandle.WaitOne(15000)) {
+            $client.Close()
+            return @{ Success = $false; Email = $Email; Host = $Host; Port = $Port; Error = "Timed out connecting to IMAP proxy" }
+        }
+        $client.EndConnect($connect)
+
+        $ssl = [System.Net.Security.SslStream]::new($client.GetStream(), $false)
+        $ssl.AuthenticateAsClient($Host)
+
+        $reader = [System.IO.StreamReader]::new($ssl, [System.Text.Encoding]::ASCII, $false, 4096, $true)
+        $writer = [System.IO.StreamWriter]::new($ssl, [System.Text.Encoding]::ASCII, 4096, $true)
+        $writer.NewLine = "`r`n"
+        $writer.AutoFlush = $true
+
+        $greeting = $reader.ReadLine()
+        if (-not $greeting -or -not $greeting.StartsWith("* OK")) {
+            return @{ Success = $false; Email = $Email; Host = $Host; Port = $Port; Error = "Unexpected IMAP greeting"; Greeting = $greeting }
+        }
+
+        $writer.WriteLine("a1 LOGIN $(ConvertTo-ImapQuotedString -Value $Email) $(ConvertTo-ImapQuotedString -Value $Password)")
+        $login = Read-ImapTaggedResponse -Reader $reader -Tag "a1"
+        if (-not $login.Line.StartsWith("a1 OK")) {
+            return @{ Success = $false; Email = $Email; Host = $Host; Port = $Port; Error = "IMAP proxy login failed"; LoginLine = $login.Line }
+        }
+
+        $writer.WriteLine("a2 SELECT INBOX")
+        $select = Read-ImapTaggedResponse -Reader $reader -Tag "a2"
+        if (-not $select.Line.StartsWith("a2 OK")) {
+            return @{ Success = $false; Email = $Email; Host = $Host; Port = $Port; Error = "IMAP proxy inbox select failed"; LoginLine = $login.Line; SelectLine = $select.Line }
+        }
+
+        try { $writer.WriteLine("a3 LOGOUT") } catch { }
+        return @{ Success = $true; Email = $Email; Host = $Host; Port = $Port; LoginLine = $login.Line; SelectLine = $select.Line }
+    } catch {
+        return @{ Success = $false; Email = $Email; Host = $Host; Port = $Port; Error = $_.Exception.Message }
+    } finally {
+        foreach ($resource in @($writer, $reader, $ssl, $client)) {
+            if ($resource) {
+                try { $resource.Dispose() } catch { try { $resource.Close() } catch { } }
+            }
+        }
+    }
+}
+
+function Confirm-SmtpPlusImapProxyAccessForDomain {
+    param(
+        [string]$DomainId,
+        [string]$Domain,
+        [string]$ActionId,
+        [string]$CustomerId,
+        [string]$OrderBatchId
+    )
+
+    $activeInboxes = @(Get-ActiveDomainInboxes -DomainId $DomainId)
+    if ($activeInboxes.Count -eq 0) {
+        return @{ Success = $false; Total = 0; Passed = 0; Failed = @("No active inboxes found for IMAP proxy validation") }
+    }
+
+    $passed = 0
+    $failed = @()
+    $host = if ($env:SMTP_PLUS_IMAP_HOST) { $env:SMTP_PLUS_IMAP_HOST } elseif ($env:IMAP_PROXY_HOST) { $env:IMAP_PROXY_HOST } else { "imap.simpleinboxes.com" }
+    $port = if ($env:SMTP_PLUS_IMAP_PORT) { [int]$env:SMTP_PLUS_IMAP_PORT } elseif ($env:IMAP_PROXY_PORT) { [int]$env:IMAP_PROXY_PORT } else { 993 }
+
+    Write-Log "Validating SMTP+ IMAP proxy login for $($activeInboxes.Count) inbox(es) on $Domain via ${host}:${port}" -Level Info
+
+    foreach ($inbox in $activeInboxes) {
+        $email = [string]$inbox.email
+        $password = [string]$inbox.password
+        $check = Test-ImapProxyMailboxLogin -Email $email -Password $password -Host $host -Port $port
+        if ($check.Success) {
+            $passed++
+            Write-Log "SMTP+ IMAP proxy validated for $email" -Level Success
+        } else {
+            $reason = "$email`: $($check.Error)"
+            if ($check.LoginLine) { $reason += " ($($check.LoginLine))" }
+            if ($check.SelectLine) { $reason += " ($($check.SelectLine))" }
+            $failed += $reason
+            Write-Log "SMTP+ IMAP proxy validation failed for ${email}: $reason" -Level Error
+        }
+    }
+
+    $success = ($failed.Count -eq 0)
+    $metadata = @{
+        domain = $Domain
+        imap_host = $host
+        imap_port = $port
+        total = $activeInboxes.Count
+        passed = $passed
+        failed = $failed
+    }
+
+    if ($success) {
+        Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "smtp_plus_imap_proxy_validated" -Severity "info" -Message "SMTP+ IMAP proxy login validated for $passed inbox(es)." -Metadata $metadata
+        Set-DomainFulfillmentStep -DomainId $DomainId -CustomerId $CustomerId -OrderBatchId $OrderBatchId -StepKey "inboxes" -Status "done" -Owner "provider" -Summary "Microsoft mailboxes and SMTP+ IMAP proxy access are ready." -NextAction "" -ActionId $ActionId -Evidence $metadata | Out-Null
+    } else {
+        Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "smtp_plus_imap_proxy_validation_failed" -Severity "error" -Message "SMTP+ IMAP proxy login validation failed." -Metadata $metadata
+        Set-DomainFulfillmentStep -DomainId $DomainId -CustomerId $CustomerId -OrderBatchId $OrderBatchId -StepKey "inboxes" -Status "blocked" -Owner "ops" -Summary "SMTP+ IMAP proxy login failed." -NextAction "Fix the IMAP proxy routing or Microsoft mailbox client access, then retry provisioning." -BlockerCode "smtp_plus_imap_proxy_failed" -ActionId $ActionId -Evidence $metadata | Out-Null
+    }
+
+    return @{ Success = $success; Total = $activeInboxes.Count; Passed = $passed; Failed = $failed; Host = $host; Port = $port }
 }
 
 # ============================================================================
@@ -2747,7 +2968,14 @@ function Process-MicrosoftDomain {
     $Bearer = Get-ROPCToken -TenantId $tenantId -ClientId $AzureCliPublicClientId -Username $AdminEmail -Password $AdminPassword
     if (-not $Bearer) {
         Write-Log "Failed to get Graph token" -Level Error
-        Stop-MicrosoftProvisioningWithAction -DomainId $DomainId -CustomerId $CustomerId -ActionId $ActionId -History $history -Reason "ROPC token failed for Microsoft admin $AdminEmail. Confirm password, MFA, and tenant sign-in policy." -EventType "graph_token_failed" -Step "graph_token" | Out-Null
+        $authFailureReason = "ROPC token failed for Microsoft admin $AdminEmail. Confirm password, MFA, and tenant sign-in policy."
+        Disable-MicrosoftAdminForAuthFailure -AdminRecord $AdminRecord -DomainId $DomainId -ActionId $ActionId -Reason $authFailureReason
+        Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "microsoft_admin_disabled_after_auth_failure" -Severity "error" -Message "Microsoft admin was removed from automatic rotation after token acquisition failed." -Metadata @{
+            admin_id = [string]$AdminRecord.id
+            admin_email = $AdminEmail
+            next_action = "Review the Microsoft admin sign-in challenge or password before reactivating this credential."
+        }
+        Stop-MicrosoftProvisioningWithAction -DomainId $DomainId -CustomerId $CustomerId -ActionId $ActionId -History $history -Reason $authFailureReason -EventType "graph_token_failed" -Step "graph_token" | Out-Null
         return
     }
     Write-Log "Graph token acquired" -Level Success
@@ -2829,7 +3057,7 @@ function Process-MicrosoftDomain {
             }
 
             # All DNS records go through Cloudflare (NS already pointing to CF)
-            $cfResult = Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "TXT" -Name "@" -Content $verificationTxt
+            $cfResult = Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "TXT" -Name "@" -Domain $Domain -Content $verificationTxt
             if (-not $cfResult.Success -and -not $cfResult.AlreadyExists) {
                 Write-Log "Failed to add verification TXT to Cloudflare" -Level Error
             }
@@ -2906,7 +3134,7 @@ function Process-MicrosoftDomain {
 
                 $verificationTxt = Get-DomainVerificationRecord -Bearer $Bearer -Domain $Domain
                 if ($verificationTxt) {
-                    $cfResult = Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "TXT" -Name "@" -Content $verificationTxt
+                    $cfResult = Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "TXT" -Name "@" -Domain $Domain -Content $verificationTxt
                     if (-not $cfResult.Success -and -not $cfResult.AlreadyExists) {
                         Write-Log "Failed to refresh verification TXT for $Domain before verification retry" -Level Warning
                     }
@@ -3202,6 +3430,16 @@ function Process-MicrosoftDomain {
             }
             $passwordSyncOk = Sync-ActiveInboxPasswordsForUpload -DomainId $DomainId -Domain $Domain -Bearer $Bearer
             if (-not $passwordSyncOk) { $failedSteps += "Password Sync" }
+
+            if ($NormalizedProvider -eq "smtp_plus") {
+                $imapProxyValidation = Confirm-SmtpPlusImapProxyAccessForDomain -DomainId $DomainId -Domain $Domain -ActionId $ActionId -CustomerId $CustomerId -OrderBatchId $OrderBatchId
+                if ($imapProxyValidation.Success) {
+                    $history = Add-HistoryEntry -History $history -Entry "SMTP+ IMAP proxy validated: $($imapProxyValidation.Passed)/$($imapProxyValidation.Total) inboxes"
+                } else {
+                    $failedSteps += "SMTP+ IMAP Proxy Validation"
+                    $history = Add-HistoryEntry -History $history -Entry "FAILED: SMTP+ IMAP proxy validation failed ($($imapProxyValidation.Passed)/$($imapProxyValidation.Total) passed)"
+                }
+            }
         }
 
         if ($failedSteps.Count -eq 0) {

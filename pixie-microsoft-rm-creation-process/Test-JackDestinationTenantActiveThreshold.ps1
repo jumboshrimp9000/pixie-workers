@@ -730,6 +730,45 @@ function Update-AdminStatus {
     Invoke-SupabaseApi -Method PATCH -Table "admin_credentials" -Query "id=eq.$AdminId" -Body $body | Out-Null
 }
 
+function Update-AdminThresholdCheck {
+    param([object]$Result)
+    $adminId = ([string]$Result.admin_id).Trim()
+    if (-not $adminId) { return }
+
+    $completedAt = ([string]$Result.completed_at).Trim()
+    if (-not $completedAt) { $completedAt = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ") }
+
+    $body = @{
+        last_threshold_checked_at = $completedAt
+        last_threshold_check_result = [string]$Result.result
+        last_threshold_check_method = [string]$Result.method
+        last_threshold_check_trace_status = [string]$Result.trace_status
+        last_threshold_check_evidence = [string]$Result.evidence
+        last_threshold_check_error = [string]$Result.error
+        last_threshold_probe_mailbox = [string]$Result.test_mailbox
+        updated_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+    }
+
+    $domainCount = 0
+    if ([int]::TryParse([string]$Result.domain_count, [ref]$domainCount)) {
+        $body.threshold_check_domain_count = $domainCount
+    }
+
+    $activeInboxCount = 0
+    if ([int]::TryParse([string]$Result.active_inbox_count, [ref]$activeInboxCount)) {
+        $body.threshold_check_active_inbox_count = $activeInboxCount
+    }
+
+    if (([string]$Result.result).Trim().ToLowerInvariant() -eq "threshold") {
+        $body.status = "Threshold Exceeded"
+    }
+
+    $updateResult = Invoke-SupabaseApi -Method PATCH -Table "admin_credentials" -Query "id=eq.$adminId" -Body $body
+    if (-not $updateResult.Success) {
+        Write-Log "Threshold result was captured in output files, but app-side tracking update failed for ${adminId}: $($updateResult.Error)" -Level Warning
+    }
+}
+
 function Connect-ExchangeOnlineWithRetry {
     param([System.Management.Automation.PSCredential]$Credential, [string]$AdminEmail)
 
@@ -881,6 +920,7 @@ foreach ($target in $allTargets) {
     $index += 1
     Write-Log "[$index/$($allTargets.Count)] Testing $($target.AdminEmail) ($($target.DomainCount) moved domain(s))" -Level Info
     $result = Test-TargetTenant -Target $target
+    Update-AdminThresholdCheck -Result $result
     $results.Add($result) | Out-Null
     Write-Jsonl -Payload $result
     $results | Export-Csv -Path $OutputCsv -NoTypeInformation

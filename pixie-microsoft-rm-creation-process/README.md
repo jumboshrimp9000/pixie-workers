@@ -93,7 +93,7 @@ Important behavior:
 - Microsoft does not allow duplicate display names during initial creation, so provisioning uses temporary display names and renames them back after creation
 - room mailboxes delete non-calendar items by default unless calendar auto-processing is disabled
 - this worker must run `Set-CalendarProcessing -AutomateProcessing None -DeleteNonCalendarItems $false`
-- SMTP+ uploads use the generated mailbox password for sending-tool SMTP/IMAP upload. SMTP goes to Microsoft directly; IMAP goes through `imap.simpleinboxes.com`, so this worker must grant the proxy app `IMAP.AccessAsUser.All` delegated tenant consent and run `Set-CASMailbox -SmtpClientAuthenticationDisabled $false -ImapEnabled $true` for each created mailbox before queuing `reupload_inboxes`.
+- SMTP+ uploads use the generated mailbox password for sending-tool SMTP/IMAP upload. SMTP goes to Microsoft directly; IMAP goes through `imap.simpleinboxes.com`, so this worker must grant the proxy app `IMAP.AccessAsUser.All` delegated tenant consent, run `Set-CASMailbox -SmtpClientAuthenticationDisabled $false -ImapEnabled $true` for each created mailbox, and validate a real `LOGIN` + `SELECT INBOX` through the IMAP proxy before queuing `reupload_inboxes` or marking a no-sequencer order complete.
 
 For `azure`, this worker uses the same tenant, DNS, DKIM, upload, update, and cancellation lifecycle, but creates shared mailboxes with `New-Mailbox -Shared`. Azure username changes still run through `microsoft_update_inboxes`; cancellation still deletes only recipients/users whose email/UPN belongs to the cancelled domain.
 
@@ -107,6 +107,7 @@ Endpoint strategy and tradeoff:
 - The domain is marked `active` only when the upload action is `completed`, has zero failed uploads, and reports `uploaded >= active inbox count`.
 - If the original order explicitly set `sending_tool_skipped` or `sequencer_skipped`, Microsoft provisioning marks the domain `active` after mailbox/DKIM completion and records `upload_skipped=true`; missing sending-tool credentials are not treated as a blocker for those orders.
 - If no sending-tool credential is assigned, or the upload action fails validation, Microsoft provisioning is recorded as complete with `upload_blocked=true` while the domain remains `in_progress` at an upload-blocked/failed state. Upload ownership stays with AP `ReuploadWorker`/ops, so mailbox creation does not look failed when the true blocker is sending-tool assignment or validation.
+- SMTP+ additionally performs a direct IMAP proxy validation against `imap.simpleinboxes.com:993` for each active inbox. This catches missing proxy routing, missing Microsoft delegated consent, disabled mailbox IMAP, and password/UPN mismatches before customer-facing tools see `Domain not configured` or generic IMAP connection errors.
 - The worker writes canonical `domain_fulfillment_steps` rows for Microsoft waits, upload skipped/blocked/pending/done states, and final readiness blockers so the internal admin does not have to infer current state from stale action text alone.
 - Completed action updates clear stale `error` text so admin views do not show an old pending/failure reason beside a completed action.
 
