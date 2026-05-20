@@ -485,6 +485,20 @@ function Claim-Action {
     return $null
 }
 
+function Get-ActionFenceQueryFromRow {
+    param([object]$Action)
+
+    if (-not $Action -or -not $Action.id) { return $null }
+    $query = "id=eq.$($Action.id)&status=eq.in_progress&attempts=eq.$([int]$Action.attempts)"
+    $startedAt = ConvertTo-ActionTimestampString $Action.started_at
+    if ($startedAt) {
+        $query += "&started_at=eq.$([uri]::EscapeDataString($startedAt))"
+    } else {
+        $query += "&started_at=is.null"
+    }
+    return $query
+}
+
 function Update-ActionStatus {
     param(
         [string]$ActionId,
@@ -519,6 +533,20 @@ function Update-ActionStatus {
         return $true
     } elseif ($result.Success) {
         Write-Log "Skipped action $ActionId status update to $Status because the lease fence no longer matched" -Level Warning
+        $freshAction = Get-Action -ActionId $ActionId
+        $expectedAttempts = if ($Action -and $Action.attempts -ne $null) { [int]$Action.attempts } else { $null }
+        $freshAttempts = if ($freshAction -and $freshAction.attempts -ne $null) { [int]$freshAction.attempts } else { $null }
+        if ($freshAction -and [string]$freshAction.status -eq "in_progress" -and ($null -eq $expectedAttempts -or $freshAttempts -eq $expectedAttempts)) {
+            $retryQuery = Get-ActionFenceQueryFromRow -Action $freshAction
+            if ($retryQuery) {
+                $retryResult = Invoke-SupabaseApi -Method PATCH -Table "actions" -Query $retryQuery -Body $body
+                if ($retryResult.Success -and $retryResult.Data -and $retryResult.Data.Count -gt 0) {
+                    Write-Log "Recovered action $ActionId status update to $Status using refreshed lease fence" -Level Warning
+                    if ($Status -eq "in_progress") { Register-ActionLeaseFence -Action $retryResult.Data[0] }
+                    return $true
+                }
+            }
+        }
     }
     return $false
 }
@@ -549,6 +577,18 @@ function Fail-Action {
     $result = Invoke-SupabaseApi -Method PATCH -Table "actions" -Query (Get-ActionFenceQuery -ActionId ([string]$Action.id) -Action $Action -RequireFence) -Body $body
     if ($result.Success -and (-not $result.Data -or $result.Data.Count -eq 0)) {
         Write-Log "Skipped failure update for action $($Action.id) because the lease fence no longer matched" -Level Warning
+        $freshAction = Get-Action -ActionId ([string]$Action.id)
+        $expectedAttempts = if ($Action.attempts -ne $null) { [int]$Action.attempts } else { $null }
+        $freshAttempts = if ($freshAction -and $freshAction.attempts -ne $null) { [int]$freshAction.attempts } else { $null }
+        if ($freshAction -and [string]$freshAction.status -eq "in_progress" -and ($null -eq $expectedAttempts -or $freshAttempts -eq $expectedAttempts)) {
+            $retryQuery = Get-ActionFenceQueryFromRow -Action $freshAction
+            if ($retryQuery) {
+                $result = Invoke-SupabaseApi -Method PATCH -Table "actions" -Query $retryQuery -Body $body
+                if ($result.Success -and $result.Data -and $result.Data.Count -gt 0) {
+                    Write-Log "Recovered failure update for action $($Action.id) using refreshed lease fence" -Level Warning
+                }
+            }
+        }
     }
     return ($result.Success -and $result.Data -and $result.Data.Count -gt 0)
 }
