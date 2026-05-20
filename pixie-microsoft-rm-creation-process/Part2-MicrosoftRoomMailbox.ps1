@@ -133,11 +133,17 @@ function Set-CloudflareDnsRecord {
 
         if ($records.Count -gt 0) {
             $record = $records[0]
-            $currentContent = ([string]$record.content).TrimEnd(".")
             $desiredContent = ([string]$Content).TrimEnd(".")
-            if ($currentContent -eq $desiredContent) {
-                Write-Log "$Type record already correct: $Name -> $Content" -Level Success
-                return @{ Success = $true; AlreadyCorrect = $true; RecordId = $record.id }
+            foreach ($existingRecord in $records) {
+                $currentContent = ([string]$existingRecord.content).TrimEnd(".")
+                if ($currentContent -eq $desiredContent) {
+                    Write-Log "$Type record already correct: $Name -> $Content" -Level Success
+                    return @{ Success = $true; AlreadyCorrect = $true; RecordId = $existingRecord.id }
+                }
+            }
+
+            if ($Type -eq "TXT") {
+                return Add-CloudflareDnsRecord -ZoneId $ZoneId -Type $Type -Name $recordName -Content $Content -TTL $TTL -Priority $Priority
             }
 
             Invoke-RestMethod -Method PATCH -Uri "https://api.cloudflare.com/client/v4/zones/$ZoneId/dns_records/$($record.id)" -Headers $headers -Body $bodyJson -UserAgent "pixie-worker/1.0" -TimeoutSec 30 -ErrorAction Stop | Out-Null
