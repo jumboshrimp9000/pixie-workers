@@ -1731,7 +1731,14 @@ function New-RoomMailboxBulk {
             Write-Log "Created room mailbox (direct): $email" -Level Success
         } catch {
             $errorMsg = $_.Exception.Message
-            # Always fall through to Method 2 when direct creation fails
+            if ($errorMsg -match "not an accepted domain|can't use the domain") {
+                $results.FatalCode = "exchange_accepted_domain_missing_before_mailbox_creation"
+                $results.FatalError = "Exchange accepted domain is not ready for mailbox creation: $errorMsg"
+                Write-Log $results.FatalError -Level Warning
+                return $results
+            }
+
+            # Fall through to Method 2 for non-domain-readiness failures.
             Write-Log "Direct method failed ($errorMsg), trying licensed user method..." -Level Warning
         }
 
@@ -3217,6 +3224,17 @@ function Process-MicrosoftDomain {
 
             if ($mailboxResults.Created.Count -eq 0) {
                 $failureMessage = if ($mailboxResults.FatalError) { [string]$mailboxResults.FatalError } else { "No mailboxes created (0/$($Inboxes.Count))" }
+                $acceptedDomainNotReady = (
+                    [string]$mailboxResults.FatalCode -eq "exchange_accepted_domain_missing_before_mailbox_creation" -or
+                    $failureMessage -match "not an accepted domain|can't use the domain"
+                )
+                if ($acceptedDomainNotReady) {
+                    Stop-MicrosoftProvisioningWithAction -DomainId $DomainId -CustomerId $CustomerId -ActionId $ActionId -History $history -Reason $failureMessage -EventType "exchange_accepted_domain_missing_before_mailbox_creation" -Step "accepted_domain_preflight" -InterimStatus "Both - DNS Records Added" -Retryable $true -DelaySeconds $exchangeSyncDeferSeconds -Metadata @{
+                        previous_interim_status = $interimStatus
+                    } | Out-Null
+                    return
+                }
+
                 $acceptedDomainBlocked = (
                     $IsAzureProvider -and
                     (
