@@ -2881,6 +2881,21 @@ function Process-MicrosoftDomain {
         $interimStatus = "Both - DKIM Complete"
     }
 
+    if ($interimStatus -eq "Both - Failed" -and $actionForProofRefresh -and $actionForProofRefresh.result) {
+        $resumeStatus = [string](Get-ObjectPropertyValue -Object $actionForProofRefresh.result -Name "resume_interim_status")
+        if ($resumeStatus -and $resumeStatus -ne "Both - Failed" -and $resumeStatus -ne "Both - Provisioning Complete" -and ($knownStatuses -contains $resumeStatus)) {
+            $resumeReason = "Recovering failed checkpoint for retry; resuming at $resumeStatus"
+            Write-Log $resumeReason -Level Warning
+            Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "failed_checkpoint_recovered_for_retry" -Severity "warn" -Message $resumeReason -Metadata @{
+                previous_interim_status = "Both - Failed"
+                resume_interim_status = $resumeStatus
+            }
+            $history = Add-HistoryEntry -History $history -Entry "RECOVERY: $resumeReason"
+            Update-Domain -DomainId $DomainId -Fields @{ status = "in_progress"; interim_status = $resumeStatus; action_history = $history }
+            $interimStatus = $resumeStatus
+        }
+    }
+
     if ($interimStatus -eq "Both - Provisioning Complete") {
         Write-Log "Already completed, skipping" -Level Warning
         Update-ActionStatus -ActionId $ActionId -Status "completed" -Result @{
