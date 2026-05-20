@@ -148,7 +148,7 @@ function Set-CloudflareDnsRecord {
         Write-Log "Failed to inspect/update $Type record ($Name): $($_.Exception.Message)" -Level Warning
     }
 
-    return Add-CloudflareDnsRecord -ZoneId $ZoneId -Type $Type -Name $Name -Content $Content -TTL $TTL -Priority $Priority
+    return Add-CloudflareDnsRecord -ZoneId $ZoneId -Type $Type -Name $recordName -Content $Content -TTL $TTL -Priority $Priority
 }
 
 # ============================================================================
@@ -794,16 +794,16 @@ function Add-M365DnsRecords {
             $result = $null
             switch ($rec.recordType) {
                 "Mx" {
-                    $result = Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "MX" -Name "@" -Content $rec.mailExchange -Priority $rec.preference
+                    $result = Set-CloudflareDnsRecord -ZoneId $ZoneId -Type "MX" -Name "@" -Domain $Domain -Content $rec.mailExchange -Priority $rec.preference
                 }
                 "Txt" {
                     if ($rec.text -match "spf") {
-                        $result = Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "TXT" -Name "@" -Content $rec.text
+                        $result = Set-CloudflareDnsRecord -ZoneId $ZoneId -Type "TXT" -Name "@" -Domain $Domain -Content $rec.text
                     }
                 }
                 "CName" {
                     $cnameName = $rec.label -replace "\.$Domain$", ""
-                    $result = Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "CNAME" -Name $cnameName -Content $rec.canonicalName
+                    $result = Set-CloudflareDnsRecord -ZoneId $ZoneId -Type "CNAME" -Name $cnameName -Domain $Domain -Content $rec.canonicalName
                 }
             }
             if ($result) {
@@ -813,7 +813,7 @@ function Add-M365DnsRecords {
             }
         }
 
-        $dmarcResult = Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "TXT" -Name "_dmarc" -Content "v=DMARC1; p=none"
+        $dmarcResult = Set-CloudflareDnsRecord -ZoneId $ZoneId -Type "TXT" -Name "_dmarc" -Domain $Domain -Content "v=DMARC1; p=none"
         if ($dmarcResult.AlreadyExists) { $existed++ } elseif ($dmarcResult.Success) { $added++ } else { $failed++ }
 
         $total = $added + $existed + $failed
@@ -828,10 +828,10 @@ function Add-M365DnsRecords {
         Write-Log "Failed to fetch DNS from Microsoft: $($_.Exception.Message). Using fallback records." -Level Warning
 
         $mxHost = $Domain -replace '\.', '-'
-        Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "MX" -Name "@" -Content "$mxHost.mail.protection.outlook.com" -Priority 0 | Out-Null
-        Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "TXT" -Name "@" -Content "v=spf1 include:spf.protection.outlook.com -all" | Out-Null
-        Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "TXT" -Name "_dmarc" -Content "v=DMARC1; p=none" | Out-Null
-        Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "CNAME" -Name "autodiscover" -Content "autodiscover.outlook.com" | Out-Null
+        Set-CloudflareDnsRecord -ZoneId $ZoneId -Type "MX" -Name "@" -Domain $Domain -Content "$mxHost.mail.protection.outlook.com" -Priority 0 | Out-Null
+        Set-CloudflareDnsRecord -ZoneId $ZoneId -Type "TXT" -Name "@" -Domain $Domain -Content "v=spf1 include:spf.protection.outlook.com -all" | Out-Null
+        Set-CloudflareDnsRecord -ZoneId $ZoneId -Type "TXT" -Name "_dmarc" -Domain $Domain -Content "v=DMARC1; p=none" | Out-Null
+        Set-CloudflareDnsRecord -ZoneId $ZoneId -Type "CNAME" -Name "autodiscover" -Domain $Domain -Content "autodiscover.outlook.com" | Out-Null
 
         return $true
     }
@@ -3013,7 +3013,7 @@ function Process-MicrosoftDomain {
             }
 
             # All DNS records go through Cloudflare (NS already pointing to CF)
-            $cfResult = Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "TXT" -Name "@" -Content $verificationTxt
+            $cfResult = Set-CloudflareDnsRecord -ZoneId $ZoneId -Type "TXT" -Name "@" -Domain $Domain -Content $verificationTxt
             if (-not $cfResult.Success -and -not $cfResult.AlreadyExists) {
                 Write-Log "Failed to add verification TXT to Cloudflare" -Level Error
             }
@@ -3090,7 +3090,7 @@ function Process-MicrosoftDomain {
 
                 $verificationTxt = Get-DomainVerificationRecord -Bearer $Bearer -Domain $Domain
                 if ($verificationTxt) {
-                    $cfResult = Add-CloudflareDnsRecord -ZoneId $ZoneId -Type "TXT" -Name "@" -Content $verificationTxt
+                    $cfResult = Set-CloudflareDnsRecord -ZoneId $ZoneId -Type "TXT" -Name "@" -Domain $Domain -Content $verificationTxt
                     if (-not $cfResult.Success -and -not $cfResult.AlreadyExists) {
                         Write-Log "Failed to refresh verification TXT for $Domain before verification retry" -Level Warning
                     }
