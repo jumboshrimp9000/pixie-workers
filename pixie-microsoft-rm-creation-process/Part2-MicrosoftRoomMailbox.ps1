@@ -2160,8 +2160,37 @@ function Confirm-DomainClientAccessForDomain {
         return @{ Success = $false; Total = 0; Enabled = 0; Failed = @("No mailboxes found") }
     }
 
-    Write-Log "Domain-level client access ready; skipping per-mailbox Set-CASMailbox loop ($total mailbox rows)" -Level Success
-    return @{ Success = $true; Total = $total; Enabled = $total; Failed = @() }
+    $enabled = 0
+    $failed = @()
+
+    foreach ($mb in $mailboxes) {
+        $email = $mb.PrimarySmtpAddress.ToString()
+
+        try {
+            Set-CASMailbox -Identity $email -SmtpClientAuthenticationDisabled $false -ImapEnabled $true -MAPIEnabled $true -ErrorAction Stop
+            Start-Sleep -Seconds 1
+
+            $cas = Get-CASMailbox -Identity $email -ErrorAction Stop
+            if ($cas.ImapEnabled -eq $true -and $cas.SmtpClientAuthenticationDisabled -eq $false) {
+                $enabled++
+                Write-Log "Client access confirmed for $email (IMAP enabled, SMTP auth enabled)" -Level Success
+            } else {
+                $failed += "$email`: IMAP/SMTP auth is still not ready after Set-CASMailbox (ImapEnabled=$($cas.ImapEnabled), SmtpClientAuthenticationDisabled=$($cas.SmtpClientAuthenticationDisabled))"
+                Write-Log "Client access not ready for $email`: IMAP/SMTP auth is still not ready after Set-CASMailbox" -Level Error
+            }
+        } catch {
+            $message = $_.Exception.Message
+            $failed += "$email`: $message"
+            Write-Log "Failed to enable client access for $email`: $message" -Level Error
+        }
+    }
+
+    if ($failed.Count -gt 0) {
+        return @{ Success = $false; Total = $total; Enabled = $enabled; Failed = $failed }
+    }
+
+    Write-Log "Domain-level client access ready for $Domain ($enabled/$total mailboxes with IMAP enabled)" -Level Success
+    return @{ Success = $true; Total = $total; Enabled = $enabled; Failed = @() }
 }
 
 # ============================================================================
@@ -2235,6 +2264,161 @@ function Sync-ActiveInboxPasswordsForUpload {
 
     Write-Log "Password sync complete before upload for $Domain" -Level Success
     return $true
+}
+
+function ConvertTo-ImapQuotedString {
+    param([string]$Value)
+
+    $safe = ([string]$Value).Replace("\", "\\").Replace('"', '\"')
+    return '"' + $safe + '"'
+}
+
+function Read-ImapTaggedResponse {
+    param(
+        [System.IO.StreamReader]$Reader,
+        [string]$Tag,
+        [int]$MaxLines = 80
+    )
+
+    $lines = @()
+    for ($i = 0; $i -lt $MaxLines; $i++) {
+        $line = $Reader.ReadLine()
+        if ($null -eq $line) { break }
+        $lines += $line
+        if ($line.StartsWith("$Tag ")) {
+            return @{ Line = $line; Lines = $lines }
+        }
+    }
+
+    return @{ Line = ""; Lines = $lines }
+}
+
+function Test-ImapProxyMailboxLogin {
+    param(
+        [string]$Email,
+        [string]$Password,
+        [string]$Host = $(if ($env:SMTP_PLUS_IMAP_HOST) { $env:SMTP_PLUS_IMAP_HOST } elseif ($env:IMAP_PROXY_HOST) { $env:IMAP_PROXY_HOST } else { "imap.simpleinboxes.com" }),
+        [int]$Port = $(if ($env:SMTP_PLUS_IMAP_PORT) { [int]$env:SMTP_PLUS_IMAP_PORT } elseif ($env:IMAP_PROXY_PORT) { [int]$env:IMAP_PROXY_PORT } else { 993 })
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Email)) {
+        return @{ Success = $false; Email = $Email; Host = $Host; Port = $Port; Error = "Missing email" }
+    }
+    if ([string]::IsNullOrWhiteSpace($Password)) {
+        return @{ Success = $false; Email = $Email; Host = $Host; Port = $Port; Error = "Missing password" }
+    }
+
+    $client = $null
+    $ssl = $null
+    $reader = $null
+    $writer = $null
+
+    try {
+        $client = [System.Net.Sockets.TcpClient]::new()
+        $client.ReceiveTimeout = 30000
+        $client.SendTimeout = 30000
+
+        $connect = $client.BeginConnect($Host, $Port, $null, $null)
+        if (-not $connect.AsyncWaitHandle.WaitOne(15000)) {
+            $client.Close()
+            return @{ Success = $false; Email = $Email; Host = $Host; Port = $Port; Error = "Timed out connecting to IMAP proxy" }
+        }
+        $client.EndConnect($connect)
+
+        $ssl = [System.Net.Security.SslStream]::new($client.GetStream(), $false)
+        $ssl.AuthenticateAsClient($Host)
+
+        $reader = [System.IO.StreamReader]::new($ssl, [System.Text.Encoding]::ASCII, $false, 4096, $true)
+        $writer = [System.IO.StreamWriter]::new($ssl, [System.Text.Encoding]::ASCII, 4096, $true)
+        $writer.NewLine = "`r`n"
+        $writer.AutoFlush = $true
+
+        $greeting = $reader.ReadLine()
+        if (-not $greeting -or -not $greeting.StartsWith("* OK")) {
+            return @{ Success = $false; Email = $Email; Host = $Host; Port = $Port; Error = "Unexpected IMAP greeting"; Greeting = $greeting }
+        }
+
+        $writer.WriteLine("a1 LOGIN $(ConvertTo-ImapQuotedString -Value $Email) $(ConvertTo-ImapQuotedString -Value $Password)")
+        $login = Read-ImapTaggedResponse -Reader $reader -Tag "a1"
+        if (-not $login.Line.StartsWith("a1 OK")) {
+            return @{ Success = $false; Email = $Email; Host = $Host; Port = $Port; Error = "IMAP proxy login failed"; LoginLine = $login.Line }
+        }
+
+        $writer.WriteLine("a2 SELECT INBOX")
+        $select = Read-ImapTaggedResponse -Reader $reader -Tag "a2"
+        if (-not $select.Line.StartsWith("a2 OK")) {
+            return @{ Success = $false; Email = $Email; Host = $Host; Port = $Port; Error = "IMAP proxy inbox select failed"; LoginLine = $login.Line; SelectLine = $select.Line }
+        }
+
+        try { $writer.WriteLine("a3 LOGOUT") } catch { }
+        return @{ Success = $true; Email = $Email; Host = $Host; Port = $Port; LoginLine = $login.Line; SelectLine = $select.Line }
+    } catch {
+        return @{ Success = $false; Email = $Email; Host = $Host; Port = $Port; Error = $_.Exception.Message }
+    } finally {
+        foreach ($resource in @($writer, $reader, $ssl, $client)) {
+            if ($resource) {
+                try { $resource.Dispose() } catch { try { $resource.Close() } catch { } }
+            }
+        }
+    }
+}
+
+function Confirm-SmtpPlusImapProxyAccessForDomain {
+    param(
+        [string]$DomainId,
+        [string]$Domain,
+        [string]$ActionId,
+        [string]$CustomerId,
+        [string]$OrderBatchId
+    )
+
+    $activeInboxes = @(Get-ActiveDomainInboxes -DomainId $DomainId)
+    if ($activeInboxes.Count -eq 0) {
+        return @{ Success = $false; Total = 0; Passed = 0; Failed = @("No active inboxes found for IMAP proxy validation") }
+    }
+
+    $passed = 0
+    $failed = @()
+    $host = if ($env:SMTP_PLUS_IMAP_HOST) { $env:SMTP_PLUS_IMAP_HOST } elseif ($env:IMAP_PROXY_HOST) { $env:IMAP_PROXY_HOST } else { "imap.simpleinboxes.com" }
+    $port = if ($env:SMTP_PLUS_IMAP_PORT) { [int]$env:SMTP_PLUS_IMAP_PORT } elseif ($env:IMAP_PROXY_PORT) { [int]$env:IMAP_PROXY_PORT } else { 993 }
+
+    Write-Log "Validating SMTP+ IMAP proxy login for $($activeInboxes.Count) inbox(es) on $Domain via ${host}:${port}" -Level Info
+
+    foreach ($inbox in $activeInboxes) {
+        $email = [string]$inbox.email
+        $password = [string]$inbox.password
+        $check = Test-ImapProxyMailboxLogin -Email $email -Password $password -Host $host -Port $port
+        if ($check.Success) {
+            $passed++
+            Write-Log "SMTP+ IMAP proxy validated for $email" -Level Success
+        } else {
+            $reason = "$email`: $($check.Error)"
+            if ($check.LoginLine) { $reason += " ($($check.LoginLine))" }
+            if ($check.SelectLine) { $reason += " ($($check.SelectLine))" }
+            $failed += $reason
+            Write-Log "SMTP+ IMAP proxy validation failed for ${email}: $reason" -Level Error
+        }
+    }
+
+    $success = ($failed.Count -eq 0)
+    $metadata = @{
+        domain = $Domain
+        imap_host = $host
+        imap_port = $port
+        total = $activeInboxes.Count
+        passed = $passed
+        failed = $failed
+    }
+
+    if ($success) {
+        Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "smtp_plus_imap_proxy_validated" -Severity "info" -Message "SMTP+ IMAP proxy login validated for $passed inbox(es)." -Metadata $metadata
+        Set-DomainFulfillmentStep -DomainId $DomainId -CustomerId $CustomerId -OrderBatchId $OrderBatchId -StepKey "inboxes" -Status "done" -Owner "provider" -Summary "Microsoft mailboxes and SMTP+ IMAP proxy access are ready." -NextAction "" -ActionId $ActionId -Evidence $metadata | Out-Null
+    } else {
+        Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "smtp_plus_imap_proxy_validation_failed" -Severity "error" -Message "SMTP+ IMAP proxy login validation failed." -Metadata $metadata
+        Set-DomainFulfillmentStep -DomainId $DomainId -CustomerId $CustomerId -OrderBatchId $OrderBatchId -StepKey "inboxes" -Status "blocked" -Owner "ops" -Summary "SMTP+ IMAP proxy login failed." -NextAction "Fix the IMAP proxy routing or Microsoft mailbox client access, then retry provisioning." -BlockerCode "smtp_plus_imap_proxy_failed" -ActionId $ActionId -Evidence $metadata | Out-Null
+    }
+
+    return @{ Success = $success; Total = $activeInboxes.Count; Passed = $passed; Failed = $failed; Host = $host; Port = $port }
 }
 
 # ============================================================================
@@ -3202,6 +3386,16 @@ function Process-MicrosoftDomain {
             }
             $passwordSyncOk = Sync-ActiveInboxPasswordsForUpload -DomainId $DomainId -Domain $Domain -Bearer $Bearer
             if (-not $passwordSyncOk) { $failedSteps += "Password Sync" }
+
+            if ($NormalizedProvider -eq "smtp_plus") {
+                $imapProxyValidation = Confirm-SmtpPlusImapProxyAccessForDomain -DomainId $DomainId -Domain $Domain -ActionId $ActionId -CustomerId $CustomerId -OrderBatchId $OrderBatchId
+                if ($imapProxyValidation.Success) {
+                    $history = Add-HistoryEntry -History $history -Entry "SMTP+ IMAP proxy validated: $($imapProxyValidation.Passed)/$($imapProxyValidation.Total) inboxes"
+                } else {
+                    $failedSteps += "SMTP+ IMAP Proxy Validation"
+                    $history = Add-HistoryEntry -History $history -Entry "FAILED: SMTP+ IMAP proxy validation failed ($($imapProxyValidation.Passed)/$($imapProxyValidation.Total) passed)"
+                }
+            }
         }
 
         if ($failedSteps.Count -eq 0) {
