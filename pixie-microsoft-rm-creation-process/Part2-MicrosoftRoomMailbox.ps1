@@ -2994,12 +2994,11 @@ function Process-MicrosoftDomain {
         "Both - Sending Tool Upload Failed"
     )
     if ($mailboxProofRefresh -and $Inboxes.Count -gt 0) {
-        $ignorePendingReason = "Mailbox proof refresh requested; ignoring $($Inboxes.Count) pending inbox row(s) and validating active mailbox readback only"
-        Write-Log $ignorePendingReason -Level Warning
-        Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "mailbox_proof_refresh_ignored_pending_inboxes" -Severity "warn" -Message $ignorePendingReason -Metadata @{
-            pending_inboxes = $Inboxes.Count
+        $refreshReason = "Mailbox proof refresh requested with $($Inboxes.Count) inbox row(s); validating/recreating expected mailboxes before upload"
+        Write-Log $refreshReason -Level Warning
+        Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "mailbox_proof_refresh_repairing_expected_inboxes" -Severity "warn" -Message $refreshReason -Metadata @{
+            inboxes_to_verify = $Inboxes.Count
         }
-        $Inboxes = @()
     }
     if ($Inboxes.Count -gt 0 -and $interimStatus -in $statusesAfterMailboxCreation) {
         $rewindReason = "Found $($Inboxes.Count) pending inbox row(s) while domain was at '$interimStatus'; rewinding to mailbox creation before finalization"
@@ -3494,6 +3493,22 @@ function Process-MicrosoftDomain {
             $preUploadBulletproof = Invoke-BulletproofMailboxCheck -Domain $Domain -Bearer $Bearer -Password $InboxPassword -MailboxMode $MailboxMode
             $MailboxProof = New-MicrosoftMailboxProof -Domain $Domain -Provider $NormalizedProvider -MailboxMode $MailboxMode -ExpectedActiveInboxCount $Inboxes.Count -Bulletproof $preUploadBulletproof -ActualMailboxCount $actualCount
             $history = Add-HistoryEntry -History $history -Entry "Pre-upload mailbox proof: $($MailboxProof.verified)/$($MailboxProof.expected) verified"
+            if (-not [bool](Get-ObjectPropertyValue -Object $MailboxProof -Name "passed")) {
+                $verifiedCount = [int](Get-ObjectPropertyValue -Object $MailboxProof -Name "verified")
+                $expectedCount = [int](Get-ObjectPropertyValue -Object $MailboxProof -Name "expected")
+                $proofIssues = @(Get-ObjectPropertyValue -Object $MailboxProof -Name "issues")
+                $reason = "Microsoft mailbox proof did not verify expected inboxes before upload ($verifiedCount/$expectedCount verified); retrying mailbox repair before upload."
+                $history = Add-HistoryEntry -History $history -Entry "PENDING: $reason"
+                Stop-MicrosoftProvisioningWithAction -DomainId $DomainId -CustomerId $CustomerId -ActionId $ActionId -History $history -Reason $reason -EventType "mailbox_proof_pending" -Step "mailbox_proof_pre_upload" -InterimStatus "Microsoft - Mailbox Proof Pending" -Retryable $true -DelaySeconds 300 -Metadata @{
+                    provider_mailbox_proof = $MailboxProof
+                    expected_active_inboxes = $expectedCount
+                    verified_inboxes = $verifiedCount
+                    actual_mailbox_count = $actualCount
+                    issues = $proofIssues
+                    next_action = "Retry mailbox creation/readback before uploading to the sending tool."
+                } | Out-Null
+                return
+            }
             $freshBearer = Get-ROPCToken -TenantId $tenantId -ClientId $AzureCliPublicClientId -Username $AdminEmail -Password $AdminPassword
             if ($freshBearer) {
                 $Bearer = $freshBearer
