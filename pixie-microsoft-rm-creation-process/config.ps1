@@ -420,7 +420,7 @@ function Get-PendingActions {
                 if ($attempts -ge ($maxAttempts + $extraReclaims) -and $hasHardError) {
                     $includeAction = $false
                 }
-            } elseif ($status -eq "pending" -and $attempts -eq $maxAttempts -and (Test-RetryableWorkerError $_.error)) {
+            } elseif ($status -eq "pending" -and $attempts -ge $maxAttempts -and (Test-RetryableWorkerError $_.error)) {
                 $includeAction = $true
             } else {
                 $includeAction = $false
