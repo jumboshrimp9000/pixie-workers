@@ -321,12 +321,15 @@ function Process-SingleAction {
 # MAIN LOOP
 # ============================================================================
 do {
-    $defaultActionTypes = @("provision_inbox", "microsoft_update_inboxes", "microsoft_cancel_domain", "microsoft_recovery_move", "microsoft_recovery_reactivate", "microsoft_recovery_purge")
+    $defaultActionTypes = @("provision_inbox", "microsoft_refresh_mailbox_proof", "microsoft_update_inboxes", "microsoft_cancel_domain", "microsoft_recovery_move", "microsoft_recovery_reactivate", "microsoft_recovery_purge")
     $configuredActionTypes = @($defaultActionTypes)
     if ($env:WORKER_ACTION_TYPES) {
         $configuredActionTypes = @($env:WORKER_ACTION_TYPES -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     } elseif ($env:WORKER_FILTER) {
         $configuredActionTypes = @($env:WORKER_FILTER -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    }
+    if (($configuredActionTypes -contains "provision_inbox") -and ($configuredActionTypes -notcontains "microsoft_refresh_mailbox_proof")) {
+        $configuredActionTypes += "microsoft_refresh_mailbox_proof"
     }
     $configuredActionSources = @()
     if ($env:WORKER_ACTION_SOURCES) {
@@ -334,7 +337,15 @@ do {
     } elseif ($env:WORKER_ACTION_SOURCE) {
         $configuredActionSources = @($env:WORKER_ACTION_SOURCE -split "," | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     }
-    $actions = Get-PendingActions -ActionTypes $configuredActionTypes -ActionSources $configuredActionSources
+    $proofRefreshActionTypes = @($configuredActionTypes | Where-Object { $_ -ieq "microsoft_refresh_mailbox_proof" })
+    $primaryActionTypes = @($configuredActionTypes | Where-Object { $_ -ine "microsoft_refresh_mailbox_proof" })
+    $actions = @()
+    if ($primaryActionTypes.Count -gt 0) {
+        $actions = Get-PendingActions -ActionTypes $primaryActionTypes -ActionSources $configuredActionSources
+    }
+    if ((-not $actions -or $actions.Count -eq 0) -and $proofRefreshActionTypes.Count -gt 0) {
+        $actions = Get-PendingActions -ActionTypes $proofRefreshActionTypes -ActionSources $configuredActionSources
+    }
 
     if ($actions -and $actions.Count -gt 0) {
         $toProcess = $actions

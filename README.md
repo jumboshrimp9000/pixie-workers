@@ -48,6 +48,7 @@ Shared queue flow:
 1. `prepare_domain`
 2. provider-specific action:
    - `provision_inbox` for Microsoft
+   - `microsoft_refresh_mailbox_proof` for Microsoft mailbox readback/proof refresh after provisioning
    - `google_provision` for paid Google
    - `free_google_provision` for free/nonprofit Google promo domains
 
@@ -72,9 +73,12 @@ Do not run two workers against the same action type.
 Recommended ownership:
 - `prepare_domain` -> `AP`
 - `provision_inbox` -> `pixie-microsoft-rm-creation-process`
+- `microsoft_refresh_mailbox_proof` -> `pixie-microsoft-rm-creation-process`
 - `microsoft_update_inboxes` -> `pixie-microsoft-rm-creation-process`
 - paid `google_*` lifecycle + provisioning actions -> `pixie-google-paid-worker`
 - `free_google_provision`, `free_google_cancel_domain`, and `google_recovery_move` -> `pixie-google-free-nonprofit-worker`
+
+`microsoft_refresh_mailbox_proof` is a lower-priority readback lane. The Microsoft worker should process real provisioning and lifecycle actions before proof refresh, so proof cleanup cannot hold new orders hostage.
 
 ## Production compose topology
 

@@ -1,8 +1,9 @@
 # Pixie Microsoft/Azure Mailbox Worker
 
-Hybrid TypeScript + PowerShell worker for Microsoft-backed mailbox provisioning. This folder is Supabase-native and owns three Microsoft-backed action families:
+Hybrid TypeScript + PowerShell worker for Microsoft-backed mailbox provisioning. This folder is Supabase-native and owns these Microsoft-backed action families:
 
 - `provision_inbox` — initial domain + mailbox provisioning for `microsoft`, `smtp_plus`, and `azure` domains
+- `microsoft_refresh_mailbox_proof` — readback-only Microsoft mailbox proof refresh after provisioning
 - `microsoft_update_inboxes` — tracked rename / username-change mutations on existing Microsoft-backed mailboxes
 - `microsoft_cancel_domain` — post-grace cancellation teardown and final state sync
 
@@ -14,6 +15,7 @@ Future worker/status changes should preserve the hardening rules documented in t
 Supabase actions queue
   prepare_domain                -> AP shared worker
   provision_inbox               -> this folder
+  microsoft_refresh_mailbox_proof -> this folder
   microsoft_update_inboxes      -> this folder
   microsoft_cancel_domain       -> this folder
 
@@ -161,11 +163,13 @@ Do not run multiple workers on the same action type.
 Recommended ownership:
 - `prepare_domain` -> `AP` `DomainPreparationWorker`
 - `provision_inbox` for `microsoft`, `smtp_plus`, and `azure` -> this folder
+- `microsoft_refresh_mailbox_proof` for provider mailbox readback -> this folder
 - `microsoft_update_inboxes` for `microsoft`, `smtp_plus`, and `azure` -> this folder
 - `microsoft_cancel_domain` for `microsoft`, `smtp_plus`, and `azure` -> this folder
 - Google action types -> `job-workers/pixie_google_smartlead`
 
 The AP backend still contains in-process Microsoft worker code, but if this external PowerShell worker is active, do not run both against the same Microsoft queue actions.
+The poller treats `microsoft_refresh_mailbox_proof` as a lower-priority recovery lane. It asks for primary Microsoft actions first and only falls back to proof refresh when no primary work is ready; legacy `provision_inbox` proof-refresh rows are also deprioritized after fetch.
 
 ## Microsoft Admin Locking
 

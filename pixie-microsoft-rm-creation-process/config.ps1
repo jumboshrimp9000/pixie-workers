@@ -374,6 +374,22 @@ function Invoke-SupabaseRpc {
 # SUPABASE TABLE HELPERS
 # ============================================================================
 
+function Get-WorkerActionPriority {
+    param([object]$Action)
+
+    if (-not $Action) { return 0 }
+    $type = if ($Action.type) { ([string]$Action.type).Trim().ToLowerInvariant() } else { "" }
+    $payload = $Action.payload
+    $source = ""
+    if ($payload -and $payload.source) { $source = ([string]$payload.source).Trim().ToLowerInvariant() }
+    $isMailboxProofRefresh =
+        $type -eq "microsoft_refresh_mailbox_proof" -or
+        ($type -eq "provision_inbox" -and $source -eq "fulfillment_watchdog_mailbox_proof_refresh")
+
+    if ($isMailboxProofRefresh) { return 50 }
+    return 0
+}
+
 function Get-PendingActions {
     param(
         [string[]]$ActionTypes = @("provision_inbox"),
@@ -384,7 +400,11 @@ function Get-PendingActions {
     $validTypes = @($ActionTypes | Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() })
     if ($validTypes.Count -eq 0) { return @() }
     $validSources = @($ActionSources | Where-Object { $_ -and $_.Trim() } | ForEach-Object { $_.Trim() })
-    $fetchLimit = if ($validSources.Count -gt 0) { [Math]::Max($Limit * 20, 100) } else { $Limit }
+    $hasPriorityMixedLane = @($validTypes | Where-Object {
+        $normalizedType = $_.Trim().ToLowerInvariant()
+        $normalizedType -eq "provision_inbox" -or $normalizedType -eq "microsoft_refresh_mailbox_proof"
+    }).Count -gt 0
+    $fetchLimit = if ($validSources.Count -gt 0 -or $hasPriorityMixedLane) { [Math]::Max($Limit * 25, 250) } else { $Limit }
 
     $encodedTypes = ($validTypes -join ",")
     $nowIso = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
@@ -403,7 +423,7 @@ function Get-PendingActions {
     if ($env:WORKER_PENDING_MIN_AGE_SECONDS) {
         try { $pendingMinAgeSeconds = [Math]::Max(0, [int][double]$env:WORKER_PENDING_MIN_AGE_SECONDS) } catch { $pendingMinAgeSeconds = 0 }
     }
-    return @(@($pendingResult.Data) + @($staleResult.Data) | Sort-Object created_at | Where-Object {
+    return @(@($pendingResult.Data) + @($staleResult.Data) | Sort-Object @{ Expression = { Get-WorkerActionPriority -Action $_ }; Ascending = $true }, @{ Expression = { $_.created_at }; Ascending = $true } | Where-Object {
         $attempts = if ($_.attempts -ne $null) { [int]$_.attempts } else { 0 }
         $maxAttempts = if ($_.max_attempts -ne $null) { [int]$_.max_attempts } else { 3 }
         $status = if ($_.status) { [string]$_.status } else { "pending" }

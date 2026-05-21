@@ -943,8 +943,14 @@ function Test-ActionMailboxProofRefresh {
     param([object]$Action)
 
     if (-not $Action) { return $false }
+    if ($Action.type -and ([string]$Action.type).Trim().ToLowerInvariant() -eq "microsoft_refresh_mailbox_proof") { return $true }
     $payload = $Action.payload
+    $source = ""
+    if ($payload -and (Test-ObjectPropertyExists -Object $payload -Name "source")) {
+        $source = ([string](Get-ObjectPropertyValue -Object $payload -Name "source")).Trim().ToLowerInvariant()
+    }
     return (
+        $source -eq "fulfillment_watchdog_mailbox_proof_refresh" -or
         (Test-TruthyPayloadFlag -Payload $payload -Name "mailbox_proof_refresh") -or
         (Test-TruthyPayloadFlag -Payload $payload -Name "mailboxProofRefresh") -or
         (Test-TruthyPayloadFlag -Payload $payload -Name "proof_refresh") -or
@@ -2944,6 +2950,13 @@ function Process-MicrosoftDomain {
     $MailboxProof = $null
     $actionForProofRefresh = Get-Action -ActionId $ActionId
     $mailboxProofRefresh = Test-ActionMailboxProofRefresh -Action $actionForProofRefresh
+    $originalInterimStatus = [string]$interimStatus
+    $proofGateResume = $mailboxProofRefresh -or $originalInterimStatus -eq "Microsoft - Mailbox Proof Pending"
+    $proofExpectedInboxCount = $Inboxes.Count
+    if ($proofGateResume) {
+        $activeInboxesForProof = @(Get-ActiveDomainInboxes -DomainId $DomainId)
+        if ($activeInboxesForProof.Count -gt 0) { $proofExpectedInboxCount = $activeInboxesForProof.Count }
+    }
 
     Write-Host ""
     Write-Host "================================================================" -ForegroundColor Magenta
@@ -3011,14 +3024,17 @@ function Process-MicrosoftDomain {
         "Both - Sending Tool Upload Blocked",
         "Both - Sending Tool Upload Failed"
     )
-    if ($mailboxProofRefresh -and $Inboxes.Count -gt 0) {
-        $refreshReason = "Mailbox proof refresh requested with $($Inboxes.Count) inbox row(s); validating/recreating expected mailboxes before upload"
-        Write-Log $refreshReason -Level Warning
-        Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "mailbox_proof_refresh_repairing_expected_inboxes" -Severity "warn" -Message $refreshReason -Metadata @{
-            inboxes_to_verify = $Inboxes.Count
+    if ($proofGateResume -and $Inboxes.Count -gt 0) {
+        $ignorePendingReason = "Mailbox proof gate resume requested; ignoring $($Inboxes.Count) inbox row(s) for mailbox creation and validating active mailbox readback only"
+        Write-Log $ignorePendingReason -Level Warning
+        Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "mailbox_proof_refresh_ignored_pending_inboxes" -Severity "warn" -Message $ignorePendingReason -Metadata @{
+            inbox_rows_ignored_for_creation = $Inboxes.Count
+            expected_active_inboxes = $proofExpectedInboxCount
+            original_interim_status = $originalInterimStatus
         }
+        $Inboxes = @()
     }
-    if ($Inboxes.Count -gt 0 -and $interimStatus -in $statusesAfterMailboxCreation) {
+    if ((-not $proofGateResume) -and $Inboxes.Count -gt 0 -and $interimStatus -in $statusesAfterMailboxCreation) {
         $rewindReason = "Found $($Inboxes.Count) pending inbox row(s) while domain was at '$interimStatus'; rewinding to mailbox creation before finalization"
         Write-Log $rewindReason -Level Warning
         $history = Add-HistoryEntry -History $history -Entry "RECOVERY: $rewindReason"
@@ -3492,9 +3508,10 @@ function Process-MicrosoftDomain {
     # ── STEP 11: Queue/validate sending-tool upload, then finalize ──
     if ($interimStatus -eq "Both - DKIM Complete") {
         $actualCount = 0
+        $preUploadExpectedInboxCount = if ($proofExpectedInboxCount -gt 0) { $proofExpectedInboxCount } else { $Inboxes.Count }
         if (-not $DryRun) {
             if ($ReplacementOldDomain) {
-                $preUploadIsolation = Invoke-ReplacementAliasIsolation -Domain $Domain -ReplacementOldDomain $ReplacementOldDomain -ExpectedMailboxCount $Inboxes.Count -Repair
+                $preUploadIsolation = Invoke-ReplacementAliasIsolation -Domain $Domain -ReplacementOldDomain $ReplacementOldDomain -ExpectedMailboxCount $preUploadExpectedInboxCount -Repair
                 $history = Add-HistoryEntry -History $history -Entry "Pre-upload replacement alias isolation: checked $($preUploadIsolation.Checked), repaired $($preUploadIsolation.Repaired)"
                 Add-ActionLog -ActionId $ActionId -DomainId $DomainId -CustomerId $CustomerId -EventType "replacement_alias_isolation_pre_upload" -Severity $(if ($preUploadIsolation.Success) { "info" } else { "error" }) -Message "Pre-upload replacement alias isolation checked for $Domain against old domain $ReplacementOldDomain" -Metadata @{
                     old_domain = $ReplacementOldDomain
@@ -3509,13 +3526,13 @@ function Process-MicrosoftDomain {
 
             $actualCount = (Get-Mailbox -ResultSize Unlimited | Where-Object { $_.PrimarySmtpAddress -like "*@$Domain" } | Measure-Object).Count
             $preUploadBulletproof = Invoke-BulletproofMailboxCheck -Domain $Domain -Bearer $Bearer -Password $InboxPassword -MailboxMode $MailboxMode
-            $MailboxProof = New-MicrosoftMailboxProof -Domain $Domain -Provider $NormalizedProvider -MailboxMode $MailboxMode -ExpectedActiveInboxCount $Inboxes.Count -Bulletproof $preUploadBulletproof -ActualMailboxCount $actualCount
+            $MailboxProof = New-MicrosoftMailboxProof -Domain $Domain -Provider $NormalizedProvider -MailboxMode $MailboxMode -ExpectedActiveInboxCount $preUploadExpectedInboxCount -Bulletproof $preUploadBulletproof -ActualMailboxCount $actualCount
             $history = Add-HistoryEntry -History $history -Entry "Pre-upload mailbox proof: $($MailboxProof.verified)/$($MailboxProof.expected) verified"
             if (-not [bool](Get-ObjectPropertyValue -Object $MailboxProof -Name "passed")) {
                 $verifiedCount = [int](Get-ObjectPropertyValue -Object $MailboxProof -Name "verified")
                 $expectedCount = [int](Get-ObjectPropertyValue -Object $MailboxProof -Name "expected")
                 $proofIssues = @(Get-ObjectPropertyValue -Object $MailboxProof -Name "issues")
-                $reason = "Microsoft mailbox proof did not verify expected inboxes before upload ($verifiedCount/$expectedCount verified); retrying mailbox repair before upload."
+                $reason = "Microsoft mailbox proof did not verify expected inboxes before upload ($verifiedCount/$expectedCount verified); retrying mailbox readback before upload."
                 $history = Add-HistoryEntry -History $history -Entry "PENDING: $reason"
                 Stop-MicrosoftProvisioningWithAction -DomainId $DomainId -CustomerId $CustomerId -ActionId $ActionId -History $history -Reason $reason -EventType "mailbox_proof_pending" -Step "mailbox_proof_pre_upload" -InterimStatus "Microsoft - Mailbox Proof Pending" -Retryable $true -DelaySeconds 300 -Metadata @{
                     provider_mailbox_proof = $MailboxProof
@@ -3523,7 +3540,7 @@ function Process-MicrosoftDomain {
                     verified_inboxes = $verifiedCount
                     actual_mailbox_count = $actualCount
                     issues = $proofIssues
-                    next_action = "Retry mailbox creation/readback before uploading to the sending tool."
+                    next_action = "Retry Microsoft mailbox readback before uploading to the sending tool."
                 } | Out-Null
                 return
             }
