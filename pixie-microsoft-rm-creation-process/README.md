@@ -194,7 +194,7 @@ Deployment/config notes:
 
 Retry safety:
 - pending actions at `max_attempts` are normally not reclaimed
-- the worker will process one due pending action at exactly `max_attempts` only when its error text is a known transient provider delay, such as DNS propagation, Exchange accepted-domain lag, DKIM/CNAME lag, Microsoft 5xx/timeout, or rate limiting
+- the worker will process due pending actions at or above `max_attempts` only when the error text is a known transient provider delay, such as DNS propagation, Exchange accepted-domain lag, DKIM/CNAME lag, Microsoft 5xx/timeout, or rate limiting
 - Microsoft propagation waits inside `provision_inbox` use no-penalty requeue. Domain verification, Email service activation, Cloudflare/M365 DNS writes, Exchange sync, accepted-domain preflight, and DKIM/CNAME waits must clear the running lease, set `status='pending'`, set `next_retry_at`, and restore the attempt count so bulk orders do not silently exhaust retries while waiting on Microsoft/DNS.
 - non-retryable configuration or credential failures, such as missing API keys, unauthorized responses, or missing dependencies, stay stopped for ops review
 
