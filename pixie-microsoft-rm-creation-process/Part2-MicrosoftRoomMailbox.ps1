@@ -979,6 +979,21 @@ function Test-ActionSendingToolSkipped {
     return ((Test-PayloadSendingToolSkipped -Payload $prepareAction.payload) -or (Test-PayloadSendingToolSkipped -Payload $prepareAction.result))
 }
 
+function Test-ActionHasNoRequestedSendingTool {
+    param([object]$Action)
+
+    if (-not $Action) { return $false }
+    $payload = $Action.payload
+    if (-not $payload) { return $false }
+
+    $sendingTool = Get-ObjectPropertyValue -Object $payload -Name "sending_tool"
+    if ($null -eq $sendingTool) { $sendingTool = Get-ObjectPropertyValue -Object $payload -Name "sendingTool" }
+    if ($null -eq $sendingTool) { return $true }
+
+    $normalized = ([string]$sendingTool).Trim().ToLowerInvariant()
+    return ([string]::IsNullOrWhiteSpace($normalized) -or $normalized -in @("none", "other", "add_later", "add later", "skip", "skipped"))
+}
+
 function Test-ActionPayloadMatchesProvision {
     param([object]$Action, [string]$ProvisionActionId)
 
@@ -1377,7 +1392,10 @@ function Resolve-MicrosoftProvisioningUploadState {
         return @{ Complete = $false; Failed = $false; Pending = $true; History = $history }
     }
 
-    if (Test-ActionSendingToolSkipped -ActionId $ActionId) {
+    $provisionAction = Get-Action -ActionId $ActionId
+    $sendingToolSkipped = Test-ActionSendingToolSkipped -ActionId $ActionId
+    $noSendingToolRequested = Test-ActionHasNoRequestedSendingTool -Action $provisionAction
+    if ($sendingToolSkipped -or ($DomainRecord.provider -eq "smtp_plus" -and $noSendingToolRequested)) {
         return Complete-ProvisionActionWithUploadSkipped `
             -DomainRecord $DomainRecord `
             -ActionId $ActionId `
