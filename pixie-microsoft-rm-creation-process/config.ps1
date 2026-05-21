@@ -411,7 +411,13 @@ function Get-PendingActions {
         if ($attempts -ge $maxAttempts) {
             if ($status -eq "in_progress") {
                 $extraReclaims = Get-WorkerStaleReclaimExtraAttempts
-                if ($attempts -ge ($maxAttempts + $extraReclaims)) {
+                $errorText = ([string]$_.error).Trim()
+                $hasHardError = $errorText -and -not (Test-RetryableWorkerError $errorText)
+
+                # A stale in-progress action is a lost lease, not a normal retry.
+                # If the previous worker died before recording a hard error, reclaim it
+                # so deploys/restarts do not leave orders permanently "running".
+                if ($attempts -ge ($maxAttempts + $extraReclaims) -and $hasHardError) {
                     $includeAction = $false
                 }
             } elseif ($status -eq "pending" -and $attempts -eq $maxAttempts -and (Test-RetryableWorkerError $_.error)) {

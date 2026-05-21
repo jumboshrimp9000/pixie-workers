@@ -187,7 +187,8 @@ Deployment/config notes:
 - one-admin-at-a-time behavior depends on the Supabase RPCs `acquire_microsoft_admin_lock`, `refresh_microsoft_admin_lock`, and `release_microsoft_admin_lock`
 - Microsoft admin rows must exist in `admin_credentials` with `provider=microsoft` and `active=true`
 - `WORKER_ACTION_LEASE_SECONDS` controls stale action reclaim for crashed workers; it does not disable or replace the per-admin Supabase lock
-- `WORKER_STALE_RECLAIM_EXTRA_ATTEMPTS` controls how many stale `in_progress` actions may be reclaimed after the normal `max_attempts` ceiling; default is `1`, which gives a crashed/hung final attempt one safe reclaim but prevents an infinite loop
+- `WORKER_STALE_RECLAIM_EXTRA_ATTEMPTS` controls how many stale `in_progress` actions with a recorded hard error may be reclaimed after the normal `max_attempts` ceiling; default is `1`
+- stale `in_progress` actions with no recorded hard error are treated as lost worker leases and remain reclaimable, so deploys/restarts cannot leave orders permanently marked as running
 - the admin lock lease defaults to 7200 seconds in `Acquire-MicrosoftAdminLock`; actions that cannot obtain the lock are requeued without consuming an attempt
 - long-running actions heartbeat both `started_at` and `updated_at`, so AP/internal-admin liveness checks can distinguish an active PowerShell run from a stranded row
 
